@@ -38,7 +38,7 @@ export interface DispatchOptions {
 
 /** Pinned so a dispatch is reproducible regardless of what Hermes' config was last set to. */
 export const DEFAULT_MODEL = "cline-pass/deepseek-v4.1-flash-1017";
-export const DEFAULT_REASONING = "max";
+export const DEFAULT_REASONING = "high";
 export const DEFAULT_TIMEOUT_SECONDS = 1800;
 export const DEFAULT_FAST_WAIT_SECONDS = 60;
 
