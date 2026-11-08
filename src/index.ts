@@ -48,7 +48,7 @@ server.registerTool(
       reasoning: z
         .string()
         .optional()
-        .describe("Reasoning effort (none|minimal|low|medium|high|xhigh|max|ultra). Defaults to max."),
+        .describe("Reasoning effort (none|minimal|low|medium|high). Defaults to high."),
       skills: z.array(z.string()).optional().describe("Skills to preload for the run."),
       timeoutSeconds: z
         .number()
