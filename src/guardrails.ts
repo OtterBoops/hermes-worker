@@ -92,6 +92,8 @@ export const WORKER_BOUNDARY = [
   "- DO NOT read, create, or modify .env files, API keys, credentials, or files outside this repository root.",
   "- DO NOT invoke remote homelab or SSH commands (hl, ottbox, ssh, arcane, cloudflare).",
   "- Local workstation testing (including local Docker Desktop containers, node/pnpm/cargo/pytest test runners) is PERMITTED.",
+  "- SUBAGENT PARALLELISM (`delegate_task`): Actively spawn parallel subagents via `delegate_task(tasks=[...])` (up to 3 concurrent children) whenever a task spans 2+ independent modules, test suites, or audit targets. Assign strictly disjoint file paths to each child so concurrent subagents never write to the same file simultaneously in this shared worktree; perform shared entrypoint integration in the parent agent.",
+  "- Do not invoke the `hermes` skill or `hermes-worker` MCP tools from inside this worker session (prevents recursive delegation).",
   "- Do not run `git push` or switch branches; leave your changes in the current worktree for Antigravity to review.",
   "[TASK SPECIFICATION]",
 ].join("\n");

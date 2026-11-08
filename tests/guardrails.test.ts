@@ -94,6 +94,8 @@ test("injectWorkerBoundary prepends the contract and keeps the prompt intact", (
   const prompt = "Add a /health endpoint to the worker.";
   const guarded = injectWorkerBoundary(prompt);
   assert.ok(guarded.startsWith("[WORKER OPERATIONAL BOUNDARY]\n"));
+  assert.ok(guarded.includes("SUBAGENT PARALLELISM (`delegate_task`)"));
+  assert.ok(guarded.includes("prevents recursive delegation"));
   assert.ok(guarded.includes("[TASK SPECIFICATION]"));
   assert.ok(guarded.trimEnd().endsWith(prompt));
   assert.equal(guarded.split(prompt).length, 2);

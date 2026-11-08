@@ -493,6 +493,15 @@ export const dispatchHermesTask = async (options: DispatchOptions): Promise<Disp
     }
 
     const modelFallbackFailed = Boolean(result.modelFallback);
+    if (modelFallbackFailed) {
+      result.diff = "";
+      result.diffTruncated = false;
+      result.modifiedFiles = [];
+      result.worktreeKept = false;
+      result.success = false;
+      await removeWorktree(repoRoot, worktreePath, branch);
+      return result;
+    }
 
     const verdict = validateModifiedFiles(result.modifiedFiles, worktreePath);
     result.violations = verdict.violations;
