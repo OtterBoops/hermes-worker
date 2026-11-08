@@ -62,6 +62,12 @@ const isInside = (root: string, target: string): boolean => {
   return normalTarget === normalRoot || normalTarget.startsWith(normalRoot + path.sep);
 };
 
+/**
+ * A colon in a repo-relative path is an NTFS alternate data stream (`file.txt:secret.txt`) or a
+ * drive-relative path, and it defeats the patterns below: `.env:stream` is not `.env`.
+ */
+const hasAlternateDataStream = (relative: string): boolean => relative.includes(":");
+
 const isMissing = (error: unknown): boolean => {
   const code = (error as NodeJS.ErrnoException).code;
   return code === "ENOENT" || code === "ENOTDIR";
@@ -119,6 +125,11 @@ export const validateModifiedFiles = (files: string[], repoRoot: string): Modifi
     const base = path.posix.basename(relative);
 
     if (!isInside(root, absolute) || relative.startsWith("../") || path.isAbsolute(relative)) {
+      violations.push(file);
+      continue;
+    }
+
+    if (hasAlternateDataStream(relative)) {
       violations.push(file);
       continue;
     }

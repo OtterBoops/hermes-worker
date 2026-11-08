@@ -59,6 +59,25 @@ test("a traversal that stays inside the worktree is allowed", () => {
   assert.equal(verdict.valid, true);
 });
 
+test("blocks Windows alternate data stream syntax", () => {
+  const blocked = [
+    "file.txt:secret.txt",
+    "src/file.txt:secret.txt",
+    "dir::$INDEX_ALLOCATION",
+    ".env:stream",
+    ".env::$DATA",
+  ];
+  for (const file of blocked) {
+    const verdict = validateModifiedFiles([file], repo);
+    assert.equal(verdict.valid, false, `${file} should be blocked`);
+    assert.ok(verdict.violations.includes(file), `${file} should be reported as a violation`);
+  }
+
+  const ordinary = validateModifiedFiles(["src/index.ts", "docs/file.txt"], repo);
+  assert.deepEqual(ordinary.violations, [], "a path without a colon must stay allowed");
+  assert.equal(ordinary.valid, true);
+});
+
 test("blocks absolute paths that resolve outside the worktree", () => {
   const verdict = validateModifiedFiles(["D:\\Windows\\System32\\drivers\\etc\\hosts"], repo);
   assert.equal(verdict.valid, false);
