@@ -1,13 +1,27 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import {
   BLOCKED_PATH_PATTERNS,
+  WORKER_BOUNDARY,
   injectWorkerBoundary,
   scanPromptForSecrets,
   validateModifiedFiles,
 } from "../src/guardrails.js";
 
 const repo = "D:\\Code\\OtterBoops\\hermes-worker";
+
+/** A junction needs no admin on Windows; POSIX uses a plain directory symlink. */
+const linkDirectory = (target: string, link: string): boolean => {
+  try {
+    fs.symlinkSync(target, link, process.platform === "win32" ? "junction" : "dir");
+    return true;
+  } catch {
+    return false;
+  }
+};
 
 test("blocks secret stores and traversal, but not ordinary repo files", () => {
   const blocked = [
@@ -99,4 +113,134 @@ test("injectWorkerBoundary prepends the contract and keeps the prompt intact", (
   assert.ok(guarded.includes("[TASK SPECIFICATION]"));
   assert.ok(guarded.trimEnd().endsWith(prompt));
   assert.equal(guarded.split(prompt).length, 2);
+});
+
+test("injectWorkerBoundary tells the parent to integrate verified subagent results", () => {
+  assert.ok(
+    WORKER_BOUNDARY.includes(
+      "When delegate_task subagents return verified results, synthesize and integrate them directly without re-running their scratch experiments in the parent session.",
+    ),
+  );
+});
+
+test("a blocked directory beats the template allowlist", () => {
+  for (const file of [".ssh/.env.example", ".gemini/.env.example", ".aws/.env.template"]) {
+    const verdict = validateModifiedFiles([file], repo);
+    assert.equal(verdict.valid, false, `${file} should be blocked`);
+  }
+  assert.equal(validateModifiedFiles([".env.example"], repo).valid, true, "the root template stays allowed");
+  assert.equal(validateModifiedFiles(["docs/.env.example"], repo).valid, true, "an ordinary directory is fine");
+  assert.equal(
+    validateModifiedFiles([".env.example/foo.ts"], repo).valid,
+    false,
+    "a directory named .env.example is judged on its segments",
+  );
+});
+
+test("the expanded pattern list rejects every documented credential store", () => {
+  const blocked = [
+    "deploy/id_rsa",
+    "deploy/id_dsa",
+    "deploy/id_ed25519.pub",
+    "deploy/id_ecdsa",
+    ".netrc",
+    "home/.npmrc",
+    ".pgpass",
+    ".git-credentials",
+    "htpasswd/.htpasswd",
+    ".aws/credentials",
+    ".docker/config.json",
+    ".kube/config",
+    ".gnupg/secring.gpg",
+    "tls/client.p8",
+    "android/app.jks",
+    "java/cacerts.keystore",
+    "gcp/service-account-production.json",
+    "service-account.json",
+    "infra/terraform.tfstate",
+  ];
+  for (const file of blocked) {
+    const verdict = validateModifiedFiles([file], repo);
+    assert.equal(verdict.valid, false, `${file} should be blocked`);
+    assert.ok(verdict.violations.includes(file), `${file} should be reported as a violation`);
+  }
+});
+
+test("every new SECRET_PROBE fires on a synthetic token", () => {
+  const tokens: Array<[string, string]> = [
+    [`ghp_${"x".repeat(36)}`, "GitHub personal access token"],
+    [`gho_${"x".repeat(36)}`, "GitHub app, user, refresh or server token"],
+    [`ghs_${"x".repeat(36)}`, "GitHub app, user, refresh or server token"],
+    [`ghu_${"x".repeat(36)}`, "GitHub app, user, refresh or server token"],
+    [`ghr_${"x".repeat(36)}`, "GitHub app, user, refresh or server token"],
+    [`github_pat_${"x".repeat(30)}`, "GitHub fine-grained token"],
+    [`sk-${"x".repeat(40)}`, "generic API secret key"],
+    [`sk-or-v1-${"a".repeat(40)}`, "OpenRouter API key"],
+    [`sk-ant-${"x".repeat(30)}`, "Anthropic API key"],
+    [`sk-proj-${"x".repeat(30)}`, "OpenAI project key"],
+    [`AKIA${"A".repeat(16)}`, "AWS access key id"],
+    [`AIza${"x".repeat(35)}`, "Google API key"],
+    [`xoxb-${"1".repeat(12)}-${"x".repeat(12)}`, "Slack token"],
+    [`xoxp-${"1".repeat(12)}-${"x".repeat(12)}`, "Slack token"],
+    [`sk_live_${"x".repeat(24)}`, "Stripe live secret key"],
+    [`glpat-${"x".repeat(20)}`, "GitLab personal access token"],
+    [`hf_${"x".repeat(34)}`, "HuggingFace access token"],
+    [`npm_${"x".repeat(36)}`, "npm publish token"],
+  ];
+  for (const [token, reason] of tokens) {
+    const scan = scanPromptForSecrets(`please use ${token} to publish`);
+    assert.equal(scan.safe, false, `${token.slice(0, 12)} should be rejected`);
+    assert.ok(scan.reason?.includes(reason), `${token.slice(0, 12)} reason was ${scan.reason}`);
+  }
+});
+
+test("the generic sk- probe never masks a provider-specific reason", () => {
+  const openrouter = scanPromptForSecrets(`sk-or-v1-${"a".repeat(40)}`);
+  assert.ok(openrouter.reason?.includes("OpenRouter"));
+  const anthropic = scanPromptForSecrets(`sk-ant-${"x".repeat(30)}`);
+  assert.ok(anthropic.reason?.includes("Anthropic"));
+});
+
+test("a junction or symlink inside the worktree cannot smuggle files out of it", (t) => {
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), "hermes-guard-outside-"));
+  const inside = fs.mkdtempSync(path.join(os.tmpdir(), "hermes-guard-inside-"));
+  t.after(() => {
+    fs.rmSync(outside, { recursive: true, force: true });
+    fs.rmSync(inside, { recursive: true, force: true });
+  });
+
+  fs.writeFileSync(path.join(outside, "stolen.txt"), "outside\n", "utf8");
+  const link = path.join(inside, "escape");
+  if (!linkDirectory(outside, link)) return;
+
+  const verdict = validateModifiedFiles([path.join("escape", "stolen.txt")], inside);
+  assert.equal(verdict.valid, false, "a file reached through the junction is outside the worktree");
+
+  const plain = validateModifiedFiles([path.join("src", "nested", "new.ts")], inside);
+  assert.equal(plain.valid, true, "a legitimate new file must still pass");
+
+  const own = validateModifiedFiles([path.join("own.txt")], inside);
+  assert.equal(own.valid, true);
+});
+
+test("a repoRoot that is itself reached through a symlink still accepts its own files", (t) => {
+  const real = fs.mkdtempSync(path.join(os.tmpdir(), "hermes-guard-real-"));
+  const holder = fs.mkdtempSync(path.join(os.tmpdir(), "hermes-guard-link-"));
+  t.after(() => {
+    fs.rmSync(real, { recursive: true, force: true });
+    fs.rmSync(holder, { recursive: true, force: true });
+  });
+  fs.writeFileSync(path.join(real, "inside.ts"), "export const x = 1;\n", "utf8");
+
+  const alias = path.join(holder, "alias");
+  if (!linkDirectory(real, alias)) return;
+
+  assert.equal(validateModifiedFiles([path.join("inside.ts")], alias).valid, true);
+  assert.equal(validateModifiedFiles([path.join(alias, "inside.ts")], alias).valid, true);
+});
+
+test("a missing repoRoot falls back to lexical containment only", () => {
+  const missingRoot = path.join(os.tmpdir(), "hermes-guard-absent-root", "repo");
+  assert.equal(validateModifiedFiles([path.join("src", "index.ts")], missingRoot).valid, true);
+  assert.equal(validateModifiedFiles([path.join("..", "outside.ts")], missingRoot).valid, false);
 });

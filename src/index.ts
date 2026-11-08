@@ -29,7 +29,10 @@ server.registerTool(
       "Run an implementation, refactor, test-generation or audit task on Hermes inside an isolated " +
       "git worktree branched from local HEAD. Returns the diff, session id, tool summary and any " +
       "memory/skill writes Hermes staged. Nothing is committed to your checkout; land it with " +
-      "hermes_worktree_action. The run is pinned to cline-pass/deepseek-v4.1-flash-1017 via the " +
+      "hermes_worktree_action. A status of 'running' is a normal answer, not an error: the run " +
+      "outlived fastWaitSeconds, nothing was killed, and running waitCommand as a background " +
+      "command delivers the completion result (the same JSON, with status 'completed') as its " +
+      "output. The run is pinned to cline-pass/deepseek-v4.1-flash-1017 via the " +
       "clinepass provider; if cline pass is refused (quota exhausted), the dispatch fails closed " +
       "(success: false, modelFallback: true) instead of silently landing on a fallback model.",
     inputSchema: {
@@ -47,7 +50,22 @@ server.registerTool(
         .optional()
         .describe("Reasoning effort (none|minimal|low|medium|high|xhigh|max|ultra). Defaults to max."),
       skills: z.array(z.string()).optional().describe("Skills to preload for the run."),
-      timeoutSeconds: z.number().int().min(30).max(7200).optional().describe("Wall-clock budget (default 300s)."),
+      timeoutSeconds: z
+        .number()
+        .int()
+        .min(30)
+        .max(7200)
+        .optional()
+        .describe("Wall-clock budget for the Hermes run (default 1800s)."),
+      fastWaitSeconds: z
+        .number()
+        .min(1)
+        .max(7200)
+        .optional()
+        .describe(
+          "How long this call blocks before returning a running descriptor with a waitCommand " +
+            "(default 60s). The run keeps going either way.",
+        ),
     },
   },
   guard(async (args) => dispatchHermesTask(args)),

@@ -102,10 +102,14 @@ const PROBE = [
   "print('HERMES_PY_OK')",
 ].join("\n");
 
-let resolvedPython: string | null = null;
+const PYTHON_FLAGS = ["-I", "-X", "utf8"];
 
-export const resolveHermesPython = async (): Promise<string> => {
-  if (resolvedPython) return resolvedPython;
+const cacheKey = (): string => `${hermesHome()}|${process.env.HERMES_PYTHON ?? ""}`;
+
+const resolvedPython = new Map<string, string>();
+const inFlightProbes = new Map<string, Promise<string>>();
+
+const probePython = async (): Promise<string> => {
   const root = hermesAgentRoot();
   const env = {
     ...process.env,
@@ -116,16 +120,38 @@ export const resolveHermesPython = async (): Promise<string> => {
   };
 
   for (const candidate of pythonCandidates()) {
-    const result = await run(candidate, ["-I", "-c", PROBE, root], {
+    const result = await run(candidate, [...PYTHON_FLAGS, "-c", PROBE, root], {
       env,
       timeoutMs: 90_000,
     });
-    if (result.code === 0 && result.stdout.includes("HERMES_PY_OK")) {
-      resolvedPython = candidate;
-      return candidate;
-    }
+    if (result.code === 0 && result.stdout.includes("HERMES_PY_OK")) return candidate;
   }
   throw new Error(
     `No Hermes Python interpreter could import tools.write_approval. Looked at: ${pythonCandidates().join(", ") || "(none)"}`,
   );
+};
+
+/**
+ * Memoised per (HERMES_HOME, HERMES_PYTHON) and re-validated on every hit: a Hermes update can
+ * delete the venv out from under a long-lived MCP process. Concurrent callers share one probe.
+ */
+export const resolveHermesPython = async (): Promise<string> => {
+  const key = cacheKey();
+  const cached = resolvedPython.get(key);
+  if (cached) {
+    if (exists(cached)) return cached;
+    resolvedPython.delete(key);
+  }
+
+  let probe = inFlightProbes.get(key);
+  if (!probe) {
+    probe = probePython().then((interpreter) => {
+      resolvedPython.set(key, interpreter);
+      return interpreter;
+    });
+    inFlightProbes.set(key, probe);
+    // A rejected promise must never stay cached, and the cleanup copy must not be an unhandled rejection.
+    probe.catch(() => {}).finally(() => inFlightProbes.delete(key));
+  }
+  return probe;
 };

@@ -12,6 +12,7 @@ import { hermesAgentRoot, hermesHome, resolveHermesPython } from "./hermes-paths
 const BRIDGE_SCRIPT = String.raw`
 import json
 import os
+import re
 import sys
 import time
 import traceback
@@ -34,12 +35,28 @@ from tools.memory_tool import load_on_disk_store
 from tools.memory_tool_store import (
     ENTRY_DELIMITER,
     _find_unique_match,
-    _normalize_for_match,
     _patch_entry,
 )
 from utils import atomic_json_write
 
 SUBSYSTEMS = ("memory", "skills")
+ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
+DESTRUCTIVE = ("patch", "replace", "remove")
+
+
+def _check_subsystem(value, allow_all=False):
+    if value is not None and value not in SUBSYSTEMS and not (allow_all and value == "all"):
+        raise ValueError("unknown subsystem '{}'".format(value))
+    return value
+
+
+def _check_id(value):
+    """A pending id becomes a filename component: 'all' or one bare token, never a path."""
+    if value is None or value == "":
+        return value
+    if str(value) == "all" or ID_PATTERN.match(str(value)):
+        return str(value)
+    raise ValueError("invalid pending id '{}'".format(value))
 
 
 def _ops(payload):
@@ -49,20 +66,8 @@ def _ops(payload):
 
 
 def _content_of(op):
-    value = op.get("content")
-    return value if value is not None else (op.get("new_text") or "")
-
-
-def _present(entries, needle):
-    needle = (needle or "").strip()
-    if not needle:
-        return False
-    if any(needle in entry for entry in entries):
-        return True
-    folded = _normalize_for_match(needle)
-    if not any(ch.isalnum() for ch in folded):
-        return False
-    return any(folded in _normalize_for_match(entry) for entry in entries)
+    """MemoryStore writes 'new_text' on legacy patch records; both fields mean the same here."""
+    return op.get("content") or op.get("new_text") or ""
 
 
 def _working(store):
@@ -73,9 +78,22 @@ def _limits(store):
     return {"memory": store.memory_char_limit, "user": store.user_char_limit}
 
 
-def _classify_ops(ops, working, limit):
-    """Classify every op against the live entries, applying each accepted op in turn so the
-    next one is judged against the state the approval would actually produce."""
+def _entries_and_limit(store, target):
+    """Fresh (entries, limit) for *target*, or (None, None) for a target no store backs."""
+    limits = _limits(store)
+    if target not in limits:
+        return None, None
+    return list(_working(store)[target]), limits[target]
+
+
+def _over_budget(entries, limit):
+    return "would put memory at {:,}/{:,} chars".format(len(ENTRY_DELIMITER.join(entries)), limit)
+
+
+def _walk(ops, working, budget):
+    """Classify the ops in order, applying each accepted op so op N+1 is judged against the
+    state op N would produce. *budget* None skips the char check (the projection pass)."""
+    entries = list(working)
     results = []
     for index, op in enumerate(ops):
         action = (op.get("action") or "").lower()
@@ -83,48 +101,65 @@ def _classify_ops(ops, working, limit):
         content = _content_of(op)
         matched = op.get("matched_entry")
         status, detail, rebind_to = "VALID", "", None
-        idx = working.index(matched) if matched and matched in working else None
+        idx = entries.index(matched) if matched and matched in entries else None
+        stale = bool(matched) and idx is None
 
         if action == "add":
-            if content.strip() and content.strip() in [entry.strip() for entry in working]:
+            stripped = content.strip()
+            if not stripped:
+                status, detail = "CONFLICT", "add requires content"
+            elif stripped in [entry.strip() for entry in entries]:
                 status, detail = "REDUNDANT_NOOP", "entry already present"
+            elif budget is not None and len(ENTRY_DELIMITER.join(entries + [stripped])) > budget:
+                status, detail = "CONFLICT", _over_budget(entries + [stripped], budget)
             else:
-                total = len(ENTRY_DELIMITER.join(working + [content]))
-                if total > limit:
-                    status, detail = "CONFLICT", "would put memory at {:,}/{:,} chars".format(total, limit)
-                else:
-                    working.append(content)
-        elif action in ("patch", "remove"):
-            if action == "patch" and not old_text.strip():
-                status, detail = "CONFLICT", "patch requires old_text"
+                entries.append(stripped)
+        elif action in DESTRUCTIVE:
+            if not old_text.strip():
+                status, detail = "CONFLICT", "{} requires old_text".format(action)
             elif idx is not None:
                 pass
-            elif action == "remove" and not _present(working, old_text):
-                status, detail = "REDUNDANT_NOOP", "entry already removed"
-            elif action == "patch" and content.strip() and content.strip() in [e.strip() for e in working]:
+            elif action != "remove" and not content.strip():
+                status, detail = "CONFLICT", "{} requires content".format(action)
+            elif action != "remove" and content.strip() and content.strip() in [e.strip() for e in entries]:
                 status, detail = "REDUNDANT_NOOP", "patched text already present"
             else:
-                ridx, ambiguous = _find_unique_match(working, old_text.strip())
+                ridx, ambiguous = _find_unique_match(entries, old_text.strip())
                 if ambiguous:
                     status, detail = "CONFLICT", "old_text matches more than one entry"
                 elif ridx is None:
-                    status, detail = "CONFLICT", "no entry matches old_text"
+                    status, detail = (
+                        ("REDUNDANT_NOOP", "entry already removed")
+                        if action == "remove"
+                        else ("CONFLICT", "no entry matches old_text")
+                    )
+                elif action == "remove" and stale:
+                    # A remove must never silently delete an entry nobody reviewed.
+                    status, detail = "CONFLICT", "entry changed since staged; refusing to rebind remove"
                 else:
-                    status, detail, rebind_to = "REBINDABLE", "unique match found; will re-pin matched_entry", working[ridx]
+                    status, detail, rebind_to = "REBINDABLE", "unique match found; will re-pin matched_entry", entries[ridx]
                     idx = ridx
         else:
             status, detail = "CONFLICT", "unsupported action '{}'".format(action)
 
-        if status in ("VALID", "REBINDABLE") and action in ("patch", "remove"):
-            entry = working[idx]
+        if status in ("VALID", "REBINDABLE") and action in DESTRUCTIVE:
+            entry = entries[idx]
             if action == "remove":
-                working.pop(idx)
+                entries.pop(idx)
             else:
                 patched, error, _failure = _patch_entry(entry, old_text, content)
                 if error:
                     status, detail, rebind_to = "CONFLICT", error, None
+                elif budget is not None and len(
+                    ENTRY_DELIMITER.join(entries[:idx] + [patched] + entries[idx + 1:])
+                ) > budget:
+                    status, detail, rebind_to = (
+                        "CONFLICT",
+                        _over_budget(entries[:idx] + [patched] + entries[idx + 1:], budget),
+                        None,
+                    )
                 else:
-                    working[idx] = patched
+                    entries[idx] = patched
 
         results.append({
             "index": index,
@@ -136,6 +171,16 @@ def _classify_ops(ops, working, limit):
             "detail": detail,
             "rebind_to": rebind_to,
         })
+    return results, entries
+
+
+def _classify_ops(ops, working, limit):
+    """The char budget is judged on the PROJECTED FINAL STATE of the batch: an add+remove pair
+    that nets inside the limit must not be rejected for its transient peak."""
+    projected, final = _walk(ops, working, None)
+    if len(ENTRY_DELIMITER.join(final)) <= limit:
+        return projected
+    results, _final = _walk(ops, working, limit)
     return results
 
 
@@ -210,13 +255,12 @@ def op_inspect(_request):
 
 
 def op_pending(request):
-    requested = request.get("subsystem") or "all"
+    requested = _check_subsystem(request.get("subsystem") or "all", allow_all=True)
+    requested = requested or "all"
     subsystems = SUBSYSTEMS if requested == "all" else (requested,)
-    only_id = request.get("id")
+    only_id = _check_id(request.get("id"))
     records = []
     for subsystem in subsystems:
-        if subsystem not in SUBSYSTEMS:
-            raise ValueError("unknown subsystem '{}'".format(subsystem))
         for rec in wa.list_pending(subsystem):
             if only_id and rec.get("id") != only_id:
                 continue
@@ -225,7 +269,6 @@ def op_pending(request):
 
 
 def _diagnose_records(store, subsystem, only_id):
-    working = _working(store)
     limits = _limits(store)
     records = []
     counts = {"VALID": 0, "REDUNDANT_NOOP": 0, "REBINDABLE": 0, "CONFLICT": 0}
@@ -244,9 +287,15 @@ def _diagnose_records(store, subsystem, only_id):
             "ops": [],
         }
         if subsystem == "memory":
-            if target not in working:
-                working[target] = []
-            ops = _classify_ops(_ops(payload), working[target], limits[target])
+            # Fresh per record: each one is judged against live state, not against a copy
+            # mutated by an earlier record.
+            entries, limit = _entries_and_limit(store, target)
+            if entries is None:
+                item["ops"] = []
+                item["note"] = "unknown target '{}'; record is not approvable".format(target)
+                records.append(item)
+                continue
+            ops = _classify_ops(_ops(payload), entries, limit)
             item["ops"] = ops
             for result in ops:
                 counts[result["status"]] = counts.get(result["status"], 0) + 1
@@ -255,7 +304,8 @@ def _diagnose_records(store, subsystem, only_id):
         records.append(item)
 
     usage = {}
-    for target, entries in working.items():
+    for target in limits:
+        entries = _working(store)[target]
         usage[target] = {
             "entries": len(entries),
             "char_count": len(ENTRY_DELIMITER.join(entries)),
@@ -265,29 +315,39 @@ def _diagnose_records(store, subsystem, only_id):
 
 
 def op_diagnose(request):
+    subsystem = _check_subsystem(request.get("subsystem") or "memory") or "memory"
+    only_id = _check_id(request.get("id"))
     store = load_on_disk_store()
-    subsystem = request.get("subsystem") or "memory"
-    if subsystem not in SUBSYSTEMS:
-        raise ValueError("unknown subsystem '{}'".format(subsystem))
-    return _diagnose_records(store, subsystem, request.get("id"))
+    return _diagnose_records(store, subsystem, only_id)
 
 
 def op_salvage(request):
+    subsystem = _check_subsystem(request.get("subsystem") or "memory")
+    if subsystem == "skills":
+        # Salvage rewrites MEMORY batches only; a skill record has no ops to re-pin.
+        raise ValueError("salvage only handles subsystem 'memory'")
     store = load_on_disk_store()
-    target_id = request.get("id") or "all"
-    working = _working(store)
-    limits = _limits(store)
+    target_id = _check_id(request.get("id") or "all") or "all"
     outcomes = []
 
     for rec in wa.list_pending("memory"):
-        payload = rec.get("payload") or {}
-        target = payload.get("target") or "memory"
-        if target not in working:
-            working[target] = []
-        ops = _ops(payload)
-        results = _classify_ops(ops, working[target], limits[target])
         if target_id != "all" and rec.get("id") != target_id:
             continue
+        payload = rec.get("payload") or {}
+        target = payload.get("target") or "memory"
+        entries, limit = _entries_and_limit(store, target)
+        if entries is None:
+            outcomes.append({
+                "id": rec.get("id"),
+                "outcome": "unchanged",
+                "kept": 0,
+                "dropped": 0,
+                "unresolvable_ops": [],
+                "message": "unknown target '{}'; the record was left in place".format(target),
+            })
+            continue
+        ops = _ops(payload)
+        results = _classify_ops(ops, entries, limit)
 
         kept, dropped, unresolvable = [], [], []
         for op, result in zip(ops, results):
@@ -358,8 +418,8 @@ def _after(subsystem, text):
 
 
 def op_approve(request):
-    subsystem = request.get("subsystem") or "memory"
-    pending_id = request.get("id")
+    subsystem = _check_subsystem(request.get("subsystem") or "memory") or "memory"
+    pending_id = _check_id(request.get("id"))
     if not pending_id:
         raise ValueError("approve requires an id (or 'all')")
     store = load_on_disk_store() if subsystem == "memory" else None
@@ -368,8 +428,8 @@ def op_approve(request):
 
 
 def op_reject(request):
-    subsystem = request.get("subsystem") or "memory"
-    pending_id = request.get("id")
+    subsystem = _check_subsystem(request.get("subsystem") or "memory") or "memory"
+    pending_id = _check_id(request.get("id"))
     if not pending_id:
         raise ValueError("reject requires an id (or 'all')")
     text = handle_pending_subcommand(subsystem, ["reject", pending_id])
@@ -404,7 +464,7 @@ def main():
             "traceback": traceback.format_exc(),
         }
 
-    response_path.write_text(json.dumps(record, ensure_ascii=False, default=str), encoding="utf-8")
+    atomic_json_write(response_path, record, default=str)
 
 
 main()
@@ -416,6 +476,22 @@ export interface BridgeRequest {
   id?: string;
 }
 
+const SUBSYSTEMS = new Set(["memory", "skills", "all"]);
+const ID_PATTERN = /^[A-Za-z0-9_-]+$/;
+
+/**
+ * A pending id is a filename component on the Python side, so a traversal id must never reach a
+ * spawned process. Validated here as well as there: defence in depth, and the error names the value.
+ */
+const validateRequest = (request: BridgeRequest): void => {
+  if (request.subsystem !== undefined && !SUBSYSTEMS.has(request.subsystem)) {
+    throw new Error(`Unknown subsystem '${String(request.subsystem)}' (expected memory, skills or all)`);
+  }
+  if (request.id !== undefined && request.id !== "all" && !ID_PATTERN.test(request.id)) {
+    throw new Error(`Invalid pending id '${request.id}' (expected 'all' or [A-Za-z0-9_-]+)`);
+  }
+};
+
 const bridgeEnv = (): NodeJS.ProcessEnv => ({
   ...process.env,
   HERMES_HOME: hermesHome(),
@@ -426,15 +502,23 @@ const bridgeEnv = (): NodeJS.ProcessEnv => ({
 
 let scriptPathPromise: Promise<string> | null = null;
 
-/** The script is written once per process, into the scratch dir the host already owns. */
+/**
+ * The script is written once per process into a private mkdtemp dir: a predictable shared name
+ * would let any local user pre-create or read it.
+ */
 const ensureScript = (): Promise<string> => {
-  scriptPathPromise ??= (async () => {
-    const dir = path.join(os.tmpdir(), "hermes-worker");
-    await fs.mkdir(dir, { recursive: true });
-    const file = path.join(dir, "hermes_bridge.py");
-    await fs.writeFile(file, BRIDGE_SCRIPT, "utf8");
-    return file;
-  })();
+  if (!scriptPathPromise) {
+    scriptPathPromise = (async () => {
+      const dir = await fs.mkdtemp(path.join(os.tmpdir(), "hermes-worker-script-"));
+      const file = path.join(dir, "hermes_bridge.py");
+      await fs.writeFile(file, BRIDGE_SCRIPT, { encoding: "utf8", mode: 0o600 });
+      return file;
+    })();
+    // One transient failure must not be cached for the life of the process.
+    scriptPathPromise.catch(() => {
+      scriptPathPromise = null;
+    });
+  }
   return scriptPathPromise;
 };
 
@@ -442,6 +526,7 @@ export const runBridge = async <T = unknown>(
   request: BridgeRequest,
   options: { timeoutMs?: number } = {},
 ): Promise<T> => {
+  validateRequest(request);
   const [python, script] = await Promise.all([resolveHermesPython(), ensureScript()]);
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "hermes-worker-run-"));
   const requestPath = path.join(dir, "request.json");
@@ -449,29 +534,41 @@ export const runBridge = async <T = unknown>(
 
   try {
     await fs.writeFile(requestPath, JSON.stringify(request), "utf8");
-    const result = await run(python, ["-I", script, requestPath, responsePath], {
+    // -X utf8: -I drops the environment, so PYTHONUTF8 alone would not enable UTF-8 mode.
+    const result = await run(python, ["-I", "-X", "utf8", script, requestPath, responsePath], {
       env: bridgeEnv(),
       timeoutMs: options.timeoutMs ?? 120_000,
     });
+
+    const stderr = (result.stderr || result.stdout).trim();
+    if (result.timedOut) {
+      throw new Error(`Hermes bridge timed out after ${options.timeoutMs ?? 120_000}ms: ${stderr}`);
+    }
+    if (result.code !== 0) {
+      throw new Error(`Hermes bridge exited ${result.code}: ${stderr}`);
+    }
 
     let raw: string;
     try {
       raw = await fs.readFile(responsePath, "utf8");
     } catch {
-      throw new Error(
-        `Hermes bridge produced no response (exit ${result.code}): ${(result.stderr || result.stdout).trim()}`,
-      );
+      throw new Error(`Hermes bridge produced no response (exit ${result.code}): ${stderr}`);
     }
 
-    const parsed = JSON.parse(raw) as
-      | { ok: true; result: T }
-      | { ok: false; error: string; traceback?: string };
+    let parsed: { ok: true; result: T } | { ok: false; error: string; traceback?: string };
+    try {
+      parsed = JSON.parse(raw) as typeof parsed;
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      throw new Error(`Hermes bridge returned unparseable JSON (exit ${result.code}): ${reason}: ${stderr}`);
+    }
     if (!parsed.ok) {
       throw new Error(`Hermes bridge error: ${parsed.error}${parsed.traceback ? `\n${parsed.traceback}` : ""}`);
     }
     return parsed.result;
   } finally {
-    await fs.rm(dir, { recursive: true, force: true });
+    // A locked Windows temp dir must not mask the real error.
+    await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
   }
 };
 

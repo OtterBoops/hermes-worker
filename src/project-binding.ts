@@ -1,11 +1,13 @@
 import fs from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { run, isWindows } from "./exec.js";
+import { run, runGit, isWindows } from "./exec.js";
 import {
   antigravityConfigDir,
   antigravitySummariesDb,
+  hermesAgentRoot,
   hermesExe,
+  hermesHome,
   projectsDbPath,
 } from "./hermes-paths.js";
 
@@ -29,20 +31,33 @@ export interface ResolveOptions {
   cwd?: string;
   conversationId?: string;
   project?: string;
+  allowProvision?: boolean;
 }
 
 /**
  * `file:///d%3A/Code/x` -> `D:\Code\x`. Antigravity percent-encodes the drive colon, so a raw
- * URL left undecoded never matches a filesystem path.
+ * URL left undecoded never matches a filesystem path. A URI with an authority is a UNC share.
  */
 export const fileUriToPath = (uri: string): string => {
-  let decoded = uri;
+  let decoded: string;
   try {
     decoded = decodeURIComponent(uri);
   } catch {
-    // A malformed escape is not worth throwing over: fall through with the raw string.
+    throw new Error(`Workspace folder URI is not valid percent-encoding: ${uri}`);
   }
-  let rest = decoded.replace(/^file:\/\//i, "");
+  const stripped = decoded.replace(/^file:\/\//i, "");
+
+  // `file://server/share/x` keeps an authority; `file:///d:/x` leaves a leading slash instead.
+  // A drive-letter authority (`file://C:/x`) is not a host, so it falls through to the drive path below.
+  if (/^file:\/\/[^/]/i.test(decoded) && !/^file:\/\/[a-z]:(\/|$)/i.test(decoded)) {
+    const [authority, ...segments] = stripped.split("/");
+    const rest = segments.filter((segment) => segment.length > 0);
+    if (!isWindows) return `//${[authority, ...rest].join("/")}`;
+    const tail = rest.join("\\");
+    return tail ? `\\\\${authority}\\${tail}` : `\\\\${authority}`;
+  }
+
+  let rest = stripped;
   if (/^\/[a-z]:(\/|$)/i.test(rest)) rest = rest.slice(1);
   if (/^[a-z]:(\/|$)/i.test(rest)) {
     const drive = rest[0].toUpperCase();
@@ -86,7 +101,12 @@ export const loadAntigravityProjects = (): AntigravityProject[] => {
       const item = resource as Record<string, unknown>;
       const gitFolder = item.gitFolder as { folderUri?: string } | undefined;
       const uri = gitFolder?.folderUri ?? (item.folderUri as string | undefined);
-      if (typeof uri === "string" && uri.trim()) folders.push(fileUriToPath(uri));
+      if (typeof uri !== "string" || !uri.trim()) continue;
+      try {
+        folders.push(fileUriToPath(uri));
+      } catch {
+        // One malformed folderUri must not hide every other workspace.
+      }
     }
     projects.push({
       id: String(record.id ?? ""),
@@ -122,6 +142,7 @@ interface HermesProjectRow {
   path: string;
 }
 
+/** A present-but-unreadable store fails the dispatch closed: guessing would provision a duplicate. */
 const loadHermesProjects = (): HermesProjectRow[] => {
   const dbPath = projectsDbPath();
   if (!fs.existsSync(dbPath)) return [];
@@ -157,8 +178,9 @@ const loadHermesProjects = (): HermesProjectRow[] => {
     for (const row of primaries) add(row, row.primary_path);
 
     return projects;
-  } catch {
-    return [];
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(`Could not read Hermes projects from ${dbPath}: ${detail}`);
   } finally {
     db?.close();
   }
@@ -173,6 +195,12 @@ const slugify = (value: string): string =>
 
 const provisionHermesProject = async (name: string, repoRoot: string, slug: string): Promise<void> => {
   const result = await run(hermesExe(), ["project", "create", name, repoRoot, "--slug", slug], {
+    cwd: repoRoot,
+    env: {
+      ...process.env,
+      HERMES_HOME: hermesHome(),
+      HERMES_AGENT_ROOT: hermesAgentRoot(),
+    },
     timeoutMs: 120_000,
   });
   if (result.code !== 0) {
@@ -180,6 +208,18 @@ const provisionHermesProject = async (name: string, repoRoot: string, slug: stri
       `hermes project create failed (${result.code}): ${(result.stderr || result.stdout).trim()}`,
     );
   }
+};
+
+/** A subdirectory, worktree or bare cwd must still resolve to the repository it belongs to. */
+const gitToplevel = async (candidate: string): Promise<string> => {
+  const result = await runGit(candidate, ["rev-parse", "--show-toplevel"]);
+  const toplevel = result.stdout.trim();
+  if (!result.ok || !toplevel) {
+    throw new Error(
+      `Could not determine a repository root: ${candidate} is not inside a git repository.`,
+    );
+  }
+  return path.resolve(toplevel);
 };
 
 /**
@@ -221,37 +261,45 @@ export const resolveAntigravityProject = async (options: ResolveOptions = {}): P
   const owningFolder = cwd
     ? selected?.folders.find((folder) => isAncestor(normalizeForCompare(folder), normalizeForCompare(cwd)))
     : undefined;
-  const repoRoot = owningFolder
+  const candidate = owningFolder
     ? path.resolve(owningFolder)
     : (cwd ?? (selected?.folders[0] ? path.resolve(selected.folders[0]) : null));
-  if (!repoRoot) {
+  if (!candidate) {
     throw new Error(
       "Could not determine a repository root: pass cwd, or a conversationId/project that has a workspace folder attached.",
     );
   }
 
+  const repoRoot = await gitToplevel(candidate);
   const target = normalizeForCompare(repoRoot);
   const hermesProjects = loadHermesProjects();
 
+  // Path only: the same basename or slug in an unrelated directory is a different project.
   const byPath = hermesProjects
     .filter((project) => isAncestor(project.path, target))
     .sort((a, b) => b.path.length - a.path.length)[0];
 
-  const nameHaystack = (selected?.name ?? path.basename(repoRoot)).toLowerCase();
-  const byName =
-    byPath ??
-    hermesProjects.find((project) => project.slug.toLowerCase() === slugify(nameHaystack)) ??
-    hermesProjects.find((project) => project.name.toLowerCase() === nameHaystack) ??
-    null;
-
-  if (byName) {
+  if (byPath) {
     return {
       repoRoot,
       antigravityProjectId: selected?.id ?? null,
       antigravityProjectName: selected?.name ?? null,
-      hermesProjectId: byName.id,
-      hermesProjectSlug: byName.slug,
-      hermesProjectName: byName.name,
+      hermesProjectId: byPath.id,
+      hermesProjectSlug: byPath.slug,
+      hermesProjectName: byPath.name,
+      provisioned: false,
+    };
+  }
+
+  const mayProvision = selected !== null || options.allowProvision === true;
+  if (!mayProvision) {
+    return {
+      repoRoot,
+      antigravityProjectId: null,
+      antigravityProjectName: null,
+      hermesProjectId: null,
+      hermesProjectSlug: null,
+      hermesProjectName: null,
       provisioned: false,
     };
   }
@@ -260,9 +308,7 @@ export const resolveAntigravityProject = async (options: ResolveOptions = {}): P
   const slug = slugify(projectName) || slugify(path.basename(repoRoot)) || "project";
   await provisionHermesProject(projectName, repoRoot, slug);
 
-  const created = loadHermesProjects().find(
-    (project) => isAncestor(project.path, target) || project.slug.toLowerCase() === slug,
-  );
+  const created = loadHermesProjects().find((project) => isAncestor(project.path, target));
   if (!created) {
     throw new Error(`Provisioned Hermes project "${slug}" but could not find it in ${projectsDbPath()}.`);
   }

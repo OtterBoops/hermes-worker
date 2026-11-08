@@ -23,6 +23,8 @@ export interface MemoryInspection {
 
 export type Subsystem = "memory" | "skills";
 
+const SUBSYSTEMS: readonly Subsystem[] = ["memory", "skills"] as const;
+
 export interface PendingOperation {
   action: string;
   old_text?: string | null;
@@ -134,33 +136,73 @@ const readRecord = (file: string): PendingRecord | null => {
   }
 };
 
-const sleepSync = (ms: number): void => {
-  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
-};
+const POLL_INTERVAL_MS = 100;
+const QUIET_WINDOW_MS = 150;
+
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+const newFiles = (subsystem: Subsystem, known: Set<string>, inspected: Set<string>): string[] =>
+  listPendingFiles(subsystem).filter((file) => {
+    const id = path.basename(file, ".json");
+    return !known.has(id) && !inspected.has(id);
+  });
 
 /**
  * The background-review fork writes its pending record in a daemon thread that can outlive the
  * CLI process teardown, so an empty read right after exit is not proof there was no write.
+ * Polls without blocking the loop, then keeps listening for one quiet window so siblings staged a
+ * moment later land in the same collection. A corrupt file is inspected once and never retried.
  */
-export const collectNewPendingWrites = (
+export const collectNewPendingWrites = async (
   before: { memory: Set<string>; skills: Set<string> },
   deadlineMs = 1500,
-): PendingRecord[] => {
+): Promise<PendingRecord[]> => {
   const started = Date.now();
-  const collect = (subsystem: Subsystem, known: Set<string>): PendingRecord[] =>
-    listPendingFiles(subsystem)
-      .filter((file) => !known.has(path.basename(file, ".json")))
-      .map(readRecord)
-      .filter((record): record is PendingRecord => record !== null);
+  const inspected: Record<Subsystem, Set<string>> = { memory: new Set(), skills: new Set() };
+  const found: Record<Subsystem, Map<string, PendingRecord>> = { memory: new Map(), skills: new Map() };
+  const elapsed = (): number => Date.now() - started;
 
-  let memory = collect("memory", before.memory);
-  let skills = collect("skills", before.skills);
-  while (memory.length === 0 && skills.length === 0 && Date.now() - started < deadlineMs) {
-    sleepSync(150);
-    memory = collect("memory", before.memory);
-    skills = collect("skills", before.skills);
+  const harvest = (): number => {
+    let added = 0;
+    for (const subsystem of SUBSYSTEMS) {
+      for (const file of newFiles(subsystem, before[subsystem], inspected[subsystem])) {
+        const id = path.basename(file, ".json");
+        inspected[subsystem].add(id);
+        const record = readRecord(file);
+        // Unparseable is not activity: it must not extend the wait, and it is not reported.
+        if (!record) continue;
+        found[subsystem].set(id, record);
+        added += 1;
+      }
+    }
+    return added;
+  };
+
+  const total = (): number => found.memory.size + found.skills.size;
+
+  harvest();
+  while (total() === 0 && elapsed() < deadlineMs) {
+    await sleep(POLL_INTERVAL_MS);
+    harvest();
   }
-  return [...memory, ...skills];
+  while (total() > 0 && elapsed() < deadlineMs) {
+    const seen = total();
+    await sleep(QUIET_WINDOW_MS);
+    harvest();
+    if (total() === seen) break;
+  }
+
+  return [...found.memory.values(), ...found.skills.values()];
+};
+
+const ID_PATTERN = /^[A-Za-z0-9_-]+$/;
+
+/** A pending id reaches a filename on the Python side: validate before spawning anything. */
+const assertPendingId = (id: string, action: string): string => {
+  if (id !== "all" && !ID_PATTERN.test(id)) {
+    throw new Error(`Invalid pending id '${id}' for ${action} (expected 'all' or [A-Za-z0-9_-]+)`);
+  }
+  return id;
 };
 
 /**
@@ -178,7 +220,7 @@ export const managePendingWrites = async (params: {
     case "list":
     case "preview": {
       const request: BridgeRequest = { op: "pending", subsystem };
-      if (params.action === "preview" && params.id) request.id = params.id;
+      if (params.action === "preview" && params.id) request.id = assertPendingId(params.id, "preview");
       const result = await runBridge<{ subsystem: string; count: number; records: PendingRecord[] }>(request);
       return { action: params.action, ...result };
     }
@@ -186,11 +228,18 @@ export const managePendingWrites = async (params: {
       if (subsystem === "all") {
         throw new Error("diagnose requires subsystem 'memory' or 'skills'");
       }
-      const result = await runBridge<Diagnosis>({ op: "diagnose", subsystem, id: params.id });
+      const result = await runBridge<Diagnosis>({
+        op: "diagnose",
+        subsystem,
+        ...(params.id === undefined ? {} : { id: assertPendingId(params.id, "diagnose") }),
+      });
       return { action: "diagnose", subsystem, ...result };
     }
     case "salvage": {
-      const id = params.id ?? "all";
+      const id = assertPendingId(params.id ?? "all", "salvage");
+      if (subsystem === "skills") {
+        throw new Error("salvage only rewrites memory batches; use subsystem 'memory'");
+      }
       const result = await runBridge<{ id: string; outcomes: SalvageOutcome[] }>({
         op: "salvage",
         subsystem: "memory",
@@ -205,7 +254,7 @@ export const managePendingWrites = async (params: {
       const result = await runBridge<{ output: string; pending_remaining: number }>({
         op: params.action,
         subsystem,
-        id: params.id,
+        id: assertPendingId(params.id, params.action),
       });
       return { action: params.action, ...result };
     }

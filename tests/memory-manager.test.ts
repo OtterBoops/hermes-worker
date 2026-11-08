@@ -12,7 +12,7 @@ import {
   type PendingWritesResult,
   type SalvageOutcome,
 } from "../src/memory-manager.js";
-import { hermesHome } from "../src/hermes-paths.js";
+import { hermesHome, resolveHermesPython } from "../src/hermes-paths.js";
 
 const DELIMITER = "\n§\n";
 
@@ -48,24 +48,54 @@ interface Sandbox {
   home: string;
   memoryFile: string;
   write: (id: string, payload: Record<string, unknown>) => void;
+  writeRaw: (id: string, raw: string) => void;
 }
 
-const makeSandbox = (t: TestContext): Sandbox => {
+interface SandboxOptions {
+  entries?: string[];
+  limits?: { memory: number; user: number };
+}
+
+/**
+ * The probe resolves against the real install, which is gone once HERMES_HOME moves. Resolve it
+ * once with the real env and then pin HERMES_PYTHON so every sandbox stays independently runnable.
+ */
+let resolvedPythonPath: string | null = null;
+
+const interpreterPath = async (): Promise<string> => {
+  resolvedPythonPath ??= await resolveHermesPython();
+  return resolvedPythonPath;
+};
+
+const makeSandbox = async (t: TestContext, options: SandboxOptions = {}): Promise<Sandbox> => {
+  const python = await interpreterPath();
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "hermes-worker-home-"));
   const memories = path.join(home, "memories");
   const pending = path.join(home, "pending", "memory");
   fs.mkdirSync(memories, { recursive: true });
   fs.mkdirSync(pending, { recursive: true });
+  fs.mkdirSync(path.join(home, "pending", "skills"), { recursive: true });
 
   const memoryFile = path.join(memories, "MEMORY.md");
-  fs.writeFileSync(memoryFile, [ALPHA, BETA, GAMMA].join(DELIMITER), "utf8");
+  fs.writeFileSync(memoryFile, (options.entries ?? [ALPHA, BETA, GAMMA]).join(DELIMITER), "utf8");
   fs.writeFileSync(path.join(memories, "USER.md"), "User profile entry.", "utf8");
+  if (options.limits) {
+    fs.writeFileSync(
+      path.join(home, "config.yaml"),
+      `memory:\n  memory_char_limit: ${options.limits.memory}\n  user_char_limit: ${options.limits.user}\n`,
+      "utf8",
+    );
+  }
 
   const previousHome = process.env.HERMES_HOME;
+  const previousPython = process.env.HERMES_PYTHON;
+  process.env.HERMES_PYTHON = python;
   process.env.HERMES_HOME = home;
   t.after(() => {
     if (previousHome === undefined) delete process.env.HERMES_HOME;
     else process.env.HERMES_HOME = previousHome;
+    if (previousPython === undefined) delete process.env.HERMES_PYTHON;
+    else process.env.HERMES_PYTHON = previousPython;
     fs.rmSync(home, { recursive: true, force: true });
   });
 
@@ -89,7 +119,11 @@ const makeSandbox = (t: TestContext): Sandbox => {
     );
   };
 
-  return { home, memoryFile, write };
+  const writeRaw = (id: string, raw: string): void => {
+    fs.writeFileSync(path.join(pending, `${id}.json`), raw, "utf8");
+  };
+
+  return { home, memoryFile, write, writeRaw };
 };
 
 const seedRecords = (sandbox: Sandbox): void => {
@@ -131,7 +165,7 @@ const seedRecords = (sandbox: Sandbox): void => {
 };
 
 test("diagnose classifies every operation without touching disk", async (t) => {
-  const sandbox = makeSandbox(t);
+  const sandbox = await makeSandbox(t);
   seedRecords(sandbox);
 
   const pendingDir = path.join(sandbox.home, "pending", "memory");
@@ -148,10 +182,7 @@ test("diagnose classifies every operation without touching disk", async (t) => {
 
   const aaa = byId.get("aaa11111");
   assert.ok(aaa, "record aaa11111 should be diagnosed");
-  assert.deepEqual(
-    aaa.ops.map((op) => op.status),
-    ["VALID", "REDUNDANT_NOOP", "REBINDABLE"],
-  );
+  assert.deepEqual(aaa.ops.map((op) => op.status), ["VALID", "REDUNDANT_NOOP", "REBINDABLE"]);
   assert.equal(aaa.ops[2].rebind_to, BETA, "the rebindable patch should name the live entry it will pin");
 
   const bbb = byId.get("bbb22222");
@@ -174,7 +205,7 @@ test("diagnose classifies every operation without touching disk", async (t) => {
 });
 
 test("salvage strips redundant ops, re-pins the rest and prunes empty records", async (t) => {
-  const sandbox = makeSandbox(t);
+  const sandbox = await makeSandbox(t);
   seedRecords(sandbox);
 
   const salvage = (await managePendingWrites({ action: "salvage", id: "all" })) as {
@@ -208,7 +239,7 @@ test("salvage strips redundant ops, re-pins the rest and prunes empty records", 
 });
 
 test("an approved record lands in memory, a rejected one is dropped", async (t) => {
-  const sandbox = makeSandbox(t);
+  const sandbox = await makeSandbox(t);
   seedRecords(sandbox);
 
   await managePendingWrites({ action: "salvage", id: "all" });
@@ -234,7 +265,7 @@ test("an approved record lands in memory, a rejected one is dropped", async (t) 
 });
 
 test("list and preview expose the staged operations", async (t) => {
-  const sandbox = makeSandbox(t);
+  const sandbox = await makeSandbox(t);
   seedRecords(sandbox);
 
   const listed = await managePendingWrites({ action: "list", subsystem: "memory" });
@@ -249,7 +280,7 @@ test("list and preview expose the staged operations", async (t) => {
 });
 
 test("skill records list, preview and reject through the same queue", async (t) => {
-  const sandbox = makeSandbox(t);
+  const sandbox = await makeSandbox(t);
   const skillsDir = path.join(sandbox.home, "pending", "skills");
   fs.mkdirSync(skillsDir, { recursive: true });
   fs.writeFileSync(
@@ -287,10 +318,15 @@ test("skill records list, preview and reject through the same queue", async (t) 
   assert.ok("output" in rejected);
   assert.equal(rejected.pending_remaining, 0);
   assert.equal(fs.existsSync(path.join(skillsDir, "eee55555.json")), false);
+
+  await assert.rejects(
+    managePendingWrites({ action: "salvage", subsystem: "skills", id: "all" }),
+    /salvage only rewrites memory/,
+  );
 });
 
 test("snapshot plus collect isolates the records a run created", async (t) => {
-  const sandbox = makeSandbox(t);
+  const sandbox = await makeSandbox(t);
   seedRecords(sandbox);
   const before = snapshotPendingIds();
   assert.deepEqual([...before.memory].sort(), ["aaa11111", "bbb22222", "ccc33333"]);
@@ -302,9 +338,176 @@ test("snapshot plus collect isolates the records a run created", async (t) => {
     content: "Epsilon topic: staged during the run.",
   });
 
-  const created = collectNewPendingWrites(before, 200);
+  const created = await collectNewPendingWrites(before, 200);
   assert.equal(created.length, 1);
   assert.equal(created[0].id, "ddd44444");
   assert.equal(created[0].subsystem, "memory");
   assert.equal(created[0].ops?.[0].action, "add");
+});
+
+test("pending ids that are not bare tokens are rejected before anything spawns", async (t) => {
+  const sandbox = await makeSandbox(t);
+  seedRecords(sandbox);
+  const pendingDir = path.join(sandbox.home, "pending", "memory");
+  const listing = fs.readdirSync(pendingDir).sort();
+
+  const started = Date.now();
+  await assert.rejects(
+    managePendingWrites({ action: "approve", subsystem: "memory", id: "../../etc/passwd" }),
+    (error: Error) => {
+      assert.match(error.message, /Invalid pending id '\.\.\/\.\.\/etc\/passwd'/);
+      assert.match(error.message, /for approve/);
+      assert.doesNotMatch(error.message, /Hermes bridge/, "must not reach the bridge at all");
+      return true;
+    },
+  );
+  await assert.rejects(
+    managePendingWrites({ action: "diagnose", subsystem: "memory", id: "../x" }),
+    /Invalid pending id '\.\.\/x'/,
+  );
+  await assert.rejects(managePendingWrites({ action: "salvage", id: "..%2Fx" }), /Invalid pending id/);
+
+  assert.ok(Date.now() - started < 5_000);
+  assert.deepEqual(fs.readdirSync(pendingDir).sort(), listing, "no file may be created or consumed");
+  assert.equal(fs.existsSync(path.join(sandbox.home, "etc")), false);
+  assert.equal(fs.existsSync(path.join(path.dirname(sandbox.home), "passwd")), false);
+});
+
+test("legacy shapes classify without inventing conflicts", async (t) => {
+  const sandbox = await makeSandbox(t);
+  sandbox.write("leg66666", {
+    action: "batch",
+    target: "memory",
+    operations: [
+      {
+        action: "replace",
+        old_text: "self-hosted runner",
+        new_text: "legacy replaced span",
+        matched_entry: BETA,
+      },
+      { action: "add", content: "   " },
+      { action: "remove", old_text: "Alpha topic", matched_entry: "Alpha topic: stale copy." },
+      { action: "remove", old_text: "Zeta topic", matched_entry: "Zeta topic: already gone." },
+      {
+        action: "patch",
+        old_text: "theme tokens are registered",
+        new_text: "theme tokens live on html",
+        matched_entry: GAMMA,
+      },
+    ],
+  });
+
+  const diagnosis = (await managePendingWrites({
+    action: "diagnose",
+    subsystem: "memory",
+  })) as Extract<PendingWritesResult, { action: "diagnose" }> & Diagnosis;
+  const record = diagnosis.records.find((entry) => entry.id === "leg66666");
+  assert.ok(record);
+  assert.deepEqual(
+    record.ops.map((op) => op.status),
+    ["VALID", "CONFLICT", "CONFLICT", "REDUNDANT_NOOP", "VALID"],
+  );
+  assert.equal(record.ops[0].content, "legacy replaced span", "new_text is a legacy content field");
+  assert.equal(record.ops[1].detail, "add requires content");
+  assert.equal(record.ops[2].detail, "entry changed since staged; refusing to rebind remove");
+  assert.equal(record.ops[3].detail, "entry already removed");
+  assert.equal(record.ops[4].content, "theme tokens live on html");
+});
+
+/** A near-full store: the add alone overflows, the paired remove frees more than the add costs. */
+const NET_BUDGET_LIMIT = 200;
+const nearEntry = `Keep topic: ${"y".repeat(40)}`;
+const staleEntry = `Stale topic: ${"x".repeat(90)}`;
+const freshEntry = `Fresh topic: ${"z".repeat(90)}`;
+
+const seedNetBudgetRecord = (sandbox: Sandbox): void => {
+  sandbox.write("fed77777", {
+    action: "batch",
+    target: "memory",
+    operations: [
+      { action: "add", content: freshEntry },
+      { action: "remove", old_text: "Stale topic", matched_entry: staleEntry },
+    ],
+  });
+};
+
+test("an add+remove batch that nets within budget is VALID and survives salvage", async (t) => {
+  const sandbox = await makeSandbox(t, {
+    entries: [nearEntry, staleEntry],
+    limits: { memory: NET_BUDGET_LIMIT, user: 100 },
+  });
+  seedNetBudgetRecord(sandbox);
+
+  const live = [nearEntry, staleEntry].join(DELIMITER).length;
+  assert.ok(live + DELIMITER.length + freshEntry.length > NET_BUDGET_LIMIT, "the add alone must overflow");
+  assert.ok([nearEntry, freshEntry].join(DELIMITER).length <= NET_BUDGET_LIMIT, "the batch must net inside");
+
+  const diagnosis = (await managePendingWrites({
+    action: "diagnose",
+    subsystem: "memory",
+  })) as Extract<PendingWritesResult, { action: "diagnose" }> & Diagnosis;
+  const record = diagnosis.records.find((entry) => entry.id === "fed77777");
+  assert.ok(record);
+  assert.deepEqual(record.ops.map((op) => op.status), ["VALID", "VALID"]);
+
+  const salvage = (await managePendingWrites({ action: "salvage", id: "fed77777" })) as {
+    outcomes: SalvageOutcome[];
+  };
+  const outcome = salvage.outcomes[0];
+  assert.equal(outcome.kept, 2, "both ops must be kept");
+  assert.equal(outcome.dropped, 0);
+
+  const kept = JSON.parse(
+    fs.readFileSync(path.join(sandbox.home, "pending", "memory", "fed77777.json"), "utf8"),
+  ) as { payload: { operations: Array<Record<string, unknown>> } };
+  assert.deepEqual(
+    kept.payload.operations.map((op) => op.action),
+    ["add", "remove"],
+  );
+  assert.equal(kept.payload.operations[1].matched_entry, staleEntry);
+});
+
+test("collectNewPendingWrites gathers records staged 80ms apart", async (t) => {
+  const sandbox = await makeSandbox(t);
+  const before = snapshotPendingIds();
+
+  const staging = (async () => {
+    sandbox.write("abc11111", { action: "add", target: "memory", content: "Sibling one." });
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    sandbox.write("abc22222", { action: "add", target: "memory", content: "Sibling two." });
+  })();
+
+  const created = await collectNewPendingWrites(before, 1_000);
+  await staging;
+
+  assert.deepEqual(created.map((record) => record.id).sort(), ["abc11111", "abc22222"]);
+});
+
+test("a corrupt pending record neither stalls collection nor appears in results", async (t) => {
+  const sandbox = await makeSandbox(t);
+  const before = snapshotPendingIds();
+  sandbox.writeRaw("bad00000", "{ this is not json");
+
+  const staging = new Promise<void>((resolve) => {
+    setTimeout(() => {
+      sandbox.write("abc33333", { action: "add", target: "memory", content: "Recovered record." });
+      resolve();
+    }, 120);
+  });
+
+  const started = Date.now();
+  const created = await collectNewPendingWrites(before, 1_500);
+  await staging;
+  const elapsed = Date.now() - started;
+
+  assert.deepEqual(created.map((record) => record.id), ["abc33333"]);
+  assert.ok(elapsed < 1_000, `a corrupt file must not hold the poll open (took ${elapsed}ms)`);
+
+  const quietBefore = snapshotPendingIds();
+  sandbox.writeRaw("bad00001", "{{ truncated");
+  const quietStarted = Date.now();
+  const none = await collectNewPendingWrites(quietBefore, 250);
+  const quietElapsed = Date.now() - quietStarted;
+  assert.deepEqual(none, []);
+  assert.ok(quietElapsed < 1_500, `deadline must bound the wait (took ${quietElapsed}ms)`);
 });
