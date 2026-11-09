@@ -2,7 +2,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { dispatchHermesTask, listHermesSessions, manageWorktree } from "./hermes-cli.js";
+import { dispatchHermesTask, listHermesSessions, manageWorktree, pruneOrphanWorktrees } from "./hermes-cli.js";
 import { inspectMemory, managePendingWrites } from "./memory-manager.js";
 
 const server = new McpServer({ name: "hermes-worker", version: "1.0.0" });
@@ -69,6 +69,13 @@ server.registerTool(
           "How long this call blocks before returning a running descriptor with a waitCommand " +
             "(default 1s). The run keeps going either way.",
         ),
+      autoApply: z
+        .boolean()
+        .optional()
+        .describe(
+          "When true, automatically apply a clean worktree diff to cwd and remove the worktree " +
+            "branch on successful completion.",
+        ),
     },
   },
   guard(async (args) => dispatchHermesTask(args)),
@@ -119,6 +126,24 @@ server.registerTool(
     },
   },
   guard(async (args) => manageWorktree(args)),
+);
+
+server.registerTool(
+  "hermes_prune_worktrees",
+  {
+    title: "Sweep orphaned bridge worktrees",
+    description:
+      "Remove every .worktrees/agy-* directory that no running run owns, then prune git's worktree " +
+      "admin records. A crashed or interrupted dispatch leaves one behind; a running run's worktree " +
+      "and its branch are never touched. Returns the number of directories removed.",
+    inputSchema: {
+      cwd: z.string().describe("Repository root to sweep."),
+    },
+  },
+  guard(async (args) => {
+    const removed = await pruneOrphanWorktrees(args.cwd);
+    return { success: true, removed, message: `Removed ${removed} orphaned worktree(s) under ${args.cwd}.` };
+  }),
 );
 
 server.registerTool(

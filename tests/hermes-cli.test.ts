@@ -1,10 +1,12 @@
-import test, { type TestContext } from "node:test";
+import test, { mock, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { run } from "../src/exec.js";
+import type { DispatchResult } from "../src/hermes-cli.js";
 import {
   DEFAULT_FAST_WAIT_SECONDS,
   DEFAULT_MODEL,
@@ -16,6 +18,7 @@ import {
   readSessionAfterRun,
   listHermesSessions,
   manageWorktree,
+  pruneOrphanWorktrees,
   runMetadata,
   snapshotCallerWorkingTree,
 } from "../src/hermes-cli.js";
@@ -26,6 +29,8 @@ import {
   clearRunState,
   formatDispatchSentinel,
   formatFailedSentinel,
+  listActiveRuns,
+  pruneStaleRuns,
   readRunState,
   runLogPath,
   runStatePath,
@@ -261,6 +266,105 @@ test("a dispatch carrying a credential is refused before any git work happens", 
   assert.equal(await git(repo, ["branch", "--list"]), branchesBefore, "no branch may be created");
 });
 
+/**
+ * Stands in for the `hermes` binary: HERMES_BIN is this Node binary and a committed, extensionless
+ * `chat` script makes Node treat the dispatch argv as a script run from the worktree it is spawned in.
+ */
+const CHAT_STUB = [
+  'const fs = require("node:fs");',
+  'const path = require("node:path");',
+  'fs.writeFileSync(path.join(process.cwd(), "auto-applied.ts"), "export const autoApplied = true;\\n");',
+  'process.stdout.write(JSON.stringify({',
+  '  type: "result",',
+  '  result: "wrote auto-applied.ts",',
+  '  session_id: "sess-auto-apply",',
+  '  exit_code: 0,',
+  '}) + "\\n");',
+].join("\n");
+
+/** A fixture repo that carries the stub, plus a session store that attributes the run to a model. */
+const makeDispatchRepo = async (t: TestContext): Promise<{ repo: string; home: string }> => {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "hermes-worker-dispatch-"));
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "hermes-worker-dispatch-home-"));
+  const previousHome = process.env.HERMES_HOME;
+  const previousBin = process.env.HERMES_BIN;
+  t.after(() => {
+    if (previousHome === undefined) delete process.env.HERMES_HOME;
+    else process.env.HERMES_HOME = previousHome;
+    if (previousBin === undefined) delete process.env.HERMES_BIN;
+    else process.env.HERMES_BIN = previousBin;
+    fs.rmSync(repo, { recursive: true, force: true });
+    fs.rmSync(home, { recursive: true, force: true });
+  });
+
+  await git(repo, ["init", "-b", "main"]);
+  fs.writeFileSync(path.join(repo, "README.md"), "# fixture\n", "utf8");
+  fs.writeFileSync(path.join(repo, "chat"), CHAT_STUB, "utf8");
+  await git(repo, ["add", "."]);
+  await git(repo, ["commit", "-m", "initial"]);
+
+  // Attribution is read back from the session row after the run: without it a dispatch fails closed.
+  const db = new DatabaseSync(path.join(home, "state.db"));
+  db.exec("CREATE TABLE sessions (id TEXT PRIMARY KEY, model TEXT, model_config TEXT)");
+  db.prepare("INSERT INTO sessions (id, model, model_config) VALUES (?, ?, ?)").run(
+    "sess-auto-apply",
+    DEFAULT_MODEL,
+    JSON.stringify({ gateway_runtime: { provider: "clinepass" } }),
+  );
+  db.close();
+
+  process.env.HERMES_HOME = home;
+  process.env.HERMES_BIN = process.execPath;
+  return { repo, home };
+};
+
+test("autoApply lands the run on the checkout and reports applied", async (t) => {
+  const runId = `apply-${process.pid}-${Date.now().toString(36)}`;
+  const { repo } = await makeDispatchRepo(t);
+
+  const outcome = await dispatchHermesTask({
+    cwd: repo,
+    prompt: "Add auto-applied.ts to the repository root.",
+    runId,
+    autoApply: true,
+    fastWaitSeconds: 120,
+  });
+
+  assert.ok(!("waitCommand" in outcome), "the call waited for the run instead of answering running");
+  const result = outcome as DispatchResult;
+
+  assert.equal(result.success, true, result.message);
+  assert.equal(result.applied, true, result.message);
+  assert.equal(result.worktreeKept, false, "an applied run leaves no worktree behind");
+
+  assert.equal(
+    fs.readFileSync(path.join(repo, "auto-applied.ts"), "utf8"),
+    "export const autoApplied = true;\n",
+    "the diff must land on the caller's checkout",
+  );
+  assert.equal(await branchExists(repo, `hermes/agy-${runId}`), false, "the branch is removed");
+  assert.equal(fs.existsSync(path.join(repo, ".worktrees", `agy-${runId}`)), false);
+});
+
+test("without autoApply the diff stays in the worktree for review", async (t) => {
+  const runId = `keep-${process.pid}-${Date.now().toString(36)}`;
+  const { repo } = await makeDispatchRepo(t);
+
+  const outcome = await dispatchHermesTask({
+    cwd: repo,
+    prompt: "Add auto-applied.ts to the repository root.",
+    runId,
+    fastWaitSeconds: 120,
+  });
+  const result = outcome as DispatchResult;
+
+  assert.equal(result.success, true, result.message);
+  assert.equal(result.applied, undefined, "apply is opt-in");
+  assert.equal(result.worktreeKept, true);
+  assert.equal(fs.existsSync(path.join(repo, "auto-applied.ts")), false, "the checkout is untouched");
+  assert.equal(await branchExists(repo, `hermes/agy-${runId}`), true);
+});
+
 test("the fast-wait default keeps a dispatch call short", () => {
   assert.equal(DEFAULT_FAST_WAIT_SECONDS, 1);
 });
@@ -425,6 +529,87 @@ test("raceFastWait reports a timeout without leaving a timer behind", async () =
 
   const immediate = await raceFastWait(Promise.resolve(42), 30);
   assert.deepEqual(immediate, { done: true, value: 42 });
+});
+
+test("pruneStaleRuns removes only run files past the age cutoff", async (t) => {
+  const stamp = `${process.pid}-${Date.now().toString(36)}`;
+  const staleId = `test-stale-${stamp}`;
+  const freshId = `test-fresh-${stamp}`;
+  const staleLog = runLogPath(staleId);
+  const freshState = runStatePath(freshId);
+  const staleTmp = `${runStatePath(staleId)}.tmp`;
+  const unrelated = path.join(RUN_STATE_DIR, `keep-${stamp}.txt`);
+  fs.mkdirSync(RUN_STATE_DIR, { recursive: true });
+  fs.writeFileSync(staleTmp, "partial", "utf8");
+  fs.writeFileSync(staleLog, "abandoned\n", "utf8");
+  fs.writeFileSync(freshState, "{}", "utf8");
+  fs.writeFileSync(unrelated, "not a run artifact", "utf8");
+  t.after(() => {
+    for (const file of [staleTmp, staleLog, freshState, unrelated]) fs.rmSync(file, { force: true });
+  });
+
+  const eightHoursAgo = new Date(Date.now() - 8 * 60 * 60 * 1000);
+  fs.utimesSync(staleTmp, eightHoursAgo, eightHoursAgo);
+  fs.utimesSync(staleLog, eightHoursAgo, eightHoursAgo);
+
+  const removed = await pruneStaleRuns(60 * 60 * 1000);
+  assert.ok(removed >= 2, `the two backdated artifacts must be pruned, removed ${removed}`);
+  assert.equal(fs.existsSync(staleTmp), false, "a stale .tmp must be removed");
+  assert.equal(fs.existsSync(staleLog), false, "a stale .log must be removed");
+  assert.equal(fs.existsSync(freshState), true, "a fresh state file must survive");
+  assert.equal(fs.existsSync(unrelated), true, "a non-run suffix must never be touched");
+});
+
+test("listActiveRuns reports only the records still running, newest first", async (t) => {
+  const stamp = `${process.pid}-${Date.now().toString(36)}`;
+  const newer = `active-new-${stamp}`;
+  const older = `active-old-${stamp}`;
+  const finished = `active-done-${stamp}`;
+  const corrupt = `active-bad-${stamp}`;
+  fs.mkdirSync(RUN_STATE_DIR, { recursive: true });
+  const logNoise = runLogPath(newer);
+  t.after(() => {
+    for (const runId of [newer, older, finished, corrupt]) fs.rmSync(runStatePath(runId), { force: true });
+    fs.rmSync(logNoise, { force: true });
+  });
+
+  await writeRunState({
+    status: "running",
+    runId: older,
+    sessionName: "s",
+    worktreePath: "w",
+    branch: "hermes/agy-old",
+    startedAt: 1_000,
+  });
+  await writeRunState({
+    status: "running",
+    runId: newer,
+    sessionName: "s",
+    worktreePath: "w",
+    branch: "hermes/agy-new",
+    startedAt: 2_000,
+  });
+  await writeRunState({
+    status: "completed",
+    runId: finished,
+    sessionName: "s",
+    worktreePath: "w",
+    branch: "hermes/agy-done",
+    startedAt: 3_000,
+    result: { success: true },
+  });
+  // A run killed mid-write leaves a truncated record: it must be skipped, not thrown on.
+  fs.writeFileSync(runStatePath(corrupt), '{"status":"running"', "utf8");
+  fs.writeFileSync(logNoise, "[Hermes:Tool] not a state record\n", "utf8");
+
+  const listed = listActiveRuns().filter((state) => state.runId.endsWith(stamp));
+  assert.deepEqual(
+    listed.map((state) => state.runId),
+    [newer, older],
+    `only running records, newest first; got ${JSON.stringify(listed.map((state) => state.runId))}`,
+  );
+  assert.equal(listed[0].branch, "hermes/agy-new", "the whole record is returned, not just the id");
+  assert.equal(listed[0].status, "running");
 });
 
 test("wait.js polls the run registry, streams the log tail and reports the result", async (t) => {
@@ -833,4 +1018,199 @@ test("runMetadata appends duration, session and tokens without leaving empty seg
     runMetadata({ durationMs: null, sessionId: "s", tokens: { input_tokens: 0 } }).brackets,
     " [session: s]",
   );
+});
+
+/** A worktree as a crashed dispatch leaves it: a directory on disk that no run record owns. */
+const makeOrphan = (repo: string, runId: string): string => {
+  const target = path.join(repo, ".worktrees", `agy-${runId}`);
+  fs.mkdirSync(path.join(target, "src"), { recursive: true });
+  fs.writeFileSync(path.join(target, "src", "leftover.ts"), "export const leftover = 1;\n", "utf8");
+  return target;
+};
+
+/**
+ * Windows holds a directory handle open briefly after its process exits, so an rm lands on EPERM
+ * and a single attempt leaks the directory. The helper must retry rather than surrender.
+ */
+/**
+ * Windows holds a directory handle open briefly after its process exits, so an rm lands on EPERM
+ * and a single attempt leaks the directory. The helper must retry rather than surrender.
+ *
+ * A worktree missing its `.git` file is the cheapest way to make git refuse the removal, which is
+ * what pushes the cleanup onto the disk sweep the mock is watching.
+ */
+const breakWorktree = (worktree: string): void => {
+  fs.rmSync(path.join(worktree, ".git"));
+};
+
+test("a transient EPERM on the worktree directory is retried, not reported as a failure", async (t) => {
+  const { repo, worktree, branch } = await makeRepo(t);
+  breakWorktree(worktree);
+  const realRm = fsp.rm.bind(fsp);
+  let attempts = 0;
+
+  const handle = mock.method(fsp, "rm", async (target: unknown, options?: unknown) => {
+    // Only the worktree path fails: the branch's own bookkeeping and the test's cleanup stay real.
+    if (path.resolve(String(target)) === path.resolve(worktree)) {
+      attempts += 1;
+      if (attempts <= 2) {
+        throw Object.assign(new Error(`EPERM: operation not permitted, rmdir '${worktree}'`), {
+          code: "EPERM",
+        });
+      }
+    }
+    return realRm(target as Parameters<typeof fsp.rm>[0], options as Parameters<typeof fsp.rm>[1]);
+  });
+  t.after(() => handle.mock.restore());
+
+  const startedAt = Date.now();
+  const result = await manageWorktree({ action: "discard", cwd: repo, worktreeBranch: branch });
+  const elapsed = Date.now() - startedAt;
+
+  assert.equal(result.success, true, `a lock that clears must not be a failure: ${result.message}`);
+  assert.equal(fs.existsSync(worktree), false, "the worktree directory must be gone");
+  assert.equal(attempts, 3, "two EPERM attempts must be retried until the removal succeeds");
+  // 150ms then 300ms of backoff: proves the retries are paced, not spun.
+  assert.ok(elapsed >= 400, `retries must back off, took ${elapsed}ms`);
+  assert.equal(await branchExists(repo, branch), false);
+});
+
+test("a removal that never clears is reported with the path and the OS error", async (t) => {
+  const { repo, worktree, branch } = await makeRepo(t);
+  breakWorktree(worktree);
+  const realRm = fsp.rm.bind(fsp);
+
+  const handle = mock.method(fsp, "rm", async (target: unknown, options?: unknown) => {
+    if (path.resolve(String(target)) === path.resolve(worktree)) {
+      throw Object.assign(new Error(`EPERM: operation not permitted, rmdir '${worktree}'`), {
+        code: "EPERM",
+      });
+    }
+    return realRm(target as Parameters<typeof fsp.rm>[0], options as Parameters<typeof fsp.rm>[1]);
+  });
+  t.after(() => handle.mock.restore());
+
+  const result = await manageWorktree({ action: "discard", cwd: repo, worktreeBranch: branch });
+
+  assert.equal(result.success, false, "a directory that survives on disk is a real failure");
+  assert.match(result.message, /could not delete/);
+  assert.match(result.message, /EPERM/);
+  assert.equal(fs.existsSync(worktree), true, "the surviving directory must be reported, not hidden");
+});
+
+/**
+ * git validates the worktree's own `.git` file before it removes anything, so a damaged worktree is
+ * refused outright with the directory left behind. Sweeping it and pruning the admin record is the
+ * same end state, so the run must not report a cleanup failure for it.
+ */
+test("a worktree git refuses to remove is still a clean removal once the directory is gone", async (t) => {
+  const { repo, worktree, branch } = await makeRepo(t);
+  breakWorktree(worktree);
+
+  const refused = await run("git", ["worktree", "remove", "--force", worktree], {
+    cwd: repo,
+    env: GIT_IDENTITY,
+    timeoutMs: 60_000,
+  });
+  assert.notEqual(refused.code, 0, "the fixture must reproduce git's refusal");
+  assert.equal(fs.existsSync(worktree), true, "git refuses without removing anything");
+
+  const result = await manageWorktree({ action: "discard", cwd: repo, worktreeBranch: branch });
+
+  assert.equal(result.success, true, `git's refusal alone must not be a failure: ${result.message}`);
+  assert.equal(fs.existsSync(worktree), false, "the damaged directory must be swept from disk");
+  assert.equal(await branchExists(repo, branch), false);
+
+  const registered = await git(repo, ["worktree", "list", "--porcelain"]);
+  assert.equal(registered.includes(worktree.replace(/\\/g, "/")), false, "the admin record must be pruned");
+});
+
+test("a directory already deleted from disk removes without error", async (t) => {
+  const { repo, worktree, branch } = await makeRepo(t);
+  fs.rmSync(worktree, { recursive: true, force: true });
+
+  const result = await manageWorktree({ action: "discard", cwd: repo, worktreeBranch: branch });
+
+  assert.equal(result.success, true, result.message);
+  assert.equal(await branchExists(repo, branch), false);
+  assert.equal(
+    (await git(repo, ["worktree", "list", "--porcelain"])).includes(worktree.replace(/\\/g, "/")),
+    false,
+  );
+});
+
+test("pruneOrphanWorktrees sweeps agy-* directories that no running run owns", async (t) => {
+  const { repo } = await makeRepo(t);
+  const stamp = `${process.pid}-${Date.now().toString(36)}`;
+  const activeId = `test-keep-${stamp}`;
+  const finishedId = `test-done-${stamp}`;
+  const strayId = `test-stray-${stamp}`;
+  const foreign = path.join(repo, ".worktrees", "not-a-run");
+
+  const worktreesRoot = path.join(repo, ".worktrees");
+  const activePath = path.join(worktreesRoot, `agy-${activeId}`);
+  const finishedPath = path.join(worktreesRoot, `agy-${finishedId}`);
+  const strayPath = path.join(worktreesRoot, `agy-${strayId}`);
+
+  await git(repo, ["worktree", "add", "-b", `hermes/agy-${activeId}`, activePath, "HEAD"]);
+  await git(repo, ["worktree", "add", "-b", `hermes/agy-${finishedId}`, finishedPath, "HEAD"]);
+  // A crashed dispatch: the directory survives with no run record pointing at it.
+  fs.mkdirSync(strayPath, { recursive: true });
+  fs.writeFileSync(path.join(strayPath, "leftover.ts"), "export const leftover = 1;\n", "utf8");
+  fs.mkdirSync(foreign, { recursive: true });
+
+  await writeRunState({
+    status: "running",
+    runId: activeId,
+    sessionName: "s",
+    worktreePath: activePath,
+    branch: `hermes/agy-${activeId}`,
+    startedAt: Date.now(),
+  });
+  t.after(() => clearRunState(activeId));
+
+  const removed = await pruneOrphanWorktrees(repo);
+
+  // Three orphans: the fixture's own worktree, the finished run's registered one and the stray.
+  // The active run's worktree and the directory that is not a bridge worktree both survive.
+  assert.equal(removed, 3, `expected every unowned agy-* directory to go, removed ${removed}`);
+  assert.equal(fs.existsSync(activePath), true, "a running run's worktree must never be swept");
+  assert.equal(fs.existsSync(finishedPath), false, "a worktree with no running run is an orphan");
+  assert.equal(fs.existsSync(strayPath), false, "a directory with no run record is an orphan");
+  assert.equal(fs.existsSync(foreign), true, "only agy-* directories belong to the bridge");
+
+  // git prints porcelain paths with forward slashes on every platform.
+  const slashed = (value: string): string => value.replace(/\\/g, "/");
+  const registered = await git(repo, ["worktree", "list", "--porcelain"]);
+  assert.equal(registered.includes(slashed(finishedPath)), false, "the swept worktree's record must be pruned");
+  assert.equal(registered.includes(slashed(activePath)), true, "the active worktree must stay registered");
+  assert.equal(fs.readFileSync(path.join(activePath, "README.md"), "utf8"), "# fixture\n");
+  // The branch is the only surviving copy of the swept work: the sweep must never delete it.
+  assert.equal(await branchExists(repo, `hermes/agy-${finishedId}`), true);
+  assert.equal(await branchExists(repo, `hermes/agy-${activeId}`), true);
+});
+
+test("pruneOrphanWorktrees sweeps the repository root when called from a subdirectory", async (t) => {
+  const { repo } = await makeRepo(t);
+  const stray = path.join(repo, ".worktrees", `agy-test-stray-${process.pid}-${Date.now().toString(36)}`);
+  fs.mkdirSync(stray, { recursive: true });
+  const nested = path.join(repo, "src", "deep");
+  fs.mkdirSync(nested, { recursive: true });
+
+  const removed = await pruneOrphanWorktrees(nested);
+
+  // The stray plus the fixture's own worktree, both found from above the caller's cwd.
+  assert.equal(removed, 2, `expected the sweep to run at the repo root, removed ${removed}`);
+  assert.equal(fs.existsSync(stray), false);
+});
+
+test("pruneOrphanWorktrees is a no-op on a repository that never dispatched", async (t) => {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "hermes-worker-repo-"));
+  t.after(() => fs.rmSync(repo, { recursive: true, force: true }));
+  await git(repo, ["init", "-b", "main"]);
+  fs.writeFileSync(path.join(repo, "README.md"), "# fixture\n", "utf8");
+  await git(repo, ["add", "."]);
+  await git(repo, ["commit", "-m", "initial"]);
+
+  assert.equal(await pruneOrphanWorktrees(repo), 0);
 });

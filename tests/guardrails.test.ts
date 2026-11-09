@@ -134,6 +134,30 @@ test("injectWorkerBoundary prepends the contract and keeps the prompt intact", (
   assert.equal(guarded.split(prompt).length, 2);
 });
 
+test("the boundary asks for targeted test filters and one full run", () => {
+  assert.ok(
+    WORKER_BOUNDARY.includes(
+      "Local workstation testing (local containers, node/pnpm/cargo/pytest runners) is encouraged. " +
+        "Iterate using targeted test filters (e.g. --test-name-pattern or single test file) during " +
+        "development; run the full test suite strictly once before declaring completion.",
+    ),
+  );
+});
+
+test("the boundary reserves subagent parallelism for large tasks", () => {
+  assert.ok(
+    WORKER_BOUNDARY.includes(
+      "Reserve `delegate_task` strictly for large tasks spanning 3+ independent modules or >150 LOC.",
+    ),
+  );
+  assert.ok(
+    WORKER_BOUNDARY.includes(
+      "For small or routine patches (1–2 files), execute directly in the parent session without " +
+        "spawning subagents.",
+    ),
+  );
+});
+
 test("injectWorkerBoundary tells the parent to integrate verified subagent results", () => {
   assert.ok(
     WORKER_BOUNDARY.includes(

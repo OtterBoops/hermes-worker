@@ -17,10 +17,11 @@ pnpm test          # node --test against tests/*.test.ts
 
 | Tool | Purpose |
 |---|---|
-| `hermes_dispatch` | Run a task on Hermes inside a worktree branched from local `HEAD`. Returns the diff, session id, tool summary, DeepSeek reasoning and any staged memory writes. |
+| `hermes_dispatch` | Run a task on Hermes inside a worktree branched from local `HEAD`. Supports `autoApply: true` to land clean verified diffs automatically. Returns the diff, session id, tool summary, DeepSeek reasoning and any staged memory writes. |
 | `hermes_pending_writes` | `list` / `preview` / `diagnose` / `salvage` / `approve` / `reject` against Hermes' `write_approval` queue. |
 | `hermes_inspect_memory` | `MEMORY.md` / `USER.md` contents, entry counts and character usage, gate state, queue depth. |
 | `hermes_worktree_action` | `apply` a run's diff with `git apply --3way`, or `discard` it. Either way the worktree and temporary branch are removed. |
+| `hermes_prune_worktrees` | Sweep `.worktrees/agy-*` directories no running run owns, and prune git's worktree records. Leaves a running run's worktree and every branch untouched. |
 | `hermes_list_sessions` | Recent Hermes sessions, optionally scoped to a project path. |
 
 ## How a dispatch runs
@@ -45,7 +46,8 @@ pnpm test          # node --test against tests/*.test.ts
    worktree is kept for review — Antigravity never sees fallback-model output presented as cline
    pass work.
 7. Modified files are checked against the guardrails. A violation destroys the worktree; an empty
-   run cleans up after itself; otherwise the worktree is kept for review.
+   run cleans up after itself; when `autoApply: true` is set, clean diffs are applied to the working
+   checkout immediately; otherwise the worktree is kept for review.
 8. The session's `cwd` / `git_repo_root` are re-anchored to the repository root so the thread stays
    resumable after the worktree is pruned. The same read reports the model that actually answered:
    Hermes falls back (429 from the pinned provider) without failing the run, so `model`,

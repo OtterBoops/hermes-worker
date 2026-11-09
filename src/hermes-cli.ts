@@ -23,6 +23,7 @@ import { formatStreamLine, openRunLog, type RunLog } from "./run-log.js";
 import {
   RUN_ID_PATTERN,
   clearRunState,
+  listActiveRuns,
   readRunState,
   runLogPath,
   writeRunState,
@@ -41,6 +42,8 @@ export interface DispatchOptions {
   timeoutSeconds?: number;
   /** How long the tool call may block before it answers with a running descriptor. */
   fastWaitSeconds?: number;
+  /** Land a clean worktree diff on the caller's checkout instead of leaving it for review. */
+  autoApply?: boolean;
   runId?: string;
 }
 
@@ -89,6 +92,8 @@ export interface DispatchResult {
   violations: string[];
   pendingWrites: PendingRecord[];
   worktreeKept: boolean;
+  /** True only when autoApply landed the diff on the caller's checkout. */
+  applied?: boolean;
   message: string;
 }
 
@@ -261,9 +266,44 @@ const listWorktrees = async (repoRoot: string): Promise<WorktreeEntry[]> => {
   return entries;
 };
 
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+const REMOVE_MAX_RETRIES = 5;
+const REMOVE_RETRY_DELAY_MS = 150;
+const REMOVE_MAX_DELAY_MS = 2_000;
+
 /**
- * Removal is idempotent and reports the first real failure: a locked worktree is unlocked first,
- * an already-deleted directory is not an error, and a branch git no longer knows is tolerated.
+ * Windows keeps a directory handle open for a moment after the process that owned it exits, so a
+ * single removal attempt fails EPERM/EBUSY and the directory leaks on disk. Retry with backoff.
+ */
+const removeDirectory = async (
+  target: string,
+  options: { maxRetries?: number; retryDelay?: number } = {},
+): Promise<{ ok: boolean; error?: string }> => {
+  const maxRetries = options.maxRetries ?? REMOVE_MAX_RETRIES;
+  const retryDelay = options.retryDelay ?? REMOVE_RETRY_DELAY_MS;
+  let lastError: string | null = null;
+
+  for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
+    if (!fs.existsSync(target)) return { ok: true };
+    try {
+      // The backoff here is the whole strategy: a nested retry would multiply it by the attempt count.
+      await fsp.rm(target, { recursive: true, force: true, maxRetries: 0 });
+    } catch (error) {
+      lastError = errorMessage(error);
+    }
+    if (!fs.existsSync(target)) return { ok: true };
+    if (attempt < maxRetries) await sleep(Math.min(retryDelay * 2 ** attempt, REMOVE_MAX_DELAY_MS));
+  }
+
+  return { ok: false, error: lastError ?? `${target} could not be removed` };
+};
+
+/**
+ * Removal is idempotent and reports only what it could not achieve: a locked worktree is unlocked
+ * first, a directory git refuses to remove is swept from disk and pruned, and a branch git no
+ * longer knows is tolerated. A path gone from disk with no registration left is a clean removal
+ * however it got there, so git's refusal alone is never recorded as a failure.
  */
 const removeWorktree = async (
   repoRoot: string,
@@ -280,13 +320,28 @@ const removeWorktree = async (
     }
   }
 
-  const removed = await runGit(repoRoot, ["worktree", "remove", "--force", worktreePath]);
-  if (!removed.ok) {
-    // A half-registered worktree still has to go: drop the directory, then let prune fix the admin data.
-    await fsp.rm(worktreePath, { recursive: true, force: true }).catch(() => undefined);
-    await runGit(repoRoot, ["worktree", "prune"]);
-    if (fs.existsSync(worktreePath)) {
-      errors.push(`git worktree remove failed: ${(removed.stderr || removed.stdout).trim()}`);
+  // git validates the worktree's own `.git` file before removing anything, so a damaged or
+  // half-deleted worktree is refused with the directory left in place. Deleting it ourselves and
+  // pruning the admin record reaches the same end state, which is what actually matters here.
+  if (fs.existsSync(worktreePath)) {
+    await runGit(repoRoot, ["worktree", "remove", "--force", worktreePath]);
+  }
+  if (fs.existsSync(worktreePath)) {
+    const swept = await removeDirectory(worktreePath);
+    if (!swept.ok) errors.push(`could not delete ${worktreePath}: ${swept.error}`);
+  }
+
+  // Pruned before the branch: git refuses `branch -D` while a registration still points at it.
+  if (!fs.existsSync(worktreePath)) {
+    const stillRegistered = (await listWorktrees(repoRoot)).some((candidate) =>
+      samePath(candidate.path, worktreePath),
+    );
+    if (stillRegistered) {
+      await runGit(repoRoot, ["worktree", "prune"]);
+      const afterPrune = (await listWorktrees(repoRoot)).some((candidate) =>
+        samePath(candidate.path, worktreePath),
+      );
+      if (afterPrune) errors.push(`git worktree prune left ${worktreePath} registered`);
     }
   }
 
@@ -296,6 +351,62 @@ const removeWorktree = async (
   }
 
   return errors.length > 0 ? { ok: false, error: errors[0] } : { ok: true };
+};
+
+/**
+ * Orphaned worktrees are what a crashed or interrupted bridge leaves behind: a directory on disk
+ * that no run owns. A running run's worktree is never touched, and neither is its branch — the
+ * branch may hold the only copy of work that has not been reviewed yet.
+ */
+export const pruneOrphanWorktrees = async (repoRoot: string): Promise<number> => {
+  // Resolved rather than assumed: a call from a subdirectory must still sweep the root the
+  // worktrees hang off, and resolving the root itself is a no-op.
+  const topLevel = await runGit(repoRoot, ["rev-parse", "--show-toplevel"]);
+  if (!topLevel.ok) return 0;
+  const root = path.resolve(topLevel.stdout.trim());
+  const worktreesRoot = path.join(root, ".worktrees");
+  let entries: string[];
+  try {
+    entries = await fsp.readdir(worktreesRoot);
+  } catch {
+    // Never dispatched from this repository, or the directory was already swept.
+    return 0;
+  }
+
+  const active = listActiveRuns();
+  const activeIds = new Set(active.map((run) => run.runId));
+  const activePaths = active.map((run) => run.worktreePath).filter((value) => Boolean(value));
+
+  let removed = 0;
+  for (const entry of entries) {
+    if (!entry.startsWith("agy-")) continue;
+    const target = path.join(worktreesRoot, entry);
+    if (activeIds.has(entry.slice("agy-".length))) continue;
+    if (activePaths.some((activePath) => samePath(activePath, target))) continue;
+
+    let stat: Awaited<ReturnType<typeof fsp.lstat>>;
+    try {
+      stat = await fsp.lstat(target);
+    } catch {
+      continue;
+    }
+    // lstat, then reject links: rm -r follows a junction and would delete outside the tree.
+    if (!stat.isDirectory() || stat.isSymbolicLink()) continue;
+
+    const swept = await removeDirectory(target);
+    if (swept.ok) removed += 1;
+  }
+
+  // A registration whose directory is already gone is the same leak with nothing left to delete.
+  const staleRegistration = (await listWorktrees(root)).some(
+    (candidate) =>
+      isInsidePath(worktreesRoot, candidate.path) &&
+      path.basename(candidate.path).startsWith("agy-") &&
+      !fs.existsSync(candidate.path),
+  );
+  if (removed > 0 || staleRegistration) await runGit(root, ["worktree", "prune"]);
+
+  return removed;
 };
 
 /** Cleanup that must never mask the failure it is cleaning up after. */
@@ -1234,6 +1345,21 @@ export const dispatchHermesTask = async (options: DispatchOptions): Promise<Disp
         message: `Dispatch failed: ${errorMessage(error)}`,
       }),
     );
+    if (options.autoApply === true && settled.success && settled.worktreeKept && !settled.securityViolation && settled.branch) {
+      const applied = await manageWorktree({
+        action: "apply",
+        cwd: repoRoot,
+        worktreeBranch: settled.branch,
+        activeRunId: runId,
+      });
+      if (applied.success) {
+        settled.applied = true;
+        settled.worktreeKept = false;
+        settled.message = `Applied ${settled.modifiedFiles.length} file(s) to ${repoRoot} and removed worktree branch.`;
+      } else {
+        settled.message = `${settled.message} (Auto-apply failed: ${applied.message})`;
+      }
+    }
     settled.status = "completed";
     // The state file is the callback channel; a tmpdir failure must not lose the result itself.
     await publish({
@@ -1290,6 +1416,8 @@ export const manageWorktree = async (options: {
   action: "apply" | "discard";
   cwd: string;
   worktreeBranch: string;
+  /** The run that is itself calling this after finishing; its state file still says `running`. */
+  activeRunId?: string;
 }): Promise<{ success: boolean; message: string; patchPath?: string }> => {
   // Anything else is a user branch: `branch -D` on it would destroy work this bridge never made.
   const branchMatch = options.worktreeBranch.match(/^hermes\/agy-([A-Za-z0-9_-]+)$/);
@@ -1302,9 +1430,10 @@ export const manageWorktree = async (options: {
     };
   }
 
-  // Refuse to touch a worktree whose Hermes process/session is actively executing.
+  // Refuse to touch a worktree whose Hermes process/session is actively executing. A run that is
+  // applying its own result names itself here: it cannot be mid-execution by definition.
   const activeRun = readRunState(branchMatch[1]);
-  if (activeRun && activeRun.status === "running") {
+  if (activeRun && activeRun.status === "running" && options.activeRunId !== branchMatch[1]) {
     return {
       success: false,
       message:
