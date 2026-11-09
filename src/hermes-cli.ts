@@ -48,7 +48,7 @@ export interface DispatchOptions {
 export const DEFAULT_MODEL = "cline-pass/deepseek-v4.1-flash-1017";
 export const DEFAULT_REASONING = "high";
 export const DEFAULT_TIMEOUT_SECONDS = 1800;
-export const DEFAULT_FAST_WAIT_SECONDS = 60;
+export const DEFAULT_FAST_WAIT_SECONDS = 1;
 
 export interface ToolEvent {
   type: string;
@@ -127,6 +127,52 @@ const makeRunId = (): string => {
 
 const errorMessage = (error: unknown): string =>
   error instanceof Error ? error.message : String(error);
+
+const tokenNumber = (record: Record<string, unknown>, keys: string[]): number => {
+  for (const key of keys) {
+    const value = record[key];
+    if (typeof value === "number" && Number.isFinite(value) && value > 0) return value;
+  }
+  return 0;
+};
+
+/**
+ * Total across the bare (Hermes stream-json), Anthropic- and OpenAI-shaped usage records the
+ * stream can carry.
+ */
+const totalTokens = (tokens: Record<string, unknown> | null): number | null => {
+  if (!tokens) return null;
+  const reported = tokenNumber(tokens, ["total", "total_tokens"]);
+  if (reported > 0) return reported;
+  const sum =
+    tokenNumber(tokens, ["input", "input_tokens", "prompt_tokens"]) +
+    tokenNumber(tokens, ["output", "output_tokens", "completion_tokens"]) +
+    tokenNumber(tokens, [
+      "cache_read",
+      "cache_read_input_tokens",
+      "cache_read_tokens",
+      "cached_tokens",
+      "prompt_cache_hit_tokens",
+    ]);
+  return sum > 0 ? sum : null;
+};
+
+/** Runtime metadata for a finished run; each segment is omitted rather than left empty. */
+export const runMetadata = (
+  result: Pick<DispatchResult, "durationMs" | "sessionId" | "tokens">,
+): { duration: string; brackets: string } => {
+  const duration =
+    typeof result.durationMs === "number" && Number.isFinite(result.durationMs)
+      ? ` in ${(result.durationMs / 1000).toFixed(1)}s`
+      : "";
+  const brackets = [
+    result.sessionId ? `[session: ${result.sessionId}]` : "",
+    totalTokens(result.tokens) !== null ? `[tokens: ${totalTokens(result.tokens)}]` : "",
+  ]
+    .filter((part) => part.length > 0)
+    .join(" ");
+  return { duration, brackets: brackets ? ` ${brackets}` : "" };
+};
 
 /**
  * Verdict of a fast-wait race: `done: false` means the run is still going and the caller gets a
@@ -1134,15 +1180,17 @@ export const dispatchHermesTask = async (options: DispatchOptions): Promise<Disp
 
       result.worktreeKept = true;
       result.success = !failed && !attributionFailed;
+      const metadata = runMetadata(result);
       result.message =
         result.message ||
-        `${result.modifiedFiles.length} file(s) changed on ${branch}. Apply with hermes_worktree_action.` +
+        `${result.modifiedFiles.length} file(s) changed on ${branch}${metadata.duration}. Apply with hermes_worktree_action.` +
           (baselinePorted > 0
             ? ` ${baselinePorted} uncommitted caller file(s) were ported into the baseline commit.`
             : "") +
           (baselineSkipped.length > 0
             ? ` Skipped from the baseline: ${baselineSkipped.join(", ")}.`
-            : "");
+            : "") +
+          metadata.brackets;
       return result;
     } catch (error) {
       // M12: a throw anywhere after the worktree exists must not leave a branch or a directory.
@@ -1390,7 +1438,13 @@ export const manageWorktree = async (options: {
   const patchPath = path.join(patchDir, `${options.worktreeBranch.replace(/[\\/]/g, "-")}.patch`);
   await fsp.writeFile(patchPath, diff.stdout, "utf8");
 
-  const applied = await runGit(repoRoot, ["apply", "--3way", "--binary", patchPath]);
+  // `git apply --3way` implies `--index`, which fails with "does not match index" when the caller
+  // has uncommitted/unstaged edits in any of the patched files. Try `--3way` first; if rejected by
+  // the index mismatch, fall back to applying directly to the working tree.
+  let applied = await runGit(repoRoot, ["apply", "--3way", "--binary", patchPath]);
+  if (!applied.ok && /does not match index/i.test(`${applied.stdout}${applied.stderr}`)) {
+    applied = await runGit(repoRoot, ["apply", "--binary", patchPath]);
+  }
   // A skipped hunk still exits 0: `Skipped patch 'x'` on either stream is a refusal, not a success.
   if (!applied.ok || /Skipped patch/i.test(`${applied.stdout}${applied.stderr}`)) {
     return {

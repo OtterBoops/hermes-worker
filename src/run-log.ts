@@ -21,18 +21,25 @@ const clip = (value: string, limit: number): string => {
   return flat.length <= limit ? flat : `${flat.slice(0, limit - 1)}…`;
 };
 
+/**
+ * Text of a tool_result payload: a bare string, a block array, or an object carrying a known text
+ * field. Recursion keeps the block-array shape working for whatever `??` fallback was picked.
+ */
 const textOfContent = (content: unknown): string => {
   if (typeof content === "string") return content;
-  if (!Array.isArray(content)) return "";
-  return content
-    .map((part) => {
-      if (typeof part === "string") return part;
-      if (!part || typeof part !== "object") return "";
-      const record = part as Record<string, unknown>;
-      return typeof record.text === "string" ? record.text : "";
-    })
-    .filter(Boolean)
-    .join(" ");
+  if (Array.isArray(content)) {
+    return content
+      .map((part) => textOfContent(part))
+      .filter(Boolean)
+      .join(" ");
+  }
+  if (!content || typeof content !== "object") return "";
+  const record = content as Record<string, unknown>;
+  for (const key of ["text", "output", "result", "stdout", "stderr"]) {
+    const value = record[key];
+    if (typeof value === "string" && value.trim()) return value;
+  }
+  return "";
 };
 
 /** The most task-relevant scalar in a tool input, never the whole JSON blob. */
@@ -57,6 +64,18 @@ const commandOfInput = (input: unknown): string | null => {
   return typeof command === "string" && command.trim() ? clip(command, INPUT_LIMIT) : null;
 };
 
+/** The first payload that actually carries something: `content: []` must not shadow `output`. */
+const firstPresent = (record: Record<string, unknown>, keys: string[]): unknown => {
+  for (const key of keys) {
+    const value = record[key];
+    if (value === undefined || value === null) continue;
+    if (typeof value === "string" && !value.trim()) continue;
+    if (Array.isArray(value) && value.length === 0) continue;
+    return value;
+  }
+  return undefined;
+};
+
 const walk = (node: unknown, lines: string[], depth = 0): void => {
   if (!node || typeof node !== "object" || depth > WALK_DEPTH) return;
   if (Array.isArray(node)) {
@@ -76,7 +95,9 @@ const walk = (node: unknown, lines: string[], depth = 0): void => {
     }
   } else if (type === "tool_result") {
     const id = String(record.tool_use_id ?? record.name ?? "result");
-    const output = clip(textOfContent(record.content), TEXT_LIMIT);
+    // A tool_result carries its payload under any of these depending on the tool's transport.
+    const raw = firstPresent(record, ["content", "output", "result", "text"]);
+    const output = clip(textOfContent(raw), TEXT_LIMIT);
     lines.push(`[Hermes:Result] ${id}${output ? ` -> ${output}` : ""}`);
   } else if (type === "text" && typeof record.text === "string" && record.text.trim()) {
     lines.push(`[Hermes:Step] ${clip(record.text, STEP_LIMIT)}`);

@@ -142,6 +142,12 @@ test("injectWorkerBoundary tells the parent to integrate verified subagent resul
   );
 });
 
+test("WORKER_BOUNDARY confines the worker to its own worktree checkout", () => {
+  assert.ok(WORKER_BOUNDARY.includes("the active worktree checkout"));
+  assert.ok(WORKER_BOUNDARY.includes("must use relative paths within cwd"));
+  assert.ok(WORKER_BOUNDARY.includes("Never navigate up to, reference, or mutate files in the parent checkout"));
+});
+
 test("a blocked directory beats the template allowlist", () => {
   for (const file of [".ssh/.env.example", ".gemini/.env.example", ".aws/.env.template"]) {
     const verdict = validateModifiedFiles([file], repo);

@@ -192,6 +192,7 @@ export const WORKER_BOUNDARY = [
   "[WORKER OPERATIONAL BOUNDARY]",
   "- You are executing inside an isolated Git worktree managed by Antigravity.",
   "- Stay focused within this repository root; do not touch .env files, credentials, or remote infrastructure.",
+  "- Operate strictly within the current working directory (the active worktree checkout). All file reads, edits, and terminal commands must use relative paths within cwd. Never navigate up to, reference, or mutate files in the parent checkout outside this worktree.",
   "- Local workstation testing (local containers, node/pnpm/cargo/pytest runners) is encouraged.",
   "- SUBAGENT PARALLELISM (`delegate_task`): Actively spawn parallel subagents via `delegate_task(tasks=[...])` (up to 3 concurrent children) whenever a task spans 2+ independent modules, test suites, or audit targets. Assign strictly disjoint file paths to each child so concurrent subagents never write to the same file simultaneously in this shared worktree; perform shared entrypoint integration in the parent agent.",
   "- When delegate_task subagents return verified results, synthesize and integrate them directly without re-running their scratch experiments in the parent session.",

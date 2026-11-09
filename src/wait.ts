@@ -88,18 +88,22 @@ const firstNumber = (record: Record<string, unknown>, keys: string[]): number =>
   return 0;
 };
 
-/** Read across the token vocabularies in use: Anthropic-style and OpenAI-style usage records. */
+/**
+ * Read across the token vocabularies in use: Hermes' own bare keys, Anthropic-style and
+ * OpenAI-style usage records.
+ */
 const readTokens = (raw: unknown): Telemetry["tokens"] => {
   const record = raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
-  const input = firstNumber(record, ["input_tokens", "prompt_tokens"]);
-  const output = firstNumber(record, ["output_tokens", "completion_tokens"]);
+  const input = firstNumber(record, ["input", "input_tokens", "prompt_tokens"]);
+  const output = firstNumber(record, ["output", "output_tokens", "completion_tokens"]);
   const cacheRead = firstNumber(record, [
+    "cache_read",
     "cache_read_input_tokens",
     "cache_read_tokens",
     "cached_tokens",
     "prompt_cache_hit_tokens",
   ]);
-  const total = firstNumber(record, ["total_tokens"]) || input + output + cacheRead;
+  const total = firstNumber(record, ["total", "total_tokens"]) || input + output + cacheRead;
   return { total, input, output, cacheRead };
 };
 
@@ -154,15 +158,24 @@ const emitTelemetry = (telemetry: Telemetry): void => {
 
 /** A crashed runner leaves no state file at all: that is a failure, not a reason to hang. */
 const finish = async (runId: string, state: RunState): Promise<void> => {
-  const result = state.result as { success?: unknown } | null | undefined;
+  const result = state.result as
+    | { success?: unknown; message?: unknown; summary?: unknown }
+    | null
+    | undefined;
   const telemetry = buildTelemetry(runId, state);
   emitTelemetry(telemetry);
   // Exactly one sentinel, and its kind is the verdict: a caller parses the line rather than
-  // re-deriving success from the JSON that follows it.
+  // re-deriving success from a large JSON payload.
   process.stdout.write(
     telemetry.status === "SUCCESS" ? `${formatDispatchSentinel(runId)}\n` : `${formatFailedSentinel(runId)}\n`,
   );
-  process.stdout.write(`${JSON.stringify(state.result ?? null, null, 2)}\n`);
+  // The summary is what the run actually said; the message is only the dispatch's verdict on it.
+  if (typeof result?.summary === "string" && result.summary.trim()) {
+    process.stdout.write(`\n[Hermes Summary]\n${result.summary.trim()}\n`);
+  }
+  if (typeof result?.message === "string" && result.message.trim()) {
+    process.stdout.write(`${result.message.trim()}\n`);
+  }
 
   // Awaited, not fire-and-forget: the process exits as soon as this returns, and a pending rm
   // would leave the log and the state file behind.

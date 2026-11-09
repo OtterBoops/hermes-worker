@@ -6,6 +6,7 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { run } from "../src/exec.js";
 import {
+  DEFAULT_FAST_WAIT_SECONDS,
   DEFAULT_MODEL,
   DEFAULT_REASONING,
   buildChatArgs,
@@ -15,6 +16,7 @@ import {
   readSessionAfterRun,
   listHermesSessions,
   manageWorktree,
+  runMetadata,
   snapshotCallerWorkingTree,
 } from "../src/hermes-cli.js";
 import {
@@ -259,6 +261,10 @@ test("a dispatch carrying a credential is refused before any git work happens", 
   assert.equal(await git(repo, ["branch", "--list"]), branchesBefore, "no branch may be created");
 });
 
+test("the fast-wait default keeps a dispatch call short", () => {
+  assert.equal(DEFAULT_FAST_WAIT_SECONDS, 1);
+});
+
 test("the dispatch argv pins the model, the reasoning effort and a supported source", () => {
   const args = buildChatArgs({
     promptFile: "C:\\Temp\\prompt.txt",
@@ -483,9 +489,9 @@ test("wait.js polls the run registry, streams the log tail and reports the resul
     "a successful run must not emit the failure sentinel",
   );
 
-  // The result JSON is the last thing on stdout, after the sentinel.
-  const json = output.stdout.slice(output.stdout.lastIndexOf('{\n  "success"'));
-  assert.deepEqual(JSON.parse(json), result);
+  // The result message is emitted after the sentinel; large raw JSON is suppressed.
+  assert.match(output.stdout, /done/);
+  assert.equal(output.stdout.includes('{\n  "success"'), false, "large raw JSON must not be emitted");
 
   assert.equal(readRunState(runId), null, "the callback consumes the state file");
   assert.equal(fs.existsSync(logPath), false, "the log is pruned with the state file");
@@ -528,7 +534,8 @@ test("wait.js emits the failure telemetry and sentinel, then exits 1", async (t)
   assert.match(output.stdout, /- Subagents Spawned: 2/);
   assert.match(output.stdout, /- Tokens Used: 125 \(input: 100, output: 20, cache: 5\)/);
   assert.ok(output.stdout.includes(formatFailedSentinel(runId)));
-  assert.equal(JSON.parse(output.stdout.slice(output.stdout.indexOf('{\n  "success"'))).success, false);
+  assert.match(output.stdout, /boom/);
+  assert.equal(output.stdout.includes('{\n  "success"'), false, "large raw JSON must not be emitted");
 });
 
 test("wait.js streams log bytes that were already on disk before it started", async (t) => {
@@ -556,6 +563,114 @@ test("wait.js streams log bytes that were already on disk before it started", as
   assert.match(output.stdout, /\[Hermes:Tool\] written-before-the-tail/);
   // The tail is drained ahead of the summary even though the run was already finished on start.
   assert.ok(output.stdout.indexOf("written-before-the-tail") < output.stdout.indexOf("Telemetry"));
+});
+
+test("wait.js reads Hermes' bare usage keys and emits the assistant summary", async (t) => {
+  const runId = `test-bare-${process.pid}-${Date.now().toString(36)}`;
+  const statePath = runStatePath(runId);
+  const result = {
+    success: true,
+    durationMs: 1_000,
+    summary: "Rewrote the token lookup and the run log renderer.",
+    message: "2 file(s) changed on hermes/agy-x.",
+    tokens: { input: 300, output: 40, cache_read: 7 },
+  };
+  await writeRunState({
+    status: "completed",
+    runId,
+    sessionName: "s",
+    worktreePath: "w",
+    branch: "hermes/agy-x",
+    startedAt: Date.now(),
+    result,
+  });
+  t.after(() => fs.rmSync(statePath, { force: true }));
+
+  const output = await run(process.execPath, ["--import", "tsx", "src/wait.ts", runId], {
+    cwd: path.resolve(import.meta.dirname, ".."),
+    timeoutMs: 20_000,
+  });
+  assert.equal(output.code, 0, output.stderr);
+  assert.match(output.stdout, /- Tokens Used: 347 \(input: 300, output: 40, cache: 7\)/);
+  assert.match(output.stdout, /\[Hermes Summary\]\nRewrote the token lookup and the run log renderer\./);
+  // The summary is the agent's own words, so it must land ahead of the dispatch verdict.
+  assert.ok(
+    output.stdout.indexOf("[Hermes Summary]") < output.stdout.indexOf("2 file(s) changed"),
+    "the summary must precede the dispatch message",
+  );
+  // A reported total wins over the sum of its parts.
+  await writeRunState({
+    status: "completed",
+    runId,
+    sessionName: "s",
+    worktreePath: "w",
+    branch: "hermes/agy-x",
+    startedAt: Date.now(),
+    result: { success: true, durationMs: 1_000, tokens: { total: 999, input: 10, output: 5 } },
+  });
+  const second = await run(process.execPath, ["--import", "tsx", "src/wait.ts", runId], {
+    cwd: path.resolve(import.meta.dirname, ".."),
+    timeoutMs: 20_000,
+  });
+  assert.equal(second.code, 0, second.stderr);
+  assert.match(second.stdout, /- Tokens Used: 999 \(input: 10, output: 5, cache: 0\)/);
+  assert.equal(
+    second.stdout.includes("[Hermes Summary]"),
+    false,
+    "a run without a summary must not print an empty header",
+  );
+});
+
+test("formatStreamLine renders a tool_result payload carried as an object or a bare field", () => {
+  // Hermes reports tool output under `output` as often as under `content`.
+  const output = formatStreamLine(
+    JSON.stringify({ type: "tool_result", tool_use_id: "call-9", output: "Tests: 12 passed" }),
+  );
+  assert.deepEqual(output, ["[Hermes:Result] call-9 -> Tests: 12 passed"]);
+
+  const nested = formatStreamLine(
+    JSON.stringify({
+      type: "tool_result",
+      tool_use_id: "call-10",
+      content: { stdout: "built in 1.2s", stderr: "" },
+    }),
+  );
+  assert.deepEqual(nested, ["[Hermes:Result] call-10 -> built in 1.2s"]);
+
+  const resultField = formatStreamLine(
+    JSON.stringify({ type: "tool_result", tool_use_id: "call-11", result: { result: "ok" } }),
+  );
+  assert.deepEqual(resultField, ["[Hermes:Result] call-11 -> ok"]);
+
+  const stderrOnly = formatStreamLine(
+    JSON.stringify({ type: "tool_result", tool_use_id: "call-12", content: { stderr: "ENOENT" } }),
+  );
+  assert.deepEqual(stderrOnly, ["[Hermes:Result] call-12 -> ENOENT"]);
+
+  // An object with no recognised text field stays silent rather than printing [object Object].
+  const opaque = formatStreamLine(
+    JSON.stringify({ type: "tool_result", tool_use_id: "call-13", content: { exit_code: 0 } }),
+  );
+  assert.deepEqual(opaque, ["[Hermes:Result] call-13"]);
+
+  // An empty content array must not shadow a populated `output` next to it.
+  const shadowed = formatStreamLine(
+    JSON.stringify({ type: "tool_result", tool_use_id: "call-14", content: [], output: "fell through" }),
+  );
+  assert.deepEqual(shadowed, ["[Hermes:Result] call-14 -> fell through"]);
+});
+
+test("runMetadata sums Hermes' bare token keys", () => {
+  const bare = runMetadata({
+    durationMs: 1_000,
+    sessionId: null,
+    tokens: { input: 50, output: 10, cache_read: 5 },
+  });
+  assert.equal(bare.brackets, " [tokens: 65]");
+
+  // `total` short-circuits the parts, exactly as `total_tokens` does.
+  const explicit = runMetadata({ durationMs: 0, sessionId: null, tokens: { total: 500, input: 1 } });
+  assert.equal(explicit.brackets, " [tokens: 500]");
 });
 
 test("formatStreamLine renders each event type as one readable line", () => {
@@ -686,5 +801,36 @@ test("listHermesSessions scopes to a cwd prefix without treating it as a pattern
     rows.map((row) => row.id).sort(),
     ["child", "exact"],
     `LIKE escaping must keep the prefix literal, got ${JSON.stringify(rows.map((row) => row.id))}`,
+  );
+});
+
+test("runMetadata appends duration, session and tokens without leaving empty segments", () => {
+  const full = runMetadata({
+    durationMs: 12_345,
+    sessionId: "sess-1",
+    tokens: { total_tokens: 987 },
+  });
+  assert.equal(full.duration, " in 12.3s");
+  assert.equal(full.brackets, " [session: sess-1] [tokens: 987]");
+
+  // Absent everything: no leading space, no empty brackets.
+  assert.deepEqual(runMetadata({ durationMs: null, sessionId: null, tokens: null }), {
+    duration: "",
+    brackets: "",
+  });
+
+  // A usage record without total_tokens still reports, summed across its parts.
+  const summed = runMetadata({
+    durationMs: 0,
+    sessionId: null,
+    tokens: { input_tokens: 100, output_tokens: 20 },
+  });
+  assert.equal(summed.duration, " in 0.0s");
+  assert.equal(summed.brackets, " [tokens: 120]");
+
+  // A zeroed or empty usage record is no count at all.
+  assert.equal(
+    runMetadata({ durationMs: null, sessionId: "s", tokens: { input_tokens: 0 } }).brackets,
+    " [session: s]",
   );
 });

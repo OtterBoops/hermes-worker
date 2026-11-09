@@ -77,7 +77,7 @@ block and one sentinel line:
 - Tokens Used: 140 (input: 111, output: 22, cache: 7)
 ============================================================
 <<<HERMES_DISPATCH_COMPLETE:20261108234625-4u18>>>
-{ ...the dispatch result... }
+1 file(s) changed on hermes/agy-20261108234625-4u18 in 22.4s. Apply with hermes_worktree_action. [session: sess-1] [tokens: 140]
 ```
 
 The sentinel is emitted on every path — success, failure, timeout and crash — so a caller can tail

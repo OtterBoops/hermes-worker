@@ -33,7 +33,7 @@ server.registerTool(
       "outlived fastWaitSeconds, nothing was killed, and running waitCommand as a background " +
       "command streams the run's log live, then prints a telemetry block, one sentinel line " +
       "('<<<HERMES_DISPATCH_COMPLETE:<runId>>>', or '<<<HERMES_DISPATCH_FAILED:<runId>>>' when " +
-      "the run did not succeed) and the result JSON. Uncommitted caller changes are ported into " +
+      "the run did not succeed) and the result message. Uncommitted caller changes are ported into " +
       "the worktree as a baseline commit, so the diff covers only Hermes' work. The run is pinned " +
       "to cline-pass/deepseek-v4.1-flash-1017 via the " +
       "clinepass provider; if cline pass is refused (quota exhausted), the dispatch fails closed " +
@@ -67,7 +67,7 @@ server.registerTool(
         .optional()
         .describe(
           "How long this call blocks before returning a running descriptor with a waitCommand " +
-            "(default 60s). The run keeps going either way.",
+            "(default 1s). The run keeps going either way.",
         ),
     },
   },
