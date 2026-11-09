@@ -15,8 +15,21 @@ import {
   readSessionAfterRun,
   listHermesSessions,
   manageWorktree,
+  snapshotCallerWorkingTree,
 } from "../src/hermes-cli.js";
-import { RUN_STATE_DIR, readRunState, runStatePath, writeRunState } from "../src/run-registry.js";
+import {
+  HERMES_DISPATCH_FAILED_PREFIX,
+  HERMES_DISPATCH_SENTINEL_PREFIX,
+  RUN_STATE_DIR,
+  clearRunState,
+  formatDispatchSentinel,
+  formatFailedSentinel,
+  readRunState,
+  runLogPath,
+  runStatePath,
+  writeRunState,
+} from "../src/run-registry.js";
+import { formatStreamLine, openRunLog } from "../src/run-log.js";
 
 const GIT_IDENTITY = {
   ...process.env,
@@ -55,6 +68,74 @@ const makeRepo = async (t: TestContext): Promise<{ repo: string; worktree: strin
 const branchExists = async (repo: string, branch: string): Promise<boolean> =>
   (await git(repo, ["branch", "--list", branch])).trim() !== "";
 
+test("a dirty caller checkout is ported into the worktree as one baseline commit", async (t) => {
+  const { repo, worktree } = await makeRepo(t);
+  const headSha = (await git(repo, ["rev-parse", "HEAD"])).trim();
+
+  // Tracked modification, a staged addition and an untracked file: all three must travel.
+  fs.writeFileSync(path.join(repo, "README.md"), "# fixture\n\nedited-in-progress\n", "utf8");
+  fs.writeFileSync(path.join(repo, "staged.ts"), "export const staged = 1;\n", "utf8");
+  await git(repo, ["add", "staged.ts"]);
+  fs.mkdirSync(path.join(repo, "src"), { recursive: true });
+  fs.writeFileSync(path.join(repo, "src", "new-component.tsx"), "export const NewComponent = () => null;\n", "utf8");
+
+  // A binary modification goes through the same patch, which is why `--binary` matters.
+  const bytes = Buffer.from([0x00, 0xff, 0x0d, 0x0a, 0x42]);
+  fs.writeFileSync(path.join(repo, "asset.bin"), bytes);
+
+  const snapshot = await snapshotCallerWorkingTree(repo, worktree, headSha);
+  assert.notEqual(snapshot.baseSha, headSha, "a ported checkout must move the baseline off HEAD");
+  assert.equal(snapshot.ported, 4, `expected 4 ported paths, skipped: ${snapshot.skipped.join(", ")}`);
+
+  assert.equal(fs.readFileSync(path.join(worktree, "README.md"), "utf8"), "# fixture\n\nedited-in-progress\n");
+  assert.equal(fs.readFileSync(path.join(worktree, "staged.ts"), "utf8"), "export const staged = 1;\n");
+  assert.equal(
+    fs.readFileSync(path.join(worktree, "src", "new-component.tsx"), "utf8"),
+    "export const NewComponent = () => null;\n",
+  );
+  assert.deepEqual([...fs.readFileSync(path.join(worktree, "asset.bin"))], [...bytes]);
+
+  // Exactly one commit, and it is the baseline: `git diff <base>..HEAD` then shows only new work.
+  const log = await git(worktree, ["log", "--format=%s", `${headSha}..HEAD`]);
+  assert.deepEqual(log.trim().split("\n"), ["[AGY-BASE] Working tree baseline snapshot"]);
+  assert.equal((await git(worktree, ["rev-parse", "HEAD"])).trim(), snapshot.baseSha);
+
+  // The caller's own checkout keeps its dirty state: the port never commits or reverts anything.
+  assert.match(await git(repo, ["status", "--porcelain"]), /README\.md/);
+  assert.equal((await git(repo, ["rev-parse", "HEAD"])).trim(), headSha);
+});
+
+test("a clean caller checkout leaves the baseline on HEAD and makes no commit", async (t) => {
+  const { repo, worktree } = await makeRepo(t);
+  const headSha = (await git(repo, ["rev-parse", "HEAD"])).trim();
+
+  const snapshot = await snapshotCallerWorkingTree(repo, worktree, headSha);
+  assert.equal(snapshot.baseSha, headSha);
+  assert.equal(snapshot.ported, 0);
+  assert.equal((await git(worktree, ["rev-parse", "HEAD"])).trim(), headSha);
+});
+
+test("the baseline port skips secrets, node_modules and stacked worktrees", async (t) => {
+  const { repo, worktree } = await makeRepo(t);
+  const headSha = (await git(repo, ["rev-parse", "HEAD"])).trim();
+
+  fs.writeFileSync(path.join(repo, ".env"), "SECRET=nope\n", "utf8");
+  fs.writeFileSync(path.join(repo, ".env.example"), "SECRET=\n", "utf8");
+  fs.mkdirSync(path.join(repo, "node_modules", "pkg"), { recursive: true });
+  fs.writeFileSync(path.join(repo, "node_modules", "pkg", "index.js"), "module.exports = 1;\n", "utf8");
+  fs.writeFileSync(path.join(repo, "keep.ts"), "export const keep = 1;\n", "utf8");
+
+  const snapshot = await snapshotCallerWorkingTree(repo, worktree, headSha);
+  assert.ok(snapshot.skipped.includes(".env"), "a .env must never be ported into a worktree");
+  assert.equal(fs.existsSync(path.join(worktree, ".env")), false);
+  assert.equal(fs.existsSync(path.join(worktree, "node_modules")), false);
+  assert.equal(fs.existsSync(path.join(worktree, ".env.example")), true, "the template is reviewable");
+  assert.equal(fs.existsSync(path.join(worktree, "keep.ts")), true);
+  // A skipped secret must not prevent the baseline commit for everything else.
+  assert.notEqual(snapshot.baseSha, headSha);
+  assert.equal((await git(worktree, ["status", "--porcelain"])), "" , "the port is fully committed");
+});
+
 test("apply lands the worktree diff on the checkout and leaves no worktree behind", async (t) => {
   const { repo, worktree, branch } = await makeRepo(t);
   fs.writeFileSync(path.join(worktree, "feature.ts"), "export const feature = () => 42;\n", "utf8");
@@ -71,6 +152,58 @@ test("apply lands the worktree diff on the checkout and leaves no worktree behin
 
   const worktrees = await git(repo, ["worktree", "list", "--porcelain"]);
   assert.equal(worktrees.includes(branch), false);
+});
+
+test("apply diffs from the baseline commit, so a dirty caller does not block it", async (t) => {
+  const { repo, worktree, branch } = await makeRepo(t);
+  const headSha = (await git(repo, ["rev-parse", "HEAD"])).trim();
+
+  // A caller with real uncommitted work: the baseline ports it, so `merge-base` sits BELOW it.
+  fs.writeFileSync(path.join(repo, "README.md"), "# fixture\n\ncaller work in progress\n", "utf8");
+  const snapshot = await snapshotCallerWorkingTree(repo, worktree, headSha);
+  assert.notEqual(snapshot.baseSha, headSha, "the caller's edit must move the baseline off HEAD");
+
+  fs.writeFileSync(path.join(worktree, "feature.ts"), "export const feature = () => 42;\n", "utf8");
+  await git(worktree, ["add", "."]);
+  await git(worktree, ["commit", "-m", "the run's own work"]);
+
+  const result = await manageWorktree({ action: "apply", cwd: repo, worktreeBranch: branch });
+  assert.equal(result.success, true, result.message);
+  assert.equal(fs.existsSync(path.join(repo, "feature.ts")), true);
+  // The caller's own uncommitted edit is not the run's to apply, and must survive untouched.
+  assert.equal(
+    fs.readFileSync(path.join(repo, "README.md"), "utf8"),
+    "# fixture\n\ncaller work in progress\n",
+  );
+  assert.equal(fs.existsSync(worktree), false);
+});
+
+test("a tracked secret edited by the caller is never ported into the baseline", async (t) => {
+  const { repo, worktree } = await makeRepo(t);
+
+  // `.env` is tracked here, so it arrives as a tracked modification rather than an untracked file.
+  fs.writeFileSync(path.join(repo, ".env"), "SECRET=placeholder\n", "utf8");
+  await git(repo, ["add", ".env"]);
+  await git(repo, ["commit", "-m", "track a placeholder env"]);
+  const trackedHead = (await git(repo, ["rev-parse", "HEAD"])).trim();
+  await git(worktree, ["reset", "--hard", trackedHead]);
+
+  fs.writeFileSync(path.join(repo, ".env"), "SECRET=real-production-token\n", "utf8");
+  fs.writeFileSync(path.join(repo, "app.ts"), "export const app = 1;\n", "utf8");
+
+  const snapshot = await snapshotCallerWorkingTree(repo, worktree, trackedHead);
+  assert.ok(snapshot.skipped.includes(".env"), "a tracked .env edit must be skipped, not ported");
+  assert.equal(
+    fs.readFileSync(path.join(worktree, ".env"), "utf8"),
+    "SECRET=placeholder\n",
+    "the worktree must keep the committed placeholder, never the caller's secret",
+  );
+  assert.equal(fs.existsSync(path.join(worktree, "app.ts")), true, "other edits still travel");
+  assert.notEqual(snapshot.baseSha, trackedHead);
+
+  // The secret must not be readable from the baseline commit git recorded.
+  const committed = await git(worktree, ["show", `${snapshot.baseSha}:.env`]);
+  assert.equal(committed, "SECRET=placeholder\n");
 });
 
 test("discard removes the worktree and branch without touching the checkout", async (t) => {
@@ -288,13 +421,17 @@ test("raceFastWait reports a timeout without leaving a timer behind", async () =
   assert.deepEqual(immediate, { done: true, value: 42 });
 });
 
-test("wait.js polls the run registry and reports the completed result", async (t) => {
+test("wait.js polls the run registry, streams the log tail and reports the result", async (t) => {
   const runId = `test-${process.pid}-${Date.now().toString(36)}`;
   const statePath = runStatePath(runId);
-  const result = { success: true, runId, message: "done" };
+  const logPath = runLogPath(runId);
+  const result = { success: true, runId, message: "done", durationMs: 4_000 };
   fs.mkdirSync(RUN_STATE_DIR, { recursive: true });
   fs.writeFileSync(statePath, JSON.stringify({ status: "running", runId, result: undefined }), "utf8");
-  t.after(() => fs.rmSync(statePath, { force: true }));
+  t.after(() => {
+    fs.rmSync(statePath, { force: true });
+    fs.rmSync(logPath, { force: true });
+  });
 
   const child = run(
     process.execPath,
@@ -302,8 +439,73 @@ test("wait.js polls the run registry and reports the completed result", async (t
     { cwd: path.resolve(import.meta.dirname, ".."), timeoutMs: 20_000 },
   );
 
-  // Give the poller one tick, then publish the completion the way a dispatch would.
+  // One tick for the poller to open the (not yet existing) log, then the dispatch starts writing.
   await new Promise((resolve) => setTimeout(resolve, 400));
+  const log = openRunLog(logPath);
+  log.write(["[Hermes:Tool] terminal (pnpm test)"]);
+  await new Promise((resolve) => setTimeout(resolve, 700));
+  log.write(["[Hermes:Result] call-1 -> 67 passing"]);
+  await log.close();
+
+  await writeRunState({
+    status: "completed",
+    runId,
+    sessionName: "s",
+    worktreePath: "w",
+    branch: "hermes/agy-x",
+    startedAt: Date.now() - 4_000,
+    result,
+  });
+
+  const output = await child;
+  assert.equal(output.code, 0, output.stderr);
+  assert.match(output.stdout, new RegExp(`\\[Hermes Worker\\] Tailing run ${runId}`));
+
+  // Both lines must reach stdout, and the first one only because the tail was live rather than
+  // read once at exit.
+  assert.match(output.stdout, /\[Hermes:Tool\] terminal \(pnpm test\)/);
+  assert.match(output.stdout, /\[Hermes:Result\] call-1 -> 67 passing/);
+  assert.ok(
+    output.stdout.indexOf("[Hermes:Tool]") < output.stdout.indexOf("Telemetry"),
+    "the tail must be flushed before the summary",
+  );
+
+  assert.match(output.stdout, /\[Hermes Dispatch Telemetry\] \(Status: SUCCESS\)/);
+  assert.match(output.stdout, new RegExp(`- Run ID: ${runId}`));
+  assert.match(output.stdout, /- Duration: 4\.0s/);
+  assert.match(output.stdout, /- Tools Called: 0/);
+  assert.match(output.stdout, /<<<HERMES_DISPATCH_COMPLETE:/);
+
+  assert.ok(output.stdout.includes(formatDispatchSentinel(runId)), "the sentinel must name the run");
+  assert.equal(
+    output.stdout.includes(HERMES_DISPATCH_FAILED_PREFIX),
+    false,
+    "a successful run must not emit the failure sentinel",
+  );
+
+  // The result JSON is the last thing on stdout, after the sentinel.
+  const json = output.stdout.slice(output.stdout.lastIndexOf('{\n  "success"'));
+  assert.deepEqual(JSON.parse(json), result);
+
+  assert.equal(readRunState(runId), null, "the callback consumes the state file");
+  assert.equal(fs.existsSync(logPath), false, "the log is pruned with the state file");
+});
+
+test("wait.js emits the failure telemetry and sentinel, then exits 1", async (t) => {
+  const runId = `test-fail-${process.pid}-${Date.now().toString(36)}`;
+  const statePath = runStatePath(runId);
+  const result = {
+    success: false,
+    message: "boom",
+    durationMs: 2_500,
+    toolEvents: [
+      { type: "tool_use", name: "read_file" },
+      { type: "tool_use", name: "delegate_task" },
+      { type: "tool_use", name: "delegate_task" },
+      { type: "tool_result", name: "r" },
+    ],
+    tokens: { input_tokens: 100, output_tokens: 20, cache_read_input_tokens: 5 },
+  };
   await writeRunState({
     status: "completed",
     runId,
@@ -313,15 +515,29 @@ test("wait.js polls the run registry and reports the completed result", async (t
     startedAt: Date.now(),
     result,
   });
+  t.after(() => fs.rmSync(statePath, { force: true }));
 
-  const output = await child;
-  assert.equal(output.code, 0, output.stderr);
-  assert.deepEqual(JSON.parse(output.stdout), result);
-  assert.equal(readRunState(runId), null, "the callback consumes the state file");
+  const output = await run(process.execPath, ["--import", "tsx", "src/wait.ts", runId], {
+    cwd: path.resolve(import.meta.dirname, ".."),
+    timeoutMs: 20_000,
+  });
+  assert.equal(output.code, 1);
+  assert.match(output.stdout, /\(Status: FAILED\)/);
+  assert.match(output.stdout, /- Duration: 2\.5s/);
+  assert.match(output.stdout, /- Tools Called: 3/);
+  assert.match(output.stdout, /- Subagents Spawned: 2/);
+  assert.match(output.stdout, /- Tokens Used: 125 \(input: 100, output: 20, cache: 5\)/);
+  assert.ok(output.stdout.includes(formatFailedSentinel(runId)));
+  assert.equal(JSON.parse(output.stdout.slice(output.stdout.indexOf('{\n  "success"'))).success, false);
 });
 
-test("wait.js exits 1 when the run failed", async (t) => {
-  const runId = `test-fail-${process.pid}-${Date.now().toString(36)}`;
+test("wait.js streams log bytes that were already on disk before it started", async (t) => {
+  const runId = `test-prelog-${process.pid}-${Date.now().toString(36)}`;
+  const logPath = runLogPath(runId);
+  fs.mkdirSync(RUN_STATE_DIR, { recursive: true });
+  fs.writeFileSync(logPath, "[Hermes:Tool] written-before-the-tail\n", "utf8");
+  t.after(() => clearRunState(runId));
+
   await writeRunState({
     status: "completed",
     runId,
@@ -329,16 +545,94 @@ test("wait.js exits 1 when the run failed", async (t) => {
     worktreePath: "w",
     branch: "hermes/agy-x",
     startedAt: Date.now(),
-    result: { success: false, message: "boom" },
+    result: { success: true, durationMs: 1_000 },
   });
-  t.after(() => fs.rmSync(runStatePath(runId), { force: true }));
 
   const output = await run(process.execPath, ["--import", "tsx", "src/wait.ts", runId], {
     cwd: path.resolve(import.meta.dirname, ".."),
     timeoutMs: 20_000,
   });
-  assert.equal(output.code, 1);
-  assert.equal(JSON.parse(output.stdout).success, false);
+  assert.equal(output.code, 0, output.stderr);
+  assert.match(output.stdout, /\[Hermes:Tool\] written-before-the-tail/);
+  // The tail is drained ahead of the summary even though the run was already finished on start.
+  assert.ok(output.stdout.indexOf("written-before-the-tail") < output.stdout.indexOf("Telemetry"));
+});
+
+test("formatStreamLine renders each event type as one readable line", () => {
+  const tool = formatStreamLine(
+    JSON.stringify({
+      type: "tool_use",
+      name: "read_file",
+      input: { file_path: "src/wait.ts", offset: 1 },
+    }),
+  );
+  assert.deepEqual(tool, ["[Hermes:Tool] read_file (src/wait.ts)"]);
+
+  const exec = formatStreamLine(
+    JSON.stringify({ type: "tool_use", name: "terminal", input: { command: "pnpm test 2>&1" } }),
+  );
+  assert.deepEqual(exec, ["[Hermes:Tool] terminal (pnpm test 2>&1)", "[Hermes:Exec] pnpm test 2>&1"]);
+
+  const result = formatStreamLine(
+    JSON.stringify({
+      type: "tool_result",
+      tool_use_id: "call-7",
+      content: [{ type: "text", text: "x".repeat(400) }],
+    }),
+  );
+  assert.equal(result.length, 1);
+  assert.match(result[0], /^\[Hermes:Result\] call-7 -> x+/);
+  assert.ok(result[0].length <= "[Hermes:Result] call-7 -> ".length + 120, "output is clipped to 120");
+
+  const step = formatStreamLine(JSON.stringify({ type: "text", text: "Reading the test suite" }));
+  assert.deepEqual(step, ["[Hermes:Step] Reading the test suite"]);
+
+  // A nested assistant message must still surface its tool_use block.
+  const nested = formatStreamLine(
+    JSON.stringify({
+      type: "assistant",
+      message: { content: [{ type: "tool_use", name: "grep", input: { pattern: "TODO" } }] },
+    }),
+  );
+  assert.deepEqual(nested, ["[Hermes:Tool] grep (TODO)"]);
+
+  assert.deepEqual(formatStreamLine(""), []);
+  assert.deepEqual(formatStreamLine("{not json"), ["[Hermes:Output] {not json"]);
+});
+
+test("the run log is written and flushed in order", async (t) => {
+  const runId = `test-log-${process.pid}-${Date.now().toString(36)}`;
+  const logPath = runLogPath(runId);
+  t.after(() => fs.rmSync(logPath, { force: true }));
+
+  const log = openRunLog(logPath);
+  log.write(["[Hermes:Tool] a"]);
+  log.write(["[Hermes:Tool] b", "[Hermes:Exec] c"]);
+  await log.close();
+
+  assert.equal(fs.readFileSync(logPath, "utf8"), "[Hermes:Tool] a\n[Hermes:Tool] b\n[Hermes:Exec] c\n");
+  // A second close must not throw: the pipeline closes in `finally` on every path.
+  await log.close();
+
+  await writeRunState({
+    status: "completed",
+    runId,
+    sessionName: "s",
+    worktreePath: "w",
+    branch: "hermes/agy-x",
+    startedAt: Date.now(),
+    result: { success: true },
+  });
+  await clearRunState(runId);
+  assert.equal(fs.existsSync(logPath), false, "clearRunState prunes the log with the state file");
+  assert.equal(fs.existsSync(runStatePath(runId)), false);
+});
+
+test("sentinel helpers name the run and use the documented prefixes", () => {
+  assert.equal(HERMES_DISPATCH_SENTINEL_PREFIX, "<<<HERMES_DISPATCH_COMPLETE:");
+  assert.equal(HERMES_DISPATCH_FAILED_PREFIX, "<<<HERMES_DISPATCH_FAILED:");
+  assert.equal(formatDispatchSentinel("abc-123"), "<<<HERMES_DISPATCH_COMPLETE:abc-123>>>");
+  assert.equal(formatFailedSentinel("abc-123"), "<<<HERMES_DISPATCH_FAILED:abc-123>>>");
 });
 
 test("wait.js refuses a path-traversing run id", async () => {

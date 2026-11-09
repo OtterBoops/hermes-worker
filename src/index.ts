@@ -31,8 +31,11 @@ server.registerTool(
       "memory/skill writes Hermes staged. Nothing is committed to your checkout; land it with " +
       "hermes_worktree_action. A status of 'running' is a normal answer, not an error: the run " +
       "outlived fastWaitSeconds, nothing was killed, and running waitCommand as a background " +
-      "command delivers the completion result (the same JSON, with status 'completed') as its " +
-      "output. The run is pinned to cline-pass/deepseek-v4.1-flash-1017 via the " +
+      "command streams the run's log live, then prints a telemetry block, one sentinel line " +
+      "('<<<HERMES_DISPATCH_COMPLETE:<runId>>>', or '<<<HERMES_DISPATCH_FAILED:<runId>>>' when " +
+      "the run did not succeed) and the result JSON. Uncommitted caller changes are ported into " +
+      "the worktree as a baseline commit, so the diff covers only Hermes' work. The run is pinned " +
+      "to cline-pass/deepseek-v4.1-flash-1017 via the " +
       "clinepass provider; if cline pass is refused (quota exhausted), the dispatch fails closed " +
       "(success: false, modelFallback: true) instead of silently landing on a fallback model.",
     inputSchema: {

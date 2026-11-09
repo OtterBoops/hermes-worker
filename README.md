@@ -31,17 +31,22 @@ pnpm test          # node --test against tests/*.test.ts
    `hermes project create` when absent).
 3. `git worktree add -b hermes/agy-<runId> <repo>/.worktrees/agy-<runId> HEAD` — `.worktrees/` is
    recorded in `.git/info/exclude`, never in the tracked `.gitignore`.
-4. `hermes chat --query-file … --format stream-json --in <worktree> -c <title> --create-if-missing
-   --yolo --source cli --provider clinepass --model cline-pass/deepseek-v4.1-flash-1017 --reasoning max`
+4. The caller's uncommitted work is ported into that worktree and committed as
+   `[AGY-BASE] Working tree baseline snapshot`: tracked changes as a `git diff HEAD --binary` patch,
+   untracked files copied (skipping `.git`, `.worktrees`, `node_modules` and blocked secret paths).
+   The dispatch's `baseSha` is that baseline commit, so `git diff <baseSha>` reports strictly what
+   Hermes changed and never re-reports the caller's in-progress edits.
+5. `hermes chat --query-file … --format stream-json --in <worktree> -c <title> --create-if-missing
+   --yolo --source cli --provider clinepass --model cline-pass/deepseek-v4.1-flash-1017 --reasoning high`
    runs the turn on the shared gateway, so Desktop streams it live. Model, reasoning and provider
    are pinned defaults; the caller can override model/reasoning per dispatch.
-5. If cline pass is refused (quota exhausted), the dispatch fails closed: `success: false`,
+6. If cline pass is refused (quota exhausted), the dispatch fails closed: `success: false`,
    `modelFallback: true`, and a `warning` naming the fallback model. No diff is produced and no
    worktree is kept for review — Antigravity never sees fallback-model output presented as cline
    pass work.
-5. Modified files are checked against the guardrails. A violation destroys the worktree; an empty
+7. Modified files are checked against the guardrails. A violation destroys the worktree; an empty
    run cleans up after itself; otherwise the worktree is kept for review.
-6. The session's `cwd` / `git_repo_root` are re-anchored to the repository root so the thread stays
+8. The session's `cwd` / `git_repo_root` are re-anchored to the repository root so the thread stays
    resumable after the worktree is pruned. The same read reports the model that actually answered:
    Hermes falls back (429 from the pinned provider) without failing the run, so `model`,
    `provider` and `modelFallback` are returned and a downgraded run also carries a `warning`.
@@ -49,6 +54,36 @@ pnpm test          # node --test against tests/*.test.ts
 `--source cli`, not `antigravity`: the gateway only admits its own surface vocabulary
 (`cli`, `tui`, `gui`, `acp`, `tool`, `oneshot`) and refuses anything else, while `oneshot` would
 hide the session from Desktop pickers.
+
+## Watching a run
+
+Every dispatch appends a human-readable tail to `<RUN_STATE_DIR>/<runId>.log` as Hermes emits
+events — `[Hermes:Tool]`, `[Hermes:Exec]`, `[Hermes:Result]`, `[Hermes:Step]`. Running the
+`waitCommand` from a `status: 'running'` answer streams those lines live, then prints a telemetry
+block and one sentinel line:
+
+```
+[Hermes Worker] Tailing run 20261108234625-4u18...
+[Hermes:Step] Planning the change
+[Hermes:Tool] terminal (pnpm test)
+[Hermes:Exec] pnpm test
+[Hermes:Result] c1 -> 67 tests passing
+============================================================
+[Hermes Dispatch Telemetry] (Status: SUCCESS)
+- Run ID: 20261108234625-4u18
+- Duration: 22.4s
+- Tools Called: 2
+- Subagents Spawned: 1
+- Tokens Used: 140 (input: 111, output: 22, cache: 7)
+============================================================
+<<<HERMES_DISPATCH_COMPLETE:20261108234625-4u18>>>
+{ ...the dispatch result... }
+```
+
+The sentinel is emitted on every path — success, failure, timeout and crash — so a caller can tail
+the command instead of guessing a timeout. `<<<HERMES_DISPATCH_FAILED:<runId>>>` replaces the
+`COMPLETE` form when the run did not succeed. Both the log and the state file are pruned when the
+wait CLI finishes.
 
 ## Requirements
 

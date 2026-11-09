@@ -19,7 +19,15 @@ import {
   type PendingRecord,
 } from "./memory-manager.js";
 import { resolveAntigravityProject, type ResolvedProject } from "./project-binding.js";
-import { RUN_ID_PATTERN, clearRunState, writeRunState, type RunState } from "./run-registry.js";
+import { formatStreamLine, openRunLog, type RunLog } from "./run-log.js";
+import {
+  RUN_ID_PATTERN,
+  clearRunState,
+  readRunState,
+  runLogPath,
+  writeRunState,
+  type RunState,
+} from "./run-registry.js";
 
 export interface DispatchOptions {
   prompt: string;
@@ -368,11 +376,16 @@ export const buildChatArgs = (options: ChatArgsOptions): string[] => {
   return args;
 };
 
+/**
+ * `log` receives every formatted line as the child emits it, which is what makes the run tailable
+ * live: the stream is flushed per event rather than at exit.
+ */
 const execHermes = (
   args: string[],
   cwd: string,
   timeoutSeconds: number,
   onSessionId?: (sessionId: string) => void,
+  log?: RunLog,
 ): Promise<HermesRun> =>
   new Promise((resolve) => {
     const state: StreamState = {
@@ -415,6 +428,7 @@ const execHermes = (
       for (const line of lines) {
         const previous = state.sessionId;
         ingestStreamLine(line, state);
+        log?.write(formatStreamLine(line));
         if (state.sessionId && state.sessionId !== previous) onSessionId?.(state.sessionId);
       }
     });
@@ -433,6 +447,7 @@ const execHermes = (
       if (buffer.trim()) {
         const previous = state.sessionId;
         ingestStreamLine(buffer, state);
+        log?.write(formatStreamLine(buffer));
         if (state.sessionId && state.sessionId !== previous) onSessionId?.(state.sessionId);
       }
       resolve({ state, timedOut, spawnError, stderr, code });
@@ -626,6 +641,177 @@ const secretViolations = (porcelain: string, alreadyBlocked: Set<string>): strin
 };
 
 /**
+ * Files a baseline port never carries into the worktree: `.worktrees` would nest the bridge's own
+ * checkouts, and `node_modules` is regenerable bulk that only slows the copy down.
+ */
+const BASELINE_SKIP_SEGMENTS = new Set([".git", ".worktrees", "node_modules"]);
+
+const isBlockedBaselinePath = (relative: string): boolean => {
+  const posix = relative.replace(/\\/g, "/");
+  const segments = posix.split("/").filter(Boolean);
+  if (segments.some((segment) => BASELINE_SKIP_SEGMENTS.has(segment))) return true;
+  const base = segments[segments.length - 1] ?? "";
+  if (ENV_TEMPLATE.test(base)) return false;
+  return BLOCKED_PATH_PATTERNS.some((pattern) => pattern.test(posix));
+};
+
+/**
+ * Ports the caller's uncommitted work into a fresh worktree so Hermes can see in-progress files
+ * (a half-written component, an untracked test) without ever committing them to the caller's
+ * checkout. Tracked changes travel as a binary diff; untracked files are copied because no diff
+ * can express a file git has never seen. Returns the baseline commit SHA, or the original HEAD
+ * SHA when there was nothing to port.
+ */
+export const snapshotCallerWorkingTree = async (
+  repoRoot: string,
+  worktreePath: string,
+  headSha: string,
+): Promise<{ baseSha: string; ported: number; skipped: string[] }> => {
+  const status = await runGit(repoRoot, [
+    "-c",
+    "core.quotePath=false",
+    "status",
+    "--porcelain=v1",
+    "--untracked-files=all",
+    "-z",
+    "--no-renames",
+  ]);
+  if (!status.ok) {
+    throw new Error(`git status failed in ${repoRoot}: ${(status.stderr || status.stdout).trim()}`);
+  }
+
+  const entries = splitNul(status.stdout);
+  const tracked: string[] = [];
+  const untracked: string[] = [];
+  for (const entry of entries) {
+    if (entry.length < 4) continue;
+    const code = entry.slice(0, 2);
+    const file = entry.slice(3);
+    if (!file) continue;
+    if (code === "??") untracked.push(file);
+    else if (code !== "!!") tracked.push(file);
+  }
+
+  if (tracked.length === 0 && untracked.length === 0) {
+    return { baseSha: headSha, ported: 0, skipped: [] };
+  }
+
+  const skipped: string[] = [];
+  // A blocked path is blocked as a tracked edit too: porting it would commit the caller's real
+  // .env into the worktree, where no diff (and so no guardrail) can see it again.
+  const trackedAllowed: string[] = [];
+  for (const file of tracked) {
+    if (isBlockedBaselinePath(file)) skipped.push(file);
+    else trackedAllowed.push(file);
+  }
+
+  if (trackedAllowed.length > 0) {
+    const diff = await runGit(repoRoot, [
+      "-c",
+      "core.quotePath=false",
+      "diff",
+      "HEAD",
+      "--binary",
+      "--no-renames",
+      // Excluded by literal pathspec rather than filtered afterwards: the excluded hunk must never
+      // be written to a patch file, even transiently.
+      ...tracked
+        .filter((file) => isBlockedBaselinePath(file))
+        .map((file) => `:(exclude,literal)${file}`),
+    ]);
+    if (!diff.ok) {
+      throw new Error(`git diff HEAD failed in ${repoRoot}: ${(diff.stderr || diff.stdout).trim()}`);
+    }
+    if (diff.stdout.trim()) {
+      const patchFile = path.join(os.tmpdir(), `hermes-baseline-${path.basename(worktreePath)}.patch`);
+      try {
+        await fsp.writeFile(patchFile, diff.stdout, "utf8");
+        // `--3way` is wrong here: the worktree is branched from HEAD, so the patch is exact.
+        const applied = await runGit(worktreePath, ["apply", "--binary", "--whitespace=nowarn", patchFile]);
+        if (!applied.ok || /Skipped patch/i.test(`${applied.stdout}${applied.stderr}`)) {
+          throw new Error(
+            `git apply of the caller's tracked changes failed: ${(applied.stderr || applied.stdout).trim()}`,
+          );
+        }
+      } finally {
+        await fsp.rm(patchFile, { force: true }).catch(() => undefined);
+      }
+    }
+  }
+
+  const skippedUntracked: string[] = [];
+  let ported = trackedAllowed.length;
+  for (const file of untracked) {
+    if (isBlockedBaselinePath(file)) {
+      skippedUntracked.push(file);
+      continue;
+    }
+    const source = path.join(repoRoot, file);
+    const target = path.join(worktreePath, file);
+    try {
+      const stat = await fsp.lstat(source);
+      // A container worktree may hold a junction that resolves outside the repo: never follow it.
+      if (!stat.isFile()) {
+        skippedUntracked.push(file);
+        continue;
+      }
+      await fsp.mkdir(path.dirname(target), { recursive: true });
+      await fsp.copyFile(source, target);
+      ported += 1;
+    } catch {
+      skippedUntracked.push(file);
+    }
+  }
+  skipped.push(...skippedUntracked);
+
+  if (ported === 0) return { baseSha: headSha, ported: 0, skipped };
+
+  const staged = await runGit(worktreePath, ["add", "-A"]);
+  if (!staged.ok) {
+    throw new Error(`git add -A failed in the worktree: ${(staged.stderr || staged.stdout).trim()}`);
+  }
+  const committed = await runGit(worktreePath, [
+    "commit",
+    "-m",
+    BASELINE_COMMIT_SUBJECT,
+    "--allow-empty",
+  ]);
+  if (!committed.ok) {
+    throw new Error(`baseline commit failed: ${(committed.stderr || committed.stdout).trim()}`);
+  }
+  const head = await runGit(worktreePath, ["rev-parse", "HEAD"]);
+  if (!head.ok) {
+    throw new Error(`could not read the baseline commit: ${(head.stderr || head.stdout).trim()}`);
+  }
+  return { baseSha: head.stdout.trim(), ported, skipped };
+};
+
+/** The subject identifies the review boundary; apply reads it back to find where the run started. */
+export const BASELINE_COMMIT_SUBJECT = "[AGY-BASE] Working tree baseline snapshot";
+
+/**
+ * The newest baseline commit between the branch point and the run's tip, or null when the caller
+ * was clean and the run branched straight from HEAD. `git log` is newest-first, so a stacked
+ * baseline (a second dispatch on an already-ported tree) resolves to the most recent one.
+ */
+const resolveBaselineSha = async (
+  repoRoot: string,
+  mergeBase: string,
+  branch: string,
+): Promise<string | null> => {
+  const found = await runGit(repoRoot, [
+    "log",
+    "--format=%H",
+    "--fixed-strings",
+    `--grep=${BASELINE_COMMIT_SUBJECT}`,
+    `${mergeBase}..${branch}`,
+  ]);
+  if (!found.ok) return null;
+  const first = found.stdout.split(/\r?\n/).map((line) => line.trim()).find(Boolean);
+  return first ?? null;
+};
+
+/**
  * One dispatch: guard the prompt, bind the project, run Hermes inside a fresh worktree branched
  * from local HEAD, then firewall whatever it produced before Antigravity ever sees it. The run
  * answers with a running descriptor when it outlives the fast-wait window; the pipeline keeps
@@ -706,6 +892,22 @@ export const dispatchHermesTask = async (options: DispatchOptions): Promise<Disp
     throw new Error(`git worktree add failed: ${(created.stderr || created.stdout).trim()}`);
   }
 
+  // The baseline commit is made before Hermes runs, so a caller's pre-commit hook is ordinary git
+  // behaviour rather than a hole in the review boundary; the hook sandbox below still guards the
+  // caller against anything Hermes does afterwards.
+  let baselineSha = baseSha;
+  let baselinePorted = 0;
+  let baselineSkipped: string[] = [];
+  try {
+    const snapshot = await snapshotCallerWorkingTree(repoRoot, worktreePath, baseSha);
+    baselineSha = snapshot.baseSha;
+    baselinePorted = snapshot.ported;
+    baselineSkipped = snapshot.skipped;
+  } catch (error) {
+    await destroyWorktree(repoRoot, worktreePath, branch);
+    throw error;
+  }
+
   try {
     await fsp.mkdir(emptyHooksDir, { recursive: true });
     const current = await runGit(repoRoot, ["config", "--get", "core.hooksPath"]);
@@ -735,7 +937,7 @@ export const dispatchHermesTask = async (options: DispatchOptions): Promise<Disp
     project,
     worktreePath,
     branch,
-    baseSha,
+    baseSha: baselineSha,
     modifiedFiles: [],
     diff: "",
     diffTruncated: false,
@@ -758,6 +960,7 @@ export const dispatchHermesTask = async (options: DispatchOptions): Promise<Disp
     message: "",
   };
 
+  let runLog: RunLog | null = null;
   const runPipeline = async (): Promise<DispatchResult> => {
     try {
       await fsp.writeFile(promptFile, guarded, "utf8");
@@ -771,10 +974,17 @@ export const dispatchHermesTask = async (options: DispatchOptions): Promise<Disp
         skills: options.skills,
       });
 
-      const execution = await execHermes(args, worktreePath, timeoutSeconds, (sessionId) => {
-        live.sessionId = sessionId;
-        result.sessionId = sessionId;
-      });
+      runLog = openRunLog(runLogPath(runId));
+      const execution = await execHermes(
+        args,
+        worktreePath,
+        timeoutSeconds,
+        (sessionId) => {
+          live.sessionId = sessionId;
+          result.sessionId = sessionId;
+        },
+        runLog,
+      );
       result.timedOut = execution.timedOut;
       result.exitCode = execution.state.exitCode ?? execution.code;
       result.sessionId = execution.state.sessionId;
@@ -825,7 +1035,7 @@ export const dispatchHermesTask = async (options: DispatchOptions): Promise<Disp
         "--name-only",
         "--no-renames",
         "-z",
-        baseSha,
+        baselineSha,
       ]);
       if (!nameOnly.ok) {
         throw new Error(`git diff --name-only failed: ${(nameOnly.stderr || nameOnly.stdout).trim()}`);
@@ -855,7 +1065,7 @@ export const dispatchHermesTask = async (options: DispatchOptions): Promise<Disp
         "diff",
         "--binary",
         "--no-renames",
-        baseSha,
+        baselineSha,
       ]);
       if (!diff.ok) {
         throw new Error(`git diff failed: ${(diff.stderr || diff.stdout).trim()}`);
@@ -926,7 +1136,13 @@ export const dispatchHermesTask = async (options: DispatchOptions): Promise<Disp
       result.success = !failed && !attributionFailed;
       result.message =
         result.message ||
-        `${result.modifiedFiles.length} file(s) changed on ${branch}. Apply with hermes_worktree_action.`;
+        `${result.modifiedFiles.length} file(s) changed on ${branch}. Apply with hermes_worktree_action.` +
+          (baselinePorted > 0
+            ? ` ${baselinePorted} uncommitted caller file(s) were ported into the baseline commit.`
+            : "") +
+          (baselineSkipped.length > 0
+            ? ` Skipped from the baseline: ${baselineSkipped.join(", ")}.`
+            : "");
       return result;
     } catch (error) {
       // M12: a throw anywhere after the worktree exists must not leave a branch or a directory.
@@ -937,6 +1153,9 @@ export const dispatchHermesTask = async (options: DispatchOptions): Promise<Disp
       result.message = `Dispatch failed: ${result.error}`;
       return result;
     } finally {
+      // Closed before the state file is published: the wait CLI flushes what is on disk when it
+      // sees `completed`, so an unclosed stream would truncate the tail.
+      await runLog?.close().catch(() => undefined);
       await fsp.rm(promptFile, { force: true }).catch(() => undefined);
       await restoreHooks();
       await clearEmptyHooks();
@@ -1007,7 +1226,7 @@ export const dispatchHermesTask = async (options: DispatchOptions): Promise<Disp
     project,
     worktreePath,
     branch,
-    baseSha,
+    baseSha: baselineSha,
     waitCommand: `node "${waitJs}" "${runId}"`,
     message:
       `Hermes is still running after ${fastWaitSeconds}s. Execute waitCommand as a background ` +
@@ -1025,12 +1244,24 @@ export const manageWorktree = async (options: {
   worktreeBranch: string;
 }): Promise<{ success: boolean; message: string; patchPath?: string }> => {
   // Anything else is a user branch: `branch -D` on it would destroy work this bridge never made.
-  if (!BRANCH_PATTERN.test(options.worktreeBranch)) {
+  const branchMatch = options.worktreeBranch.match(/^hermes\/agy-([A-Za-z0-9_-]+)$/);
+  if (!branchMatch) {
     return {
       success: false,
       message:
         `Refusing to touch branch '${options.worktreeBranch}': only hermes/agy-<runId> branches ` +
         "created by hermes_dispatch are managed here.",
+    };
+  }
+
+  // Refuse to touch a worktree whose Hermes process/session is actively executing.
+  const activeRun = readRunState(branchMatch[1]);
+  if (activeRun && activeRun.status === "running") {
+    return {
+      success: false,
+      message:
+        `Refusing to ${options.action} '${options.worktreeBranch}': Hermes run '${branchMatch[1]}' ` +
+        "is still actively executing. Wait for the run to finish before managing the worktree.",
     };
   }
 
@@ -1072,6 +1303,9 @@ export const manageWorktree = async (options: {
       : { success: true, message: `Discarded worktree and branch '${options.worktreeBranch}'.` };
   }
 
+  // `merge-base` is the branch point, which is caller HEAD — it sits BELOW the baseline commit,
+  // so diffing from it re-emits the caller's uncommitted work and the patch collides with their
+  // dirty tree. The baseline commit is the review boundary: everything the caller already had.
   const mergeBase = await runGit(repoRoot, ["merge-base", options.worktreeBranch, "HEAD"]);
   if (!mergeBase.ok) {
     return {
@@ -1079,7 +1313,7 @@ export const manageWorktree = async (options: {
       message: `Could not find a merge base for '${options.worktreeBranch}': ${mergeBase.stderr.trim()}`,
     };
   }
-  const baseSha = mergeBase.stdout.trim();
+  const baseSha = (await resolveBaselineSha(repoRoot, mergeBase.stdout.trim(), options.worktreeBranch)) ?? mergeBase.stdout.trim();
 
   const staged = await runGit(target.path, ["-c", "core.quotePath=false", "add", "-N", "."]);
   if (!staged.ok) {
