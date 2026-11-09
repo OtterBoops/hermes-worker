@@ -192,7 +192,7 @@ export const WORKER_BOUNDARY = [
   "[WORKER OPERATIONAL BOUNDARY]",
   "- You are executing inside an isolated Git worktree managed by Antigravity.",
   "- Stay focused within this repository root; do not touch .env files, credentials, or remote infrastructure.",
-  "- Operate strictly within the current working directory (the active worktree checkout). All file reads, edits, and terminal commands must use relative paths within cwd. Never navigate up to, reference, or mutate files in the parent checkout outside this worktree.",
+  "- Operate strictly within the current working directory (the active worktree checkout). All file reads, edits, and terminal commands must use relative paths within cwd. Never navigate up to, reference, or mutate files in the parent checkout outside this worktree. If temporary probe fixtures are required for testing, limit them strictly to system temp ($TMPDIR or os.tmpdir()); never touch or create files in $LOCALAPPDATA, user profile directories, or outside temp.",
   "- Local workstation testing (local containers, node/pnpm/cargo/pytest runners) is encouraged. "
     + "Iterate using targeted test filters (e.g. --test-name-pattern or single test file) during development; "
     + "run the full test suite strictly once before declaring completion.",

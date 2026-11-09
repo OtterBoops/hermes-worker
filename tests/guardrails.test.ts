@@ -170,6 +170,8 @@ test("WORKER_BOUNDARY confines the worker to its own worktree checkout", () => {
   assert.ok(WORKER_BOUNDARY.includes("the active worktree checkout"));
   assert.ok(WORKER_BOUNDARY.includes("must use relative paths within cwd"));
   assert.ok(WORKER_BOUNDARY.includes("Never navigate up to, reference, or mutate files in the parent checkout"));
+  assert.ok(WORKER_BOUNDARY.includes("limit them strictly to system temp ($TMPDIR or os.tmpdir())"));
+  assert.ok(WORKER_BOUNDARY.includes("never touch or create files in $LOCALAPPDATA"));
 });
 
 test("a blocked directory beats the template allowlist", () => {
