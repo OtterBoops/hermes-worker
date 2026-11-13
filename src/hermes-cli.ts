@@ -515,8 +515,6 @@ export interface ChatArgsOptions {
   skills?: string[];
   /** The per-run usage ledger. A top-level flag, so it cannot travel with the chat arguments. */
   usageFile?: string;
-  /** Chat-scoped wall-clock budget: the agent gets a wrap-up notice before the hard kill. */
-  runBudgetSeconds?: number;
 }
 
 export const buildChatArgs = (options: ChatArgsOptions): string[] => {
@@ -546,9 +544,9 @@ export const buildChatArgs = (options: ChatArgsOptions): string[] => {
     "--reasoning",
     options.reasoning || DEFAULT_REASONING,
   ];
-  if (typeof options.runBudgetSeconds === "number" && options.runBudgetSeconds > 0) {
-    args.push("--run-budget", String(Math.round(options.runBudgetSeconds)));
-  }
+  // No --run-budget: the gateway CLI refuses it outright (exit 2, "Unsupported gateway CLI
+  // options") and points at agent.run_budget_seconds. The process timeout in execHermes
+  // is the only budget a dispatch actually gets.
   if (options.skills?.length) args.push("--skills", options.skills.join(","));
   return args;
 };
@@ -1298,9 +1296,6 @@ export const dispatchHermesTask = async (options: DispatchOptions): Promise<Disp
         reasoning: options.reasoning,
         skills: options.skills,
         usageFile,
-        // The process timeout is the hard kill; the run budget is the softer notice that lets the
-        // agent wrap up and report instead of dying mid-write.
-        runBudgetSeconds: timeoutSeconds,
       });
 
       runLog = openRunLog(runLogPath(runId));

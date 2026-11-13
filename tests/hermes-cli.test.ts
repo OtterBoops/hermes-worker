@@ -1395,21 +1395,22 @@ test("pruneOrphanWorktrees is a no-op on a repository that never dispatched", as
   assert.equal(await pruneOrphanWorktrees(repo), 0);
 });
 
-test("the usage-file flag is top-level and the run budget rides with chat", () => {
+test("the usage-file flag is top-level and no gateway-rejected flag is emitted", () => {
   const args = buildChatArgs({
     promptFile: "p.txt",
     worktreePath: "w",
     sessionName: "s",
     usageFile: "C:\\Temp\\usage.json",
-    runBudgetSeconds: 900,
   });
 
   // argparse refuses --usage-file after the subcommand, so a later edit that appends it to the
   // chat argument list breaks every dispatch instead of failing one option.
   assert.ok(args.indexOf("--usage-file") < args.indexOf("chat"), "the ledger flag must precede chat");
   assert.equal(args[args.indexOf("--usage-file") + 1], "C:\\Temp\\usage.json");
-  assert.equal(args[args.indexOf("--run-budget") + 1], "900");
-  assert.ok(args.indexOf("--run-budget") > args.indexOf("chat"), "--run-budget is a chat flag");
+
+  // The gateway CLI refuses --run-budget with exit 2 and no session, so emitting it makes every
+  // dispatch fail before the provider is reached. The process timeout is the only real budget.
+  assert.equal(args.includes("--run-budget"), false);
 
   // No usage file, no flags: a call without a ledger must not carry an empty path.
   const bare = buildChatArgs({ promptFile: "p.txt", worktreePath: "w", sessionName: "s" });
