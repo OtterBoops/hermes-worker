@@ -27,11 +27,12 @@ server.registerTool(
     title: "Dispatch a task to Hermes Agent",
     description:
       "Run an implementation, refactor, test-generation or audit task on Hermes inside an isolated " +
-      "git worktree branched from local HEAD. Returns the diff, session id, tool summary and any " +
-      "memory/skill writes Hermes staged. Nothing is committed to your checkout; land it with " +
-      "hermes_worktree_action. A status of 'running' is a normal answer, not an error: the run " +
-      "outlived fastWaitSeconds, nothing was killed, and running waitCommand as a background " +
-      "command streams the run's log live, then prints a telemetry block, one sentinel line " +
+      "git worktree branched from local HEAD. Returns the session id, tool summary, memory/skill " +
+      "writes Hermes staged and the diff (omitted when autoApply already landed it). Nothing is " +
+      "committed to your checkout; land it with hermes_worktree_action. A status of 'running' is a " +
+      "normal answer, not an error: the run outlived fastWaitSeconds, nothing was killed, and " +
+      "running waitCommand as a background command streams the run's log live, then prints a " +
+      "telemetry table (duration, tools, subagents, model, tokens, cost), one sentinel line " +
       "('<<<HERMES_DISPATCH_COMPLETE:<runId>>>', or '<<<HERMES_DISPATCH_FAILED:<runId>>>' when " +
       "the run did not succeed) and the result message. Uncommitted caller changes are ported into " +
       "the worktree as a baseline commit, so the diff covers only Hermes' work. The run is pinned " +
@@ -84,6 +85,14 @@ server.registerTool(
         .describe(
           "When true, automatically apply a clean worktree diff to cwd and remove the worktree " +
             "branch on successful completion.",
+        ),
+      includeDiff: z
+        .boolean()
+        .optional()
+        .describe(
+          "Return the diff body even when autoApply landed it. An auto-applied run omits the " +
+            "diff by default because the changes are already on the checkout; a run left for " +
+            "review returns it by default.",
         ),
     },
   },

@@ -47,7 +47,9 @@ pnpm test          # node --test against tests/*.test.ts
    pass work.
 7. Modified files are checked against the guardrails. A violation destroys the worktree; an empty
    run cleans up after itself; when `autoApply: true` is set, clean diffs are applied to the working
-   checkout immediately; otherwise the worktree is kept for review.
+   checkout immediately; otherwise the worktree is kept for review. An applied run returns no diff
+   body (`diffOmitted: true`) because the change is already on the checkout; pass `includeDiff: true`
+   when the caller still needs to read it, or `includeDiff: false` to omit it from a review-kept run.
 8. The session's `cwd` / `git_repo_root` are re-anchored to the repository root so the thread stays
    resumable after the worktree is pruned. The same read reports the model that actually answered:
    Hermes falls back (429 from the pinned provider) without failing the run, so `model`,
@@ -60,9 +62,10 @@ hide the session from Desktop pickers.
 ## Watching a run
 
 Every dispatch appends a human-readable tail to `<RUN_STATE_DIR>/<runId>.log` as Hermes emits
-events — `[Hermes:Tool]`, `[Hermes:Exec]`, `[Hermes:Result]`, `[Hermes:Step]`. Running the
+events — `[Hermes:Tool]`, `[Hermes:Exec]`, `[Hermes:Result]`, `[Hermes:Step]`. A read or search
+result is dropped because its `[Hermes:Tool]` line already names what was read. Running the
 `waitCommand` from a `status: 'running'` answer streams those lines live, then prints a telemetry
-block and one sentinel line:
+table and one sentinel line:
 
 ```
 [Hermes Worker] Tailing run 20261108234625-4u18...
@@ -70,17 +73,27 @@ block and one sentinel line:
 [Hermes:Tool] terminal (pnpm test)
 [Hermes:Exec] pnpm test
 [Hermes:Result] c1 -> 67 tests passing
-============================================================
-[Hermes Dispatch Telemetry] (Status: SUCCESS)
-- Run ID: 20261108234625-4u18
-- Duration: 22.4s
-- Tools Called: 2
-- Subagents Spawned: 1
-- Tokens Used: 140 (input: 111, output: 22, cache: 7)
-============================================================
+[Hermes Dispatch Telemetry] SUCCESS
+| field | value |
+| --- | --- |
+| run | 20261108234625-4u18 |
+| duration | 22.4s |
+| tools | 2 |
+| subagents | 1 |
+| model | cline-pass/deepseek-v4.1-flash-1017 (clinepass) |
+| tokens | input 111 · output 22 · cache_read 7 · reasoning 0 · total 140 |
+| cost_usd | 0.000312 |
+| clinepass | ok · 7 requests |
+| agy_quota | gemini-argon-wtu-weekly 3% @ 2026-11-14T10:09:42Z · gemini-weekly 16% @ 2026-11-14T10:12:32Z |
+
 <<<HERMES_DISPATCH_COMPLETE:20261108234625-4u18>>>
 1 file(s) changed on hermes/agy-20261108234625-4u18 in 22.4s. Apply with hermes_worktree_action. [session: sess-1] [tokens: 140]
 ```
+
+The `clinepass` and `agy_quota` rows come from a local probe that spends no model tokens: the key
+statuses in `$HERMES_HOME/auth.json`, and Antigravity's `RetrieveUserQuotaSummary` over loopback
+Connect-RPC (`ANTIGRAVITY_ENDPOINT_URL`/`ANTIGRAVITY_CSRF_TOKEN`, else the daemon's `hub_*.json`
+descriptor, else process discovery). Either row is omitted when the probe finds nothing.
 
 The sentinel is emitted on every path — success, failure, timeout and crash — so a caller can tail
 the command instead of guessing a timeout. `<<<HERMES_DISPATCH_FAILED:<runId>>>` replaces the

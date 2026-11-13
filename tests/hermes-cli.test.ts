@@ -281,6 +281,7 @@ const chatStub = (options: {
   sessionId: string;
   writeUsage?: Record<string, unknown>;
   sleepMs?: number;
+  emitToolCalls?: boolean;
 }): string =>
   [
     'import fs from "node:fs";',
@@ -288,6 +289,7 @@ const chatStub = (options: {
     `const SESSION_ID = ${JSON.stringify(options.sessionId)};`,
     `const WRITE_USAGE = ${JSON.stringify(options.writeUsage ?? null)};`,
     `const SLEEP_MS = ${options.sleepMs ?? 0};`,
+    `const EMIT_TOOL_CALLS = ${options.emitToolCalls === true};`,
     "const argv = process.argv.slice(2);",
     'const flag = (name) => { const i = argv.indexOf(name); return i === -1 ? undefined : argv[i + 1]; };',
     '// The ledger flag is top-level: argparse rejects it anywhere after the subcommand.',
@@ -305,6 +307,13 @@ const chatStub = (options: {
     "    JSON.stringify(WRITE_USAGE ?? { session_id: SESSION_ID, completed: true, failed: false }) + \"\\n\",",
     "  );",
     "}",
+    // A read call and its payload: the event pair a leaky collector would copy into the result.
+    "if (EMIT_TOOL_CALLS) {",
+    '  process.stdout.write(JSON.stringify({ type: "tool_use", id: "call-1", name: "read_file",',
+    '    input: { file_path: "src/secret-layout.ts" } }) + "\\n");',
+    '  process.stdout.write(JSON.stringify({ type: "tool_result", tool_use_id: "call-1",',
+    '    content: [{ type: "text", text: "x".repeat(900) }] }) + "\\n");',
+    "}",
     'process.stdout.write(JSON.stringify({',
     '  type: "result",',
     '  result: "wrote auto-applied.ts",',
@@ -321,6 +330,7 @@ const makeDispatchRepo = async (
     usage?: Record<string, unknown> | null;
     sleepMs?: number;
     fallbackActive?: boolean;
+    emitToolCalls?: boolean;
   } = {},
 ): Promise<{ repo: string; home: string }> => {
   const repo = fs.mkdtempSync(path.join(os.tmpdir(), "hermes-worker-dispatch-"));
@@ -340,7 +350,12 @@ const makeDispatchRepo = async (
   const bin = path.join(home, "hermes-bin.mjs");
   fs.writeFileSync(
     bin,
-    chatStub({ sessionId, sleepMs: options.sleepMs, writeUsage: options.usage ?? undefined }),
+    chatStub({
+      sessionId,
+      sleepMs: options.sleepMs,
+      writeUsage: options.usage ?? undefined,
+      emitToolCalls: options.emitToolCalls,
+    }),
     "utf8",
   );
 
@@ -413,6 +428,112 @@ test("without autoApply the diff stays in the worktree for review", async (t) =>
   assert.equal(result.worktreeKept, true);
   assert.equal(fs.existsSync(path.join(repo, "auto-applied.ts")), false, "the checkout is untouched");
   assert.equal(await branchExists(repo, `hermes/agy-${runId}`), true);
+});
+
+test("an auto-applied run omits the diff body it just wrote to the checkout", async (t) => {
+  const runId = `apply-nodiff-${process.pid}-${Date.now().toString(36)}`;
+  const { repo } = await makeDispatchRepo(t);
+
+  const result = (await dispatchHermesTask({
+    cwd: repo,
+    prompt: "Add auto-applied.ts to the repository root.",
+    runId,
+    autoApply: true,
+    fastWaitSeconds: 120,
+  })) as DispatchResult;
+
+  assert.equal(result.success, true, result.message);
+  assert.equal(result.applied, true);
+  // The body would be the same bytes already on the checkout: paying AGY to read it twice is waste.
+  assert.equal(result.diff, "");
+  assert.equal(result.diffTruncated, false);
+  assert.equal(result.diffOmitted, true);
+  assert.deepEqual(result.modifiedFiles, ["auto-applied.ts"], "the file list survives the omission");
+  assert.equal(
+    fs.readFileSync(path.join(repo, "auto-applied.ts"), "utf8"),
+    "export const autoApplied = true;\n",
+  );
+});
+
+test("includeDiff true still returns the diff of an applied run", async (t) => {
+  const runId = `apply-withdiff-${process.pid}-${Date.now().toString(36)}`;
+  const { repo } = await makeDispatchRepo(t);
+
+  const result = (await dispatchHermesTask({
+    cwd: repo,
+    prompt: "Add auto-applied.ts to the repository root.",
+    runId,
+    autoApply: true,
+    includeDiff: true,
+    fastWaitSeconds: 120,
+  })) as DispatchResult;
+
+  assert.equal(result.applied, true, result.message);
+  assert.match(result.diff, /auto-applied\.ts/, "an explicit includeDiff still pays for the body");
+  assert.equal(result.diffOmitted, undefined, "a returned diff is not an omitted one");
+});
+
+test("includeDiff false omits the diff of a run left in its worktree", async (t) => {
+  const runId = `keep-nodiff-${process.pid}-${Date.now().toString(36)}`;
+  const { repo } = await makeDispatchRepo(t);
+
+  const result = (await dispatchHermesTask({
+    cwd: repo,
+    prompt: "Add auto-applied.ts to the repository root.",
+    runId,
+    includeDiff: false,
+    fastWaitSeconds: 120,
+  })) as DispatchResult;
+
+  assert.equal(result.success, true, result.message);
+  assert.equal(result.worktreeKept, true, "asking for no diff must not land anything");
+  assert.equal(result.diff, "");
+  assert.equal(result.diffOmitted, true);
+  assert.deepEqual(result.modifiedFiles, ["auto-applied.ts"]);
+});
+
+test("a review-kept dispatch still returns the diff by default", async (t) => {
+  const runId = `keep-diff-${process.pid}-${Date.now().toString(36)}`;
+  const { repo } = await makeDispatchRepo(t);
+
+  const result = (await dispatchHermesTask({
+    cwd: repo,
+    prompt: "Add auto-applied.ts to the repository root.",
+    runId,
+    fastWaitSeconds: 120,
+  })) as DispatchResult;
+
+  assert.equal(result.worktreeKept, true);
+  assert.match(result.diff, /auto-applied\.ts/, "an unapplied run has no other source for its diff");
+  assert.equal(result.diffOmitted, undefined);
+});
+
+test("the returned tool events name calls only, never a result payload", async (t) => {
+  const runId = `tool-events-${process.pid}-${Date.now().toString(36)}`;
+  const { repo } = await makeDispatchRepo(t, { emitToolCalls: true });
+
+  const result = (await dispatchHermesTask({
+    cwd: repo,
+    prompt: "Add auto-applied.ts to the repository root.",
+    runId,
+    fastWaitSeconds: 120,
+  })) as DispatchResult;
+
+  assert.equal(result.success, true, result.message);
+  const uses = result.toolEvents.filter((event) => event.type === "tool_use");
+  assert.equal(uses.length, 1, "the read call is still counted");
+  assert.equal(uses[0].name, "read_file");
+  // The payload is the run log's job: copying it back bills the caller for text nothing reads.
+  assert.equal(
+    result.toolEvents.some((event) => event.type === "tool_result"),
+    false,
+    "no result payload may ride along in the dispatch answer",
+  );
+  assert.equal(
+    JSON.stringify(result.toolEvents).includes("xxxxxxxxxx"),
+    false,
+    "no tool output may be smuggled into the answer",
+  );
 });
 
 test("the fast-wait default keeps a dispatch call short", () => {
@@ -711,10 +832,10 @@ test("wait.js polls the run registry, streams the log tail and reports the resul
     "the tail must be flushed before the summary",
   );
 
-  assert.match(output.stdout, /\[Hermes Dispatch Telemetry\] \(Status: SUCCESS\)/);
-  assert.match(output.stdout, new RegExp(`- Run ID: ${runId}`));
-  assert.match(output.stdout, /- Duration: 4\.0s/);
-  assert.match(output.stdout, /- Tools Called: 0/);
+  assert.match(output.stdout, /\[Hermes Dispatch Telemetry\] SUCCESS/);
+  assert.match(output.stdout, new RegExp(`\\| run \\| ${runId} \\|`));
+  assert.match(output.stdout, /\| duration \| 4\.0s \|/);
+  assert.match(output.stdout, /\| tools \| 0 \|/);
   assert.match(output.stdout, /<<<HERMES_DISPATCH_COMPLETE:/);
 
   assert.ok(output.stdout.includes(formatDispatchSentinel(runId)), "the sentinel must name the run");
@@ -763,11 +884,14 @@ test("wait.js emits the failure telemetry and sentinel, then exits 1", async (t)
     timeoutMs: 20_000,
   });
   assert.equal(output.code, 1);
-  assert.match(output.stdout, /\(Status: FAILED\)/);
-  assert.match(output.stdout, /- Duration: 2\.5s/);
-  assert.match(output.stdout, /- Tools Called: 3/);
-  assert.match(output.stdout, /- Subagents Spawned: 2/);
-  assert.match(output.stdout, /- Tokens Used: 125 \(input: 100, output: 20, cache: 5\)/);
+  assert.match(output.stdout, /\[Hermes Dispatch Telemetry\] FAILED/);
+  assert.match(output.stdout, /\| duration \| 2\.5s \|/);
+  assert.match(output.stdout, /\| tools \| 3 \|/);
+  assert.match(output.stdout, /\| subagents \| 2 \|/);
+  assert.match(
+    output.stdout,
+    /\| tokens \| input 100 · output 20 · cache_read 5 · reasoning 0 · total 125 \|/,
+  );
   assert.ok(output.stdout.includes(formatFailedSentinel(runId)));
   assert.match(output.stdout, /boom/);
   assert.equal(output.stdout.includes('{\n  "success"'), false, "large raw JSON must not be emitted");
@@ -826,7 +950,10 @@ test("wait.js reads Hermes' bare usage keys and emits the assistant summary", as
     timeoutMs: 20_000,
   });
   assert.equal(output.code, 0, output.stderr);
-  assert.match(output.stdout, /- Tokens Used: 347 \(input: 300, output: 40, cache: 7\)/);
+  assert.match(
+    output.stdout,
+    /\| tokens \| input 300 · output 40 · cache_read 7 · reasoning 0 · total 347 \|/,
+  );
   assert.match(output.stdout, /\[Hermes Summary\]\nRewrote the token lookup and the run log renderer\./);
   // The summary is the agent's own words, so it must land ahead of the dispatch verdict.
   assert.ok(
@@ -848,7 +975,10 @@ test("wait.js reads Hermes' bare usage keys and emits the assistant summary", as
     timeoutMs: 20_000,
   });
   assert.equal(second.code, 0, second.stderr);
-  assert.match(second.stdout, /- Tokens Used: 999 \(input: 10, output: 5, cache: 0\)/);
+  assert.match(
+    second.stdout,
+    /\| tokens \| input 10 · output 5 · cache_read 0 · reasoning 0 · total 999 \|/,
+  );
   assert.equal(
     second.stdout.includes("[Hermes Summary]"),
     false,
@@ -1310,7 +1440,14 @@ test("readUsageReport reads the native ledger and tolerates a partial one", (t) 
   assert.equal(report?.model, "cline-pass/deepseek-v4.1-flash-1017");
   assert.equal(report?.provider, "clinepass");
   assert.equal(report?.sessionId, "sess-9");
-  assert.deepEqual(report?.tokens, { input: 100, output: 20, cache_read: 5, total: 125 });
+  assert.deepEqual(report?.tokens, {
+    input: 100,
+    output: 20,
+    cache_read: 5,
+    reasoning: 0,
+    cache_write: 0,
+    total: 125,
+  });
   assert.equal(report?.failed, false);
 
   // A failed run writes nulls rather than no file: it must still name its failure.
@@ -1444,7 +1581,7 @@ test("wait.js fails immediately when the worker pid is already dead", async (t) 
 
   assert.equal(output.code, 1);
   assert.ok(output.stdout.includes(formatFailedSentinel(runId)));
-  assert.match(output.stdout, /\(Status: FAILED\)/);
+  assert.match(output.stdout, /\[Hermes Dispatch Telemetry\] FAILED/);
   assert.match(output.stderr, /abandoned by dead worker pid 2147483647/);
   // The whole point: a two-hour deadline is not waited out for a process that is already gone.
   assert.ok(elapsed < 20_000, `a dead run must not be waited out, took ${elapsed}ms`);
@@ -1452,7 +1589,7 @@ test("wait.js fails immediately when the worker pid is already dead", async (t) 
   assert.notEqual(readRunState(runId), null, "an abandoned run's record must not be cleared");
 });
 
-test("wait.js reports the model, files, warning and pending writes before clearing state", async (t) => {
+test("wait.js reports the model in the telemetry table and the files, warning and pending writes in the detail", async (t) => {
   const runId = `test-detail-${process.pid}-${Date.now().toString(36)}`;
   await writeRunState({
     status: "completed",
@@ -1484,7 +1621,11 @@ test("wait.js reports the model, files, warning and pending writes before cleari
   assert.equal(output.code, 0, output.stderr);
 
   assert.match(output.stdout, /\[Hermes Result Detail\]/);
-  assert.match(output.stdout, /- Model: cline-pass\/deepseek-v4\.1-flash-1017, provider: clinepass/);
+  assert.match(
+    output.stdout,
+    /\| model \| cline-pass\/deepseek-v4\.1-flash-1017 \(clinepass\) \|/,
+    "the model belongs to the telemetry table, not the detail block",
+  );
   assert.match(output.stdout, /- Warning: Attribution came from the native ledger\./);
   assert.match(output.stdout, /- Files Changed: 2 \(src\/a\.ts, tests\/a\.test\.ts\)/);
   assert.match(output.stdout, /- Pending Writes: 2/);
@@ -1553,6 +1694,89 @@ test("a dispatch attributes the run from the native ledger", async (t) => {
   // Cache tokens have to survive the merge: an unreconciled key silently drops out of every total.
   assert.equal(result.tokens?.cache_read, 10);
   assert.equal(runMetadata(result).brackets.includes("[tokens: 260]"), true);
+});
+
+test("a ledger's reasoning and cost survive without inflating the reported total", async (t) => {
+  const runId = `ledger-cost-${process.pid}-${Date.now().toString(36)}`;
+  const { repo } = await makeDispatchRepo(t, {
+    usage: {
+      model: DEFAULT_MODEL,
+      provider: "clinepass",
+      session_id: "sess-auto-apply",
+      input_tokens: 111,
+      output_tokens: 22,
+      cache_read_tokens: 7,
+      reasoning_tokens: 11,
+      estimated_cost_usd: 0.000312,
+      cost_source: "estimated",
+      total_tokens: 140,
+      completed: true,
+      failed: false,
+    },
+  });
+
+  const result = (await dispatchHermesTask({
+    cwd: repo,
+    prompt: "Add auto-applied.ts to the repository root.",
+    runId,
+    fastWaitSeconds: 120,
+  })) as DispatchResult;
+
+  assert.equal(result.success, true, result.message);
+  assert.equal(result.tokens?.reasoning, 11);
+  assert.equal(result.costUsd, 0.000312, "the ledger's billed cost reaches the result");
+  // Reasoning is already inside output: counting it again would report 151 tokens for a 140 run.
+  assert.equal(runMetadata(result).brackets.includes("[tokens: 140]"), true);
+});
+
+test("a ledger reporting only cache_creation_input_tokens still carries the cache write", async (t) => {
+  const runId = `ledger-cachewrite-${process.pid}-${Date.now().toString(36)}`;
+  const { repo } = await makeDispatchRepo(t, {
+    usage: {
+      model: DEFAULT_MODEL,
+      provider: "clinepass",
+      session_id: "sess-auto-apply",
+      cache_creation_input_tokens: 30,
+      completed: true,
+      failed: false,
+    },
+  });
+
+  const result = (await dispatchHermesTask({
+    cwd: repo,
+    prompt: "Add auto-applied.ts to the repository root.",
+    runId,
+    fastWaitSeconds: 120,
+  })) as DispatchResult;
+
+  assert.equal(result.success, true, result.message);
+  assert.equal(result.tokens?.cache_write, 30, "the Anthropic spelling maps into cache_write");
+  assert.notEqual(result.tokens, null, "a cache-write-only ledger is not an all-zero one");
+});
+
+test("an unknown cost stays null rather than reading as a free run", async (t) => {
+  const runId = `ledger-nocost-${process.pid}-${Date.now().toString(36)}`;
+  const { repo } = await makeDispatchRepo(t, {
+    usage: {
+      model: DEFAULT_MODEL,
+      provider: "clinepass",
+      session_id: "sess-auto-apply",
+      total_tokens: 50,
+      estimated_cost_usd: null,
+      completed: true,
+      failed: false,
+    },
+  });
+
+  const result = (await dispatchHermesTask({
+    cwd: repo,
+    prompt: "Add auto-applied.ts to the repository root.",
+    runId,
+    fastWaitSeconds: 120,
+  })) as DispatchResult;
+
+  assert.equal(result.success, true, result.message);
+  assert.equal(result.costUsd, null, "0 would claim the run was free");
 });
 
 test("a ledger that spells the requested model without its provider prefix is not a fallback", async (t) => {

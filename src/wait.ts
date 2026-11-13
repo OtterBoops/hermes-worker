@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import fs from "node:fs";
 import { StringDecoder } from "node:string_decoder";
+import { fileURLToPath } from "node:url";
 import {
   RUN_ID_PATTERN,
   clearRunState,
@@ -14,9 +15,13 @@ import {
 
 const POLL_MS = 500;
 const MAX_WAIT_MS = 2 * 60 * 60 * 1000;
-const RULE = "=".repeat(60);
 /** A pending-write queue is a work backlog, not a report: cap the listing so the answer stays scannable. */
 const MAX_PENDING_LINES = 10;
+/** U+00B7 between token segments: the row stays one line so a caller can parse it as one field. */
+const DOT = "\u00b7";
+const PROBE_TIMEOUT_MS = 600;
+/** Hard ceiling on the quota wait: the report is the product, the pool is decoration. */
+const PROBE_BUDGET_MS = 700;
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -71,13 +76,27 @@ class LogTail {
   }
 }
 
-interface Telemetry {
+export interface Telemetry {
   runId: string;
   status: "SUCCESS" | "FAILED";
   durationSeconds: string;
   toolsCalled: number;
   subagentsSpawned: number;
-  tokens: { total: number; input: number; output: number; cacheRead: number };
+  tokens: {
+    total: number;
+    input: number;
+    output: number;
+    cacheRead: number;
+    reasoning: number;
+    cacheWrite: number;
+  };
+  model: string;
+  provider: string;
+  modelFallback: boolean;
+  costUsd: number | null;
+  /** Pre-formatted by the probe module: the table never re-derives their wording. */
+  clinepass: string | null;
+  agyQuota: string | null;
 }
 
 const asNumber = (value: unknown): number =>
@@ -92,10 +111,11 @@ const firstNumber = (record: Record<string, unknown>, keys: string[]): number =>
 };
 
 /**
- * Read across the token vocabularies in use: Hermes' own bare keys, Anthropic-style and
- * OpenAI-style usage records.
+ * Read across the token vocabularies in use: Hermes' bare keys, Anthropic-style and OpenAI-style.
+ * `reasoning` is a subset of `output` and `cacheWrite` is billed input, so neither may be folded
+ * into `total`: they are the same tokens counted a second time.
  */
-const readTokens = (raw: unknown): Telemetry["tokens"] => {
+export const readTokens = (raw: unknown): Telemetry["tokens"] => {
   const record = raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
   const input = firstNumber(record, ["input", "input_tokens", "prompt_tokens"]);
   const output = firstNumber(record, ["output", "output_tokens", "completion_tokens"]);
@@ -106,8 +126,15 @@ const readTokens = (raw: unknown): Telemetry["tokens"] => {
     "cached_tokens",
     "prompt_cache_hit_tokens",
   ]);
+  const reasoning = firstNumber(record, ["reasoning_tokens", "reasoning"]);
+  const cacheWrite = firstNumber(record, [
+    "cache_write_tokens",
+    "cache_write",
+    "cache_creation_input_tokens",
+  ]);
+  // A reported total outranks the parts, and only its absence makes the sum the best evidence.
   const total = firstNumber(record, ["total", "total_tokens"]) || input + output + cacheRead;
-  return { total, input, output, cacheRead };
+  return { total, input, output, cacheRead, reasoning, cacheWrite };
 };
 
 interface ResultShape {
@@ -121,6 +148,9 @@ interface ResultShape {
   model?: unknown;
   provider?: unknown;
   modelFallback?: unknown;
+  estimatedCostUsd?: unknown;
+  estimated_cost_usd?: unknown;
+  costUsd?: unknown;
   warning?: unknown;
   modifiedFiles?: unknown;
   pendingWrites?: unknown;
@@ -129,6 +159,9 @@ interface ResultShape {
 /** Detail lines are single-line by contract: a newline inside a value would forge extra report lines. */
 const asText = (value: unknown): string =>
   typeof value === "string" ? value.replace(/\s+/g, " ").trim() : "";
+
+/** A pipe inside a value would split one table row into two, so it is escaped instead of flattened. */
+const asCell = (value: unknown): string => asText(value).replace(/\|/g, "\\|");
 
 const clipText = (value: string, max: number): string =>
   value.length <= max ? value : `${value.slice(0, Math.max(0, max - 1))}...`;
@@ -143,6 +176,26 @@ const countToolCalls = (events: unknown, name: string | null): number =>
       }).length
     : 0;
 
+/** A negative or non-finite cost is not a price, and printing one would be a fabricated number. */
+const asCost = (value: unknown): number | null =>
+  typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null;
+
+const readCost = (result: ResultShape | null): number | null => {
+  const tokens =
+    result?.tokens && typeof result.tokens === "object"
+      ? (result.tokens as Record<string, unknown>)
+      : {};
+  return (
+    asCost(tokens.estimated_cost_usd) ??
+    asCost(result?.estimatedCostUsd) ??
+    asCost(result?.estimated_cost_usd) ??
+    // The dispatch hoists the ledger's cost off `tokens` into a typed field; both spellings report.
+    asCost(result?.costUsd)
+  );
+};
+
+const formatCost = (cost: number): string => cost.toFixed(6).replace(/0+$/, "").replace(/\.$/, "");
+
 const buildTelemetry = (runId: string, state: RunState | null): Telemetry => {
   const result = (state?.result ?? null) as ResultShape | null;
   const success = result?.success === true && result?.timedOut !== true;
@@ -154,42 +207,140 @@ const buildTelemetry = (runId: string, state: RunState | null): Telemetry => {
     toolsCalled: countToolCalls(result?.toolEvents, null),
     subagentsSpawned: countToolCalls(result?.toolEvents, "delegate_task"),
     tokens: readTokens(result?.tokens),
+    model: asText(result?.model),
+    provider: asText(result?.provider),
+    modelFallback: result?.modelFallback === true,
+    costUsd: readCost(result),
+    clinepass: null,
+    agyQuota: null,
   };
 };
 
-/** The rule-delimited block a caller parses; the sentinel lines below it are the terminator. */
-const emitTelemetry = (telemetry: Telemetry): void => {
+/**
+ * The table is the entire report body, so every row is written here and nowhere else: a caller
+ * parses these lines field by field and a second writer would drift out of step.
+ */
+export const renderTelemetryTable = (telemetry: Telemetry): string[] => {
+  const row = (field: string, value: string): string => `| ${field} | ${asCell(value)} |`;
   const { tokens } = telemetry;
-  process.stdout.write(
-    `${[
-      RULE,
-      `[Hermes Dispatch Telemetry] (Status: ${telemetry.status})`,
-      `- Run ID: ${telemetry.runId}`,
-      `- Duration: ${telemetry.durationSeconds}s`,
-      `- Tools Called: ${telemetry.toolsCalled}`,
-      `- Subagents Spawned: ${telemetry.subagentsSpawned}`,
-      `- Tokens Used: ${tokens.total} (input: ${tokens.input}, output: ${tokens.output}, cache: ${tokens.cacheRead})`,
-      RULE,
-    ].join("\n")}\n`,
+  const lines = [
+    `[Hermes Dispatch Telemetry] ${telemetry.status}`,
+    "| field | value |",
+    "| --- | --- |",
+    row("run", telemetry.runId),
+    row("duration", `${telemetry.durationSeconds}s`),
+    row("tools", String(telemetry.toolsCalled)),
+    row("subagents", String(telemetry.subagentsSpawned)),
+  ];
+
+  const model = asText(telemetry.model);
+  const provider = asText(telemetry.provider);
+  if (model || provider) {
+    const fallback = telemetry.modelFallback ? " FALLBACK" : "";
+    lines.push(row("model", `${model || "unknown"} (${provider || "unknown"})${fallback}`));
+  }
+
+  lines.push(
+    row(
+      "tokens",
+      [
+        `input ${tokens.input}`,
+        `output ${tokens.output}`,
+        `cache_read ${tokens.cacheRead}`,
+        `reasoning ${tokens.reasoning}`,
+        `total ${tokens.total}`,
+      ].join(` ${DOT} `),
+    ),
   );
+
+  const cost = asCost(telemetry.costUsd);
+  if (cost !== null) lines.push(row("cost_usd", formatCost(cost)));
+
+  // An absent probe value omits its row: "unavailable" reads as a measurement and is not one.
+  const clinepass = asText(telemetry.clinepass);
+  if (clinepass) lines.push(row("clinepass", clinepass));
+
+  const agyQuota = asText(telemetry.agyQuota);
+  if (agyQuota) lines.push(row("agy_quota", agyQuota));
+
+  return lines;
+};
+
+const writeTelemetry = (telemetry: Telemetry): void => {
+  // The blank line separates the table from the sentinel a caller parses next.
+  process.stdout.write(`${renderTelemetryTable(telemetry).join("\n")}\n\n`);
+};
+
+interface QuotaCells {
+  clinepass: string | null;
+  agyQuota: string | null;
+}
+
+/** Only the members this file calls: a probe module with extra or renamed helpers still reports. */
+interface QuotaProbeModule {
+  readClinePassPool?: (options?: { timeoutMs?: number }) => unknown;
+  probeAntigravityQuota?: (options?: { timeoutMs?: number }) => unknown;
+  formatClinePass?: (pool: unknown) => unknown;
+  formatQuota?: (quota: unknown) => unknown;
+}
+
+const formatCell = (
+  format: ((value: unknown) => unknown) | undefined,
+  value: unknown,
+): string | null => {
+  if (typeof format !== "function") return null;
+  try {
+    const text = format(value);
+    return typeof text === "string" && text.trim() !== "" ? text.trim() : null;
+  } catch {
+    return null;
+  }
 };
 
 /**
- * The detail block is optional by construction: a result with no model, no files and no pending
+ * Quota is decoration on the report, so a missing, broken or hanging probe module must read as no
+ * data: the specifier is dynamic and every failure settles into the same empty shape.
+ */
+const readQuotaCells = async (): Promise<QuotaCells> => {
+  const empty = (): QuotaCells => ({ clinepass: null, agyQuota: null });
+  let timer: NodeJS.Timeout | undefined;
+  const budget = new Promise<QuotaCells>((resolve) => {
+    timer = setTimeout(() => resolve(empty()), PROBE_BUDGET_MS);
+    timer.unref();
+  });
+
+  const work = (async (): Promise<QuotaCells> => {
+    const specifier = "./quota-probe.js";
+    const probe = (await import(specifier)) as QuotaProbeModule;
+    const [pool, quota] = await Promise.allSettled([
+      Promise.resolve(probe.readClinePassPool?.()),
+      Promise.resolve(probe.probeAntigravityQuota?.({ timeoutMs: PROBE_TIMEOUT_MS })),
+    ]);
+    return {
+      clinepass: pool.status === "fulfilled" ? formatCell(probe.formatClinePass, pool.value) : null,
+      agyQuota: quota.status === "fulfilled" ? formatCell(probe.formatQuota, quota.value) : null,
+    };
+  })().catch(empty);
+
+  const cells = await Promise.race([work, budget]);
+  if (timer !== undefined) clearTimeout(timer);
+  return cells;
+};
+
+/** Probing lives on this path rather than at each call site, so every exit renders the same rows. */
+const emitTelemetry = async (telemetry: Telemetry): Promise<void> => {
+  const cells = await readQuotaCells().catch(
+    (): QuotaCells => ({ clinepass: null, agyQuota: null }),
+  );
+  writeTelemetry({ ...telemetry, ...cells });
+};
+
+/**
+ * The detail block is optional by construction: a result with no warning, no files and no pending
  * writes must print nothing at all, because an empty header reads as a real, empty answer.
  */
 const buildDetailBlock = (result: ResultShape | null | undefined): string[] => {
   const lines: string[] = [];
-
-  const model = asText(result?.model);
-  const provider = asText(result?.provider);
-  const fallback = result?.modelFallback === true;
-  if (model || provider || fallback) {
-    const parts = [model || "unknown"];
-    if (provider) parts.push(`provider: ${provider}`);
-    if (fallback) parts.push("FALLBACK");
-    lines.push(`- Model: ${parts.join(", ")}`);
-  }
 
   const warning = asText(result?.warning);
   if (warning) lines.push(`- Warning: ${clipText(warning, 500)}`);
@@ -227,7 +378,7 @@ const buildDetailBlock = (result: ResultShape | null | undefined): string[] => {
 const finish = async (runId: string, state: RunState): Promise<void> => {
   const result = state.result as ResultShape | null | undefined;
   const telemetry = buildTelemetry(runId, state);
-  emitTelemetry(telemetry);
+  await emitTelemetry(telemetry);
   // Exactly one sentinel, and its kind is the verdict: a caller parses the line rather than
   // re-deriving success from a large JSON payload.
   process.stdout.write(
@@ -279,7 +430,7 @@ const main = async (): Promise<void> => {
     // publish a result hangs the caller for two hours on a run that is already over.
     if (state && isRunAbandoned(state)) {
       tail.close();
-      emitTelemetry(buildTelemetry(runId, state));
+      await emitTelemetry(buildTelemetry(runId, state));
       process.stdout.write(`${formatFailedSentinel(runId)}\n`);
       // The record still names the worktree holding the work, so it is deliberately not cleared.
       process.stderr.write(
@@ -291,7 +442,7 @@ const main = async (): Promise<void> => {
 
     if (Date.now() > deadline) {
       tail.close();
-      emitTelemetry(buildTelemetry(runId, state));
+      await emitTelemetry(buildTelemetry(runId, state));
       process.stdout.write(`${formatFailedSentinel(runId)}\n`);
       process.stderr.write(
         `wait: run '${runId}' was still running after 2h. The runner may have died; check the worktree.\n`,
@@ -306,14 +457,27 @@ const main = async (): Promise<void> => {
 
 /**
  * The last line of defence: whatever goes wrong, a caller tailing this process still gets a
- * sentinel instead of waiting out its own timeout.
+ * sentinel instead of waiting out its own timeout. No probe here, because a crash path must not wait.
  */
-main().catch((error: unknown) => {
+const crash = (error: unknown): void => {
   const runId = process.argv[2] ?? "";
   process.stderr.write(`wait: ${error instanceof Error ? error.message : String(error)}\n`);
   if (RUN_ID_PATTERN.test(runId)) {
-    emitTelemetry(buildTelemetry(runId, null));
+    writeTelemetry(buildTelemetry(runId, null));
     process.stdout.write(`${formatFailedSentinel(runId)}\n`);
   }
   process.exit(1);
-});
+};
+
+/** An imported module must not tail a run: the CLI contract is that invoking this file is the trigger. */
+const invokedDirectly = (): boolean => {
+  const entry = process.argv[1];
+  if (!entry) return false;
+  try {
+    return fs.realpathSync(entry) === fs.realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    return false;
+  }
+};
+
+if (invokedDirectly()) main().catch(crash);

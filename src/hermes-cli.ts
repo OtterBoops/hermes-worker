@@ -19,7 +19,7 @@ import {
   type PendingRecord,
 } from "./memory-manager.js";
 import { resolveAntigravityProject, type ResolvedProject } from "./project-binding.js";
-import { formatStreamLine, openRunLog, type RunLog } from "./run-log.js";
+import { createStreamFormatter, openRunLog, type RunLog } from "./run-log.js";
 import {
   RUN_ID_PATTERN,
   clearRunState,
@@ -45,6 +45,8 @@ export interface DispatchOptions {
   fastWaitSeconds?: number;
   /** Land a clean worktree diff on the caller's checkout instead of leaving it for review. */
   autoApply?: boolean;
+  /** Return the diff body even when autoApply already wrote it to the checkout. */
+  includeDiff?: boolean;
   runId?: string;
 }
 
@@ -74,6 +76,8 @@ export interface DispatchResult {
   modifiedFiles: string[];
   diff: string;
   diffTruncated: boolean;
+  /** True when the diff body was withheld because autoApply already landed it on the checkout. */
+  diffOmitted?: boolean;
   summary: string;
   reasoning: string | null;
   /** What actually answered, which is not always what was requested: Hermes falls back on 429. */
@@ -85,6 +89,8 @@ export interface DispatchResult {
   warning: string | null;
   toolEvents: ToolEvent[];
   tokens: Record<string, unknown> | null;
+  /** Billed cost from the native ledger; null when the run reported none, never 0 for an unknown. */
+  costUsd?: number | null;
   durationMs: number | null;
   exitCode: number | null;
   error: string | null;
@@ -154,6 +160,7 @@ const totalTokens = (tokens: Record<string, unknown> | null): number | null => {
   if (!tokens) return null;
   const reported = tokenNumber(tokens, ["total", "total_tokens"]);
   if (reported > 0) return reported;
+  // reasoning is a subset of output and cache_write is billed input: summing either double-counts.
   const sum =
     tokenNumber(tokens, ["input", "input_tokens", "prompt_tokens"]) +
     tokenNumber(tokens, ["output", "output_tokens", "completion_tokens"]) +
@@ -439,6 +446,10 @@ interface StreamState {
   error: string | null;
 }
 
+/**
+ * Calls only, never results: a result's payload is the run log's job, and copying 200 characters of
+ * every read into the returned result bills the caller for output nothing reads.
+ */
 const collectToolEvents = (node: unknown, sink: ToolEvent[], depth = 0): void => {
   if (!node || typeof node !== "object" || depth > 6) return;
   if (Array.isArray(node)) {
@@ -446,26 +457,11 @@ const collectToolEvents = (node: unknown, sink: ToolEvent[], depth = 0): void =>
     return;
   }
   const record = node as Record<string, unknown>;
-  const type = typeof record.type === "string" ? record.type : "";
-  if (type === "tool_use") {
+  if (record.type === "tool_use") {
     sink.push({
-      type,
+      type: "tool_use",
       name: String(record.name ?? "tool"),
       detail: String(record.id ?? ""),
-    });
-  } else if (type === "tool_result") {
-    const content = record.content;
-    const text = Array.isArray(content)
-      ? content
-          .map((part) => (part && typeof part === "object" ? String((part as Record<string, unknown>).text ?? "") : ""))
-          .join(" ")
-      : typeof content === "string"
-        ? content
-        : "";
-    sink.push({
-      type,
-      name: String(record.tool_use_id ?? "result"),
-      detail: text.slice(0, 200),
     });
   }
   for (const value of Object.values(record)) {
@@ -599,6 +595,8 @@ interface ExecHermesOptions {
 const execHermes = (options: ExecHermesOptions): Promise<HermesRun> =>
   new Promise((resolve) => {
     const { args, cwd, timeoutSeconds, repoRoot, env, onSessionId, onChildPid, log } = options;
+    // One formatter per run: correlating a result to its tool needs the ids this run has seen.
+    const format = createStreamFormatter();
     const state: StreamState = {
       sessionId: null,
       text: "",
@@ -669,7 +667,7 @@ const execHermes = (options: ExecHermesOptions): Promise<HermesRun> =>
       for (const line of lines) {
         const previous = state.sessionId;
         ingestStreamLine(line, state);
-        log?.write(formatStreamLine(line));
+        log?.write(format(line));
         if (state.sessionId && state.sessionId !== previous) onSessionId?.(state.sessionId);
         abortOnFallback();
         // The turn has produced its first step: any fallback it was going to report is on disk.
@@ -695,7 +693,7 @@ const execHermes = (options: ExecHermesOptions): Promise<HermesRun> =>
       if (buffer.trim()) {
         const previous = state.sessionId;
         ingestStreamLine(buffer, state);
-        log?.write(formatStreamLine(buffer));
+        log?.write(format(buffer));
         if (state.sessionId && state.sessionId !== previous) onSessionId?.(state.sessionId);
       }
       resolve({ state, timedOut, spawnError, stderr, code, childPid: child.pid ?? null, abortedFallback });
@@ -829,6 +827,10 @@ export interface UsageReport {
   provider: string | null;
   sessionId: string | null;
   tokens: Record<string, number> | null;
+  /** Null when the ledger named no cost: a coerced 0 would claim the run was free. */
+  costUsd: number | null;
+  /** How the ledger derived the cost (estimated/reported/unknown), null when it said nothing. */
+  costSource: string | null;
   failed: boolean;
   failure: string | null;
 }
@@ -842,6 +844,12 @@ const usageText = (value: unknown): string | null => {
 const usageNumber = (record: Record<string, unknown>, key: string): number => {
   const value = record[key];
   return typeof value === "number" && Number.isFinite(value) ? value : 0;
+};
+
+/** Kept separate from usageNumber: a missing cost has to stay null, not become a free run. */
+const usageCost = (record: Record<string, unknown>, key: string): number | null => {
+  const value = record[key];
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null;
 };
 
 /**
@@ -874,15 +882,25 @@ export const readUsageReport = (usageFile: string | null | undefined): UsageRepo
     input: usageNumber(record, "input_tokens") || usageNumber(record, "input"),
     output: usageNumber(record, "output_tokens") || usageNumber(record, "output"),
     cache_read: usageNumber(record, "cache_read_tokens") || usageNumber(record, "cache_read"),
+    // Reasoning is billed inside output, so it is reported beside it and never added to the total.
+    reasoning: usageNumber(record, "reasoning_tokens") || usageNumber(record, "reasoning"),
+    // Cache writes are billed as input; the Anthropic spelling is what a provider-side report uses.
+    cache_write:
+      usageNumber(record, "cache_write_tokens") ||
+      usageNumber(record, "cache_write") ||
+      usageNumber(record, "cache_creation_input_tokens"),
     total: usageNumber(record, "total_tokens") || usageNumber(record, "total"),
   };
-  const anyTokens = tokens.input + tokens.output + tokens.cache_read + tokens.total > 0;
+  // Every bucket counts here: a run that reports only reasoning or cache-write tokens was not free.
+  const anyTokens = Object.values(tokens).some((count) => count > 0);
 
   return {
     model: usageText(record.model),
     provider: usageText(record.provider),
     sessionId: usageText(record.session_id),
     tokens: anyTokens ? tokens : null,
+    costUsd: usageCost(record, "estimated_cost_usd"),
+    costSource: usageText(record.cost_source),
     failed: record.failed === true,
     failure: usageText(record.failure),
   };
@@ -1416,6 +1434,8 @@ export const dispatchHermesTask = async (options: DispatchOptions): Promise<Disp
       const session = result.sessionId ? readSessionAfterRun(result.sessionId, repoRoot) : null;
       if (session) result.reasoning = session.reasoning;
       if (usage?.tokens) result.tokens = { ...(result.tokens ?? {}), ...usage.tokens };
+      // A present ledger carries a verdict on cost even when that verdict is "unknown" (null).
+      if (usage) result.costUsd = usage.costUsd;
 
       let attributionUnknown = false;
       const attributedModel = usage?.model ?? session?.model ?? null;
@@ -1573,6 +1593,13 @@ export const dispatchHermesTask = async (options: DispatchOptions): Promise<Disp
       } else {
         settled.message = `${settled.message} (Auto-apply failed: ${applied.message})`;
       }
+    }
+    // Read after the apply attempt: an applied diff is billed twice if it is also sent back.
+    const keepDiff = options.includeDiff ?? !settled.applied;
+    if (!keepDiff) {
+      settled.diff = "";
+      settled.diffTruncated = false;
+      settled.diffOmitted = true;
     }
     settled.status = "completed";
     // A cancelled run already has its terminal record, and the waiter that wrote it owns it: writing

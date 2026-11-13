@@ -14,6 +14,32 @@ const WALK_DEPTH = 6;
 /** Tools whose input carries a shell command, so the command is worth its own line. */
 const EXEC_TOOLS = new Set(["terminal", "exec", "bash", "shell", "run_command", "run_shell"]);
 
+/**
+ * Read-only exploration whose payload its own [Hermes:Tool] line already names: repeating it costs a
+ * caller input tokens and tells it nothing. Anything whose output is worth reading stays out.
+ */
+export const NOISY_RESULT_TOOLS: ReadonlySet<string> = new Set([
+  "read_file",
+  "search_files",
+  "grep",
+  "glob",
+  "list_dir",
+  "ls",
+  "web_search",
+  "web_extract",
+  "skill_view",
+  "skills_list",
+  "skills_search",
+  "todo_list",
+  "hermes_list_sessions",
+  "hermes_inspect_memory",
+]);
+
+/** The correlation map is a cache, not a transcript: unbounded it would hold a whole run's tool ids. */
+const MAX_TRACKED_TOOLS = 256;
+
+const TOOL_PREFIX = "[Hermes:Tool] ";
+
 export const flatten = (value: string): string => value.replace(/\s+/g, " ").trim();
 
 const clip = (value: string, limit: number): string => {
@@ -76,10 +102,18 @@ const firstPresent = (record: Record<string, unknown>, keys: string[]): unknown 
   return undefined;
 };
 
-const walk = (node: unknown, lines: string[], depth = 0): void => {
+/** What the walk saw besides its lines, so a caller can correlate a result back to its tool. */
+interface Trace {
+  uses: { id: string; name: string }[];
+  results: { id: string; line: number }[];
+}
+
+const newTrace = (): Trace => ({ uses: [], results: [] });
+
+const walk = (node: unknown, lines: string[], depth = 0, trace?: Trace): void => {
   if (!node || typeof node !== "object" || depth > WALK_DEPTH) return;
   if (Array.isArray(node)) {
-    for (const item of node) walk(item, lines, depth + 1);
+    for (const item of node) walk(item, lines, depth + 1, trace);
     return;
   }
   const record = node as Record<string, unknown>;
@@ -89,6 +123,9 @@ const walk = (node: unknown, lines: string[], depth = 0): void => {
     const name = String(record.name ?? "tool");
     const summary = summariseInput(record.input);
     lines.push(`[Hermes:Tool] ${name}${summary ? ` (${summary})` : ""}`);
+    if (trace && record.id !== undefined && record.id !== null) {
+      trace.uses.push({ id: String(record.id), name });
+    }
     if (EXEC_TOOLS.has(name)) {
       const command = commandOfInput(record.input);
       if (command) lines.push(`[Hermes:Exec] ${command}`);
@@ -98,6 +135,9 @@ const walk = (node: unknown, lines: string[], depth = 0): void => {
     // A tool_result carries its payload under any of these depending on the tool's transport.
     const raw = firstPresent(record, ["content", "output", "result", "text"]);
     const output = clip(textOfContent(raw), TEXT_LIMIT);
+    if (trace && record.tool_use_id !== undefined && record.tool_use_id !== null) {
+      trace.results.push({ id, line: lines.length });
+    }
     lines.push(`[Hermes:Result] ${id}${output ? ` -> ${output}` : ""}`);
   } else if (type === "text" && typeof record.text === "string" && record.text.trim()) {
     lines.push(`[Hermes:Step] ${clip(record.text, STEP_LIMIT)}`);
@@ -109,7 +149,7 @@ const walk = (node: unknown, lines: string[], depth = 0): void => {
 
   for (const [key, value] of Object.entries(record)) {
     if (key === "text") continue;
-    if (value && typeof value === "object") walk(value, lines, depth + 1);
+    if (value && typeof value === "object") walk(value, lines, depth + 1, trace);
   }
 };
 
@@ -133,6 +173,67 @@ export const formatStreamLine = (line: string): string[] => {
     return [`[Hermes:Output] ${clip(trimmed, STEP_LIMIT)}`];
   }
   return formatStreamEvent(parsed);
+};
+
+/**
+ * Only a stateful formatter can classify a result, because a tool_result event carries the
+ * tool_use_id alone; an id it never saw must render as-is rather than be guessed at and dropped.
+ */
+export const createStreamFormatter = (): ((line: string) => string[]) => {
+  const names = new Map<string, string>();
+  let previousLine: string | null = null;
+
+  /** Re-inserting on every hit makes insertion order the recency order, so the first key is stalest. */
+  const remember = (id: string, name: string): void => {
+    names.delete(id);
+    names.set(id, name);
+    while (names.size > MAX_TRACKED_TOOLS) {
+      const oldest = names.keys().next();
+      if (oldest.done) break;
+      names.delete(oldest.value);
+    }
+  };
+
+  return (line: string): string[] => {
+    let body: string[];
+    try {
+      const trimmed = line.trim();
+      if (!trimmed) return [];
+      let event: unknown = null;
+      if (trimmed.startsWith("{")) {
+        try {
+          event = JSON.parse(trimmed);
+        } catch {
+          event = null;
+        }
+      }
+      if (!event || typeof event !== "object") {
+        previousLine = `[Hermes:Output] ${clip(trimmed, STEP_LIMIT)}`;
+        return [previousLine];
+      }
+      const trace = newTrace();
+      body = [];
+      walk(event, body, 0, trace);
+      for (const use of trace.uses) remember(use.id, use.name);
+      for (const result of trace.results) {
+        const name = names.get(result.id);
+        if (name !== undefined && NOISY_RESULT_TOOLS.has(name)) body[result.line] = "";
+      }
+    } catch {
+      // An event this formatter cannot read still renders exactly as the legacy path would.
+      return formatStreamLine(line);
+    }
+
+    const emitted: string[] = [];
+    for (const entry of body) {
+      if (entry === "") continue;
+      // Adjacency is the whole signal: the same read twice in a row says nothing the first did not.
+      if (entry === previousLine && entry.startsWith(TOOL_PREFIX)) continue;
+      emitted.push(entry);
+      previousLine = entry;
+    }
+    return emitted;
+  };
 };
 
 export interface RunLog {
