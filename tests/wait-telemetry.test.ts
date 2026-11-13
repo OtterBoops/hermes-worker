@@ -31,7 +31,7 @@ const baseTelemetry = (overrides: Partial<Telemetry> = {}): Telemetry => ({
   provider: "",
   modelFallback: false,
   costUsd: null,
-  clinepass: null,
+  opencode: null,
   agyQuota: null,
   ...overrides,
 });
@@ -55,7 +55,7 @@ test("the telemetry table is byte-exact for a fully populated record", () => {
       model: "cline-pass/deepseek-v4.1-flash-1017",
       provider: "clinepass",
       costUsd: 0.000312,
-      clinepass: `ok ${D} 7 requests ${D} last ok 18:38`,
+      opencode: `ok ${D} 7 requests ${D} last ok 18:38`,
       agyQuota: `gemini-weekly 16% @ 2026-11-14T10:12:32Z ${D} gemini-5h 70% @ 2026-11-13T19:14:19Z`,
     }),
   );
@@ -71,7 +71,7 @@ test("the telemetry table is byte-exact for a fully populated record", () => {
     "| model | cline-pass/deepseek-v4.1-flash-1017 (clinepass) |",
     `| tokens | input 111 ${D} output 22 ${D} cache_read 7 ${D} reasoning 0 ${D} total 140 |`,
     "| cost_usd | 0.000312 |",
-    `| clinepass | ok ${D} 7 requests ${D} last ok 18:38 |`,
+    `| opencode | ok ${D} 7 requests ${D} last ok 18:38 |`,
     `| agy_quota | gemini-weekly 16% @ 2026-11-14T10:12:32Z ${D} gemini-5h 70% @ 2026-11-13T19:14:19Z |`,
   ]);
 });
@@ -126,9 +126,9 @@ test("a reported total wins and reasoning or cache_write never inflate it", () =
 });
 
 test("a pipe and a newline in a value stay escaped on one row", () => {
-  const table = renderTelemetryTable(baseTelemetry({ clinepass: "a | forged\n| row |" }));
-  const clinepass = table.filter((line) => line.startsWith("| clinepass |"));
-  assert.deepEqual(clinepass, ["| clinepass | a \\| forged \\| row \\| |"]);
+  const table = renderTelemetryTable(baseTelemetry({ opencode: "a | forged\n| row |" }));
+  const opencode = table.filter((line) => line.startsWith("| opencode |"));
+  assert.deepEqual(opencode, ["| opencode | a \\| forged \\| row \\| |"]);
   for (const line of table) {
     assert.equal(line.includes("\n"), false, "every rendered line is single-line");
   }

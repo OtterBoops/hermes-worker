@@ -373,7 +373,7 @@ const makeDispatchRepo = async (
     JSON.stringify({
       gateway_runtime: options.fallbackActive
         ? { provider: "openrouter", fallback_active: true }
-        : { provider: "clinepass" },
+        : { provider: "opencode-go" },
     }),
   );
   db.close();
@@ -586,8 +586,8 @@ test("a silently downgraded model is detectable in the session row", () => {
   assert.equal(fallback.provider, "openrouter");
   assert.equal(fallback.fallbackActive, true);
 
-  const primary = parseGatewayRuntime(JSON.stringify({ gateway_runtime: { provider: "clinepass" } }));
-  assert.equal(primary.provider, "clinepass");
+  const primary = parseGatewayRuntime(JSON.stringify({ gateway_runtime: { provider: "opencode-go" } }));
+  assert.equal(primary.provider, "opencode-go");
   assert.equal(primary.fallbackActive, false);
 
   assert.deepEqual(parseGatewayRuntime(null), { provider: null, fallbackActive: false });
@@ -1425,8 +1425,8 @@ test("readUsageReport reads the native ledger and tolerates a partial one", (t) 
   fs.writeFileSync(
     full,
     JSON.stringify({
-      model: "cline-pass/deepseek-v4.1-flash-1017",
-      provider: "clinepass",
+      model: "deepseek-v4.1-flash",
+      provider: "opencode-go",
       session_id: "sess-9",
       input_tokens: 100,
       output_tokens: 20,
@@ -1437,8 +1437,8 @@ test("readUsageReport reads the native ledger and tolerates a partial one", (t) 
     "utf8",
   );
   const report = readUsageReport(full);
-  assert.equal(report?.model, "cline-pass/deepseek-v4.1-flash-1017");
-  assert.equal(report?.provider, "clinepass");
+  assert.equal(report?.model, "deepseek-v4.1-flash");
+  assert.equal(report?.provider, "opencode-go");
   assert.equal(report?.sessionId, "sess-9");
   assert.deepEqual(report?.tokens, {
     input: 100,
@@ -1602,8 +1602,8 @@ test("wait.js reports the model in the telemetry table and the files, warning an
       success: true,
       durationMs: 1_000,
       message: "2 file(s) changed on hermes/agy-x.",
-      model: "cline-pass/deepseek-v4.1-flash-1017",
-      provider: "clinepass",
+      model: "deepseek-v4.1-flash",
+      provider: "opencode-go",
       warning: "Attribution came from the native ledger.",
       modifiedFiles: ["src/a.ts", "tests/a.test.ts"],
       pendingWrites: [
@@ -1623,7 +1623,7 @@ test("wait.js reports the model in the telemetry table and the files, warning an
   assert.match(output.stdout, /\[Hermes Result Detail\]/);
   assert.match(
     output.stdout,
-    /\| model \| cline-pass\/deepseek-v4\.1-flash-1017 \(clinepass\) \|/,
+    /\| model \| deepseek-v4\.1-flash \(opencode-go\) \|/,
     "the model belongs to the telemetry table, not the detail block",
   );
   assert.match(output.stdout, /- Warning: Attribution came from the native ledger\./);
@@ -1664,7 +1664,7 @@ test("a dispatch attributes the run from the native ledger", async (t) => {
   const { repo } = await makeDispatchRepo(t, {
     usage: {
       model: DEFAULT_MODEL,
-      provider: "clinepass",
+      provider: "opencode-go",
       session_id: "sess-auto-apply",
       input_tokens: 210,
       output_tokens: 40,
@@ -1684,7 +1684,7 @@ test("a dispatch attributes the run from the native ledger", async (t) => {
 
   assert.equal(result.success, true, result.message);
   assert.equal(result.model, DEFAULT_MODEL);
-  assert.equal(result.provider, "clinepass");
+  assert.equal(result.provider, "opencode-go");
   assert.equal(result.modelFallback, false);
   // The stderr session line names the run before the stream does.
   assert.equal(result.sessionId, "sess-auto-apply");
@@ -1701,7 +1701,7 @@ test("a ledger's reasoning and cost survive without inflating the reported total
   const { repo } = await makeDispatchRepo(t, {
     usage: {
       model: DEFAULT_MODEL,
-      provider: "clinepass",
+      provider: "opencode-go",
       session_id: "sess-auto-apply",
       input_tokens: 111,
       output_tokens: 22,
@@ -1734,7 +1734,7 @@ test("a ledger reporting only cache_creation_input_tokens still carries the cach
   const { repo } = await makeDispatchRepo(t, {
     usage: {
       model: DEFAULT_MODEL,
-      provider: "clinepass",
+      provider: "opencode-go",
       session_id: "sess-auto-apply",
       cache_creation_input_tokens: 30,
       completed: true,
@@ -1759,7 +1759,7 @@ test("an unknown cost stays null rather than reading as a free run", async (t) =
   const { repo } = await makeDispatchRepo(t, {
     usage: {
       model: DEFAULT_MODEL,
-      provider: "clinepass",
+      provider: "opencode-go",
       session_id: "sess-auto-apply",
       total_tokens: 50,
       estimated_cost_usd: null,
@@ -1786,7 +1786,7 @@ test("a ledger that spells the requested model without its provider prefix is no
       // The provider echoed only the model id: a string comparison against the configured
       // "provider/model" would read this as a fallback and hard-fail an otherwise clean run.
       model: DEFAULT_MODEL.split("/").pop() as string,
-      provider: "clinepass",
+      provider: "opencode-go",
       session_id: "sess-auto-apply",
       total_tokens: 12,
       completed: true,
@@ -1828,7 +1828,7 @@ test("a ledger naming a model nobody asked for is a fallback, and fails closed",
   assert.equal(result.success, false, "a fallback model may never report success");
   assert.equal(result.modelFallback, true);
   assert.equal(result.model, "openrouter/some-free-model");
-  assert.match(result.message, /Dispatch refused: cline pass exhausted/);
+  assert.match(result.message, /Dispatch refused: Go allowance exhausted/);
   assert.deepEqual(result.modifiedFiles, [], "a fallback diff is not reviewable");
   assert.equal(await branchExists(repo, `hermes/agy-${runId}`), false);
 });
@@ -1942,7 +1942,7 @@ test("a fallback already recorded at session start aborts the run on turn 1", as
   assert.equal(result.success, false);
   assert.equal(result.abortedFallback, true, "the run must be reported as an early abort");
   assert.equal(result.modelFallback, true);
-  assert.match(result.message, /cline pass exhausted/);
+  assert.match(result.message, /Go allowance exhausted/);
   // Turn 1 is where the fallback shows up: the rest of the run would spend quota on output that
   // cannot be reviewed, so it is killed rather than waited out.
   assert.ok(elapsed < 20_000, `the abort must not wait out the child's 30s, took ${elapsed}ms`);

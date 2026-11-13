@@ -4,7 +4,7 @@
 
 Build a standalone TypeScript Model Context Protocol (MCP) server at `D:\Code\OtterBoops\hermes-worker` targeting **Node 26** (`v26.13.0`, ES2024, native `node:sqlite`).
 
-`hermes-worker` enables **Antigravity** (the Brain & Review Gatekeeper) to dispatch code implementation, refactoring, test generation, and codebase auditing tasks to **Hermes Agent** (`cline-pass/deepseek-v4.1-flash-1017`), while preserving:
+`hermes-worker` enables **Antigravity** (the Brain & Review Gatekeeper) to dispatch code implementation, refactoring, test generation, and codebase auditing tasks to **Hermes Agent** (`deepseek-v4.1-flash` via `opencode-go`), while preserving:
 1. **Strict Security Guardrails**: Zero access to `.env*`, credentials, keys, or remote homelab infrastructure (`hl`, `ottbox`, Arcane, Cloudflare). Local workstation Docker (`docker run`, `docker compose` for local tests) is permitted.
 2. **1:1 Project Auto-Binding**: Automatic resolution between Antigravity projects (`~/.gemini/config/projects/*.json` + `conversation_summaries.db`) and Hermes projects (`C:\Users\Otter\AppData\Local\hermes\projects.db`), auto-provisioning in Hermes if missing.
 3. **Bridge-Managed Git Worktrees**: Isolated worktrees under `<repo>/.worktrees/agy-<short_id>` branched strictly from local `HEAD`, keeping `.worktrees/` in `<repo>/.git/info/exclude` so tracked `.gitignore` is never dirtied.

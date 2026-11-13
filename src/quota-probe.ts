@@ -2,10 +2,10 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { isWindows, run } from "./exec.js";
-import { hermesHome } from "./hermes-paths.js";
+import { hermesHome, readHermesEnv } from "./hermes-paths.js";
 import { isPidAlive } from "./run-registry.js";
 
-export interface ClinePassKey {
+export interface ProviderKey {
   label: string;
   source: string;
   status: string;
@@ -16,8 +16,8 @@ export interface ClinePassKey {
   cooldownUntil: string | null;
 }
 
-export interface ClinePassPool {
-  keys: ClinePassKey[];
+export interface ProviderPool {
+  keys: ProviderKey[];
   ok: number;
   failing: number;
   requested: number;
@@ -31,6 +31,16 @@ export interface QuotaBucket {
   resetTime: string | null;
 }
 
+export interface OpenCodeUsageWindow {
+  window: string;
+  usedPercent: number;
+  resetsAt: string | null;
+}
+
+export interface OpenCodeQuota {
+  windows: OpenCodeUsageWindow[];
+}
+
 export interface AntigravityQuota {
   buckets: QuotaBucket[];
   source: "env" | "daemon" | "process";
@@ -42,6 +52,9 @@ export interface QuotaProbeOptions {
   endpointUrl?: string;
   csrfToken?: string;
   timeoutMs?: number;
+  /** OpenCode Go lives behind HTTPS, so tests point this at a loopback server. */
+  openCodeUrl?: string;
+  openCodeKey?: string;
 }
 
 /** Middle dot, so every segment is one fixed separator apart regardless of which ones survive. */
@@ -64,18 +77,19 @@ const asNumber = (value: unknown): number =>
 
 interface RankedKey {
   priority: number;
-  key: ClinePassKey;
+  key: ProviderKey;
 }
 
 /** Only the fields the table renders are copied: `secret_fingerprint` must never reach a caller. */
-const readClinePassEntries = (authPath: string): RankedKey[] | null => {
+const readPoolEntries = (authPath: string, provider: string): RankedKey[] | null => {
   let parsed: unknown;
   try {
     parsed = JSON.parse(fs.readFileSync(authPath, "utf8"));
   } catch {
     return null;
   }
-  const pool = isRecord(parsed) && isRecord(parsed.credential_pool) ? parsed.credential_pool.clinepass : null;
+  const pool =
+    isRecord(parsed) && isRecord(parsed.credential_pool) ? parsed.credential_pool[provider] : null;
   if (!Array.isArray(pool)) return null;
   return pool.filter(isRecord).map((record) => ({
     priority: asNumber(record.priority),
@@ -92,8 +106,8 @@ const readClinePassEntries = (authPath: string): RankedKey[] | null => {
   }));
 };
 
-export const readClinePassPool = (options: QuotaProbeOptions = {}): ClinePassPool | null => {
-  const entries = readClinePassEntries(options.authPath ?? path.join(hermesHome(), "auth.json"));
+const readPool = (authPath: string, provider: string): ProviderPool | null => {
+  const entries = readPoolEntries(authPath, provider);
   if (!entries) return null;
   // priority is a sort key only: carrying it into the returned records would outlive the ordering.
   const keys = entries
@@ -108,6 +122,11 @@ export const readClinePassPool = (options: QuotaProbeOptions = {}): ClinePassPoo
   };
 };
 
+export const readProviderPool = (
+  provider: string,
+  options: QuotaProbeOptions = {},
+): ProviderPool | null => readPool(options.authPath ?? path.join(hermesHome(), "auth.json"), provider);
+
 const localClock = (timestamp: string): string => {
   const at = new Date(timestamp);
   const hours = String(at.getHours()).padStart(2, "0");
@@ -116,7 +135,7 @@ const localClock = (timestamp: string): string => {
 };
 
 /** Newest wins because the segment answers "when did the pool last work", not "when did any key". */
-const newestStatus = (keys: ClinePassKey[]): string | null => {
+const newestStatus = (keys: ProviderKey[]): string | null => {
   let newest: { at: number; clock: string } | null = null;
   for (const key of keys) {
     if (!key.lastStatusAt) continue;
@@ -127,7 +146,7 @@ const newestStatus = (keys: ClinePassKey[]): string | null => {
   return newest?.clock ?? null;
 };
 
-export const formatClinePass = (pool: ClinePassPool | null): string | null => {
+export const formatProviderPool = (pool: ProviderPool | null): string | null => {
   if (!pool || pool.keys.length === 0) return null;
   const failing = pool.keys.filter((key) => key.status !== "ok");
   if (failing.length === 0) {
@@ -364,6 +383,70 @@ export const probeAntigravityQuota = async (
 ): Promise<AntigravityQuota | null> => {
   try {
     return await probeLayers(options);
+  } catch {
+    return null;
+  }
+};
+
+const OPENCODE_USAGE_PATH = "/usage";
+const OPENCODE_DEFAULT_URL = "https://opencode.ai/zen/go/v1";
+
+/**
+ * The Go usage payload is documented nowhere, so every window is read defensively and an
+ * unrecognised shape yields null rather than a row of zeroes that reads as a real measurement.
+ */
+const parseOpenCodeUsage = (payload: unknown): OpenCodeQuota | null => {
+  const usage = isRecord(payload) && isRecord(payload.usage) ? payload.usage : null;
+  if (!usage) return null;
+  const windows: OpenCodeUsageWindow[] = [];
+  for (const name of ["rolling", "weekly", "monthly"]) {
+    const block = usage[name];
+    if (!isRecord(block)) continue;
+    const percent = block.percent;
+    if (typeof percent !== "number" || !Number.isFinite(percent)) continue;
+    windows.push({
+      window: name,
+      usedPercent: percent,
+      resetsAt: asNullableText(block.resetsAt),
+    });
+  }
+  return windows.length > 0 ? { windows } : null;
+};
+
+export const formatOpenCodeQuota = (quota: OpenCodeQuota | null): string | null => {
+  if (!quota || quota.windows.length === 0) return null;
+  // Tightest first, matching the Antigravity row: the window about to bite is the one to read.
+  const tightest = [...quota.windows]
+    .sort((a, b) => b.usedPercent - a.usedPercent || a.window.localeCompare(b.window))
+    .slice(0, 2);
+  return tightest
+    .map((entry) => `${entry.window} ${Math.round(entry.usedPercent)}%`)
+    .join(SEPARATOR);
+};
+
+/**
+ * The monthly window carries the whole allowance, so it is the number a dispatch cares about;
+ * a 200 with no recognisable window is reported as no data, never as 0%.
+ */
+export const probeOpenCodeQuota = async (
+  options: QuotaProbeOptions = {},
+): Promise<OpenCodeQuota | null> => {
+  // Env first (a dispatcher may inject it), then Hermes' own .env, which is where `hermes auth` writes it.
+  const key =
+    options.openCodeKey ||
+    process.env.OPENCODE_GO_API_KEY ||
+    process.env.OPENCODE_API_KEY ||
+    readHermesEnv("OPENCODE_GO_API_KEY") ||
+    "";
+  if (!key) return null;
+  const base = (options.openCodeUrl ?? OPENCODE_DEFAULT_URL).replace(/\/+$/, "");
+  try {
+    const response = await fetch(`${base}${OPENCODE_USAGE_PATH}`, {
+      headers: { Authorization: `Bearer ${key}`, "User-Agent": "hermes-worker/1.0" },
+      signal: AbortSignal.timeout(options.timeoutMs ?? DEFAULT_TIMEOUT_MS),
+    });
+    if (!response.ok) return null;
+    return parseOpenCodeUsage(await response.json());
   } catch {
     return null;
   }

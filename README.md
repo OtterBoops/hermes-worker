@@ -38,7 +38,7 @@ pnpm test          # node --test against tests/*.test.ts
    The dispatch's `baseSha` is that baseline commit, so `git diff <baseSha>` reports strictly what
    Hermes changed and never re-reports the caller's in-progress edits.
 5. `hermes chat --query-file … --format stream-json --in <worktree> -c <title> --create-if-missing
-   --yolo --source cli --provider clinepass --model cline-pass/deepseek-v4.1-flash-1017 --reasoning high`
+   --yolo --source cli --provider opencode-go --model deepseek-v4.1-flash --reasoning high`
    runs the turn on the shared gateway, so Desktop streams it live. Model, reasoning and provider
    are pinned defaults; the caller can override model/reasoning per dispatch.
 6. If cline pass is refused (quota exhausted), the dispatch fails closed: `success: false`,
@@ -80,17 +80,18 @@ table and one sentinel line:
 | duration | 22.4s |
 | tools | 2 |
 | subagents | 1 |
-| model | cline-pass/deepseek-v4.1-flash-1017 (clinepass) |
+| model | deepseek-v4.1-flash (opencode-go) |
 | tokens | input 111 · output 22 · cache_read 7 · reasoning 0 · total 140 |
 | cost_usd | 0.000312 |
-| clinepass | ok · 7 requests |
+| opencode | monthly 47% · weekly 12% |
 | agy_quota | gemini-argon-wtu-weekly 3% @ 2026-11-14T10:09:42Z · gemini-weekly 16% @ 2026-11-14T10:12:32Z |
 
 <<<HERMES_DISPATCH_COMPLETE:20261108234625-4u18>>>
 1 file(s) changed on hermes/agy-20261108234625-4u18 in 22.4s. Apply with hermes_worktree_action. [session: sess-1] [tokens: 140]
 ```
 
-The `clinepass` and `agy_quota` rows come from a local probe that spends no model tokens: the key
+The `opencode` and `agy_quota` rows come from probes that spend no model tokens: the opencode row
+reads the Go usage endpoint, and the key
 statuses in `$HERMES_HOME/auth.json`, and Antigravity's `RetrieveUserQuotaSummary` over loopback
 Connect-RPC (`ANTIGRAVITY_ENDPOINT_URL`/`ANTIGRAVITY_CSRF_TOKEN`, else the daemon's `hub_*.json`
 descriptor, else process discovery). Either row is omitted when the probe finds nothing.

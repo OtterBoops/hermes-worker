@@ -51,7 +51,7 @@ export interface DispatchOptions {
 }
 
 /** Pinned so a dispatch is reproducible regardless of what Hermes' config was last set to. */
-export const DEFAULT_MODEL = "cline-pass/deepseek-v4.1-flash-1017";
+export const DEFAULT_MODEL = "deepseek-v4.1-flash";
 export const DEFAULT_REASONING = "high";
 export const DEFAULT_TIMEOUT_SECONDS = 1800;
 export const DEFAULT_FAST_WAIT_SECONDS = 1;
@@ -83,7 +83,7 @@ export interface DispatchResult {
   /** What actually answered, which is not always what was requested: Hermes falls back on 429. */
   model: string | null;
   provider: string | null;
-  /** True when cline pass was refused and a different model answered. Treated as a hard failure —
+  /** True when the Go allowance was refused and a different model answered. Treated as a hard failure —
    * the dispatch never silently lands on a fallback model. */
   modelFallback: boolean;
   warning: string | null;
@@ -540,7 +540,7 @@ export const buildChatArgs = (options: ChatArgsOptions): string[] => {
     "--source",
     "cli",
     "--provider",
-    "clinepass",
+    "opencode-go",
     "--model",
     options.model || DEFAULT_MODEL,
     "--reasoning",
@@ -1343,7 +1343,7 @@ export const dispatchHermesTask = async (options: DispatchOptions): Promise<Disp
         result.modelFallback = true;
         result.warning =
           `Aborted after turn 1: the fallback model answered instead of ${options.model || DEFAULT_MODEL}.`;
-        result.message = `Dispatch refused: cline pass exhausted, the fallback model answered turn 1. No changes are reviewable.`;
+        result.message = `Dispatch refused: Go allowance exhausted, the fallback model answered turn 1. No changes are reviewable.`;
       }
       // A missing exit status is not success, and a stream code of 0 must not mask a non-zero
       // process code (or the other way round).
@@ -1456,7 +1456,7 @@ export const dispatchHermesTask = async (options: DispatchOptions): Promise<Disp
           result.warning ??
           `Ran on ${attributedModel ?? "unknown"} (${attributedProvider ?? "unknown"}) instead of ${requestedModel}: ` +
             "the requested model was refused by its provider.";
-        result.message = `Dispatch refused: cline pass exhausted, ran on fallback ${attributedModel ?? "unknown"}. No changes are reviewable.`;
+        result.message = `Dispatch refused: Go allowance exhausted, ran on fallback ${attributedModel ?? "unknown"}. No changes are reviewable.`;
       } else if (usage === null && !session?.known) {
         attributionUnknown = true;
       }

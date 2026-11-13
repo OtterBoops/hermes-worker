@@ -16,6 +16,29 @@ export const hermesHome = (): string => {
 
 export const hermesAgentRoot = (): string => path.join(hermesHome(), "hermes-agent");
 
+/**
+ * Hermes' own `.env` is not loaded into this process, so a probe that needs a provider key has to
+ * read the file. Parsed narrowly: `KEY=value`, quotes stripped, `#` starts a comment line.
+ */
+export const readHermesEnv = (name: string): string | null => {
+  let raw: string;
+  try {
+    raw = fs.readFileSync(path.join(hermesHome(), ".env"), "utf8");
+  } catch {
+    return null;
+  }
+  for (const line of raw.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const eq = trimmed.indexOf("=");
+    if (eq <= 0) continue;
+    if (trimmed.slice(0, eq).trim() !== name) continue;
+    const value = trimmed.slice(eq + 1).trim().replace(/^["']|["']$/g, "");
+    return value.length > 0 ? value : null;
+  }
+  return null;
+};
+
 export const hermesExe = (): string => {
   const override = process.env.HERMES_BIN?.trim();
   if (override) return override;

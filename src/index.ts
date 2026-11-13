@@ -36,8 +36,8 @@ server.registerTool(
       "('<<<HERMES_DISPATCH_COMPLETE:<runId>>>', or '<<<HERMES_DISPATCH_FAILED:<runId>>>' when " +
       "the run did not succeed) and the result message. Uncommitted caller changes are ported into " +
       "the worktree as a baseline commit, so the diff covers only Hermes' work. The run is pinned " +
-      "to cline-pass/deepseek-v4.1-flash-1017 via the " +
-      "clinepass provider; if cline pass is refused (quota exhausted), the dispatch fails closed " +
+      "to deepseek-v4.1-flash via the " +
+      "opencode-go provider; if the Go allowance is exhausted, the dispatch fails closed " +
       "(success: false, modelFallback: true) instead of silently landing on a fallback model.",
     inputSchema: {
       prompt: z
@@ -57,7 +57,7 @@ server.registerTool(
       model: z
         .string()
         .optional()
-        .describe("Model override. Defaults to cline-pass/deepseek-v4.1-flash-1017."),
+        .describe("Model override. Defaults to deepseek-v4.1-flash."),
       reasoning: z
         .string()
         .optional()

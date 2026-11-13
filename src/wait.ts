@@ -95,7 +95,7 @@ export interface Telemetry {
   modelFallback: boolean;
   costUsd: number | null;
   /** Pre-formatted by the probe module: the table never re-derives their wording. */
-  clinepass: string | null;
+  opencode: string | null;
   agyQuota: string | null;
 }
 
@@ -211,7 +211,7 @@ const buildTelemetry = (runId: string, state: RunState | null): Telemetry => {
     provider: asText(result?.provider),
     modelFallback: result?.modelFallback === true,
     costUsd: readCost(result),
-    clinepass: null,
+    opencode: null,
     agyQuota: null,
   };
 };
@@ -257,8 +257,8 @@ export const renderTelemetryTable = (telemetry: Telemetry): string[] => {
   if (cost !== null) lines.push(row("cost_usd", formatCost(cost)));
 
   // An absent probe value omits its row: "unavailable" reads as a measurement and is not one.
-  const clinepass = asText(telemetry.clinepass);
-  if (clinepass) lines.push(row("clinepass", clinepass));
+  const opencode = asText(telemetry.opencode);
+  if (opencode) lines.push(row("opencode", opencode));
 
   const agyQuota = asText(telemetry.agyQuota);
   if (agyQuota) lines.push(row("agy_quota", agyQuota));
@@ -272,15 +272,17 @@ const writeTelemetry = (telemetry: Telemetry): void => {
 };
 
 interface QuotaCells {
-  clinepass: string | null;
+  opencode: string | null;
   agyQuota: string | null;
 }
 
 /** Only the members this file calls: a probe module with extra or renamed helpers still reports. */
 interface QuotaProbeModule {
-  readClinePassPool?: (options?: { timeoutMs?: number }) => unknown;
+  readProviderPool?: (provider: string, options?: { timeoutMs?: number }) => unknown;
+  probeOpenCodeQuota?: (options?: { timeoutMs?: number }) => unknown;
   probeAntigravityQuota?: (options?: { timeoutMs?: number }) => unknown;
-  formatClinePass?: (pool: unknown) => unknown;
+  formatProviderPool?: (pool: unknown) => unknown;
+  formatOpenCodeQuota?: (quota: unknown) => unknown;
   formatQuota?: (quota: unknown) => unknown;
 }
 
@@ -302,7 +304,7 @@ const formatCell = (
  * data: the specifier is dynamic and every failure settles into the same empty shape.
  */
 const readQuotaCells = async (): Promise<QuotaCells> => {
-  const empty = (): QuotaCells => ({ clinepass: null, agyQuota: null });
+  const empty = (): QuotaCells => ({ opencode: null, agyQuota: null });
   let timer: NodeJS.Timeout | undefined;
   const budget = new Promise<QuotaCells>((resolve) => {
     timer = setTimeout(() => resolve(empty()), PROBE_BUDGET_MS);
@@ -312,12 +314,18 @@ const readQuotaCells = async (): Promise<QuotaCells> => {
   const work = (async (): Promise<QuotaCells> => {
     const specifier = "./quota-probe.js";
     const probe = (await import(specifier)) as QuotaProbeModule;
-    const [pool, quota] = await Promise.allSettled([
-      Promise.resolve(probe.readClinePassPool?.()),
+    const [pool, quota, opencode] = await Promise.allSettled([
+      Promise.resolve(probe.readProviderPool?.("opencode-go")),
       Promise.resolve(probe.probeAntigravityQuota?.({ timeoutMs: PROBE_TIMEOUT_MS })),
+      Promise.resolve(probe.probeOpenCodeQuota?.({ timeoutMs: PROBE_TIMEOUT_MS })),
     ]);
+    // The live window beats the local pool file: a stale credential row says nothing about
+    // how much allowance is actually left, so the HTTP probe is preferred when it answers.
+    const opencodeCell =
+      opencode.status === "fulfilled" ? formatCell(probe.formatOpenCodeQuota, opencode.value) : null;
     return {
-      clinepass: pool.status === "fulfilled" ? formatCell(probe.formatClinePass, pool.value) : null,
+      opencode:
+        opencodeCell ?? (pool.status === "fulfilled" ? formatCell(probe.formatProviderPool, pool.value) : null),
       agyQuota: quota.status === "fulfilled" ? formatCell(probe.formatQuota, quota.value) : null,
     };
   })().catch(empty);
@@ -330,7 +338,7 @@ const readQuotaCells = async (): Promise<QuotaCells> => {
 /** Probing lives on this path rather than at each call site, so every exit renders the same rows. */
 const emitTelemetry = async (telemetry: Telemetry): Promise<void> => {
   const cells = await readQuotaCells().catch(
-    (): QuotaCells => ({ clinepass: null, agyQuota: null }),
+    (): QuotaCells => ({ opencode: null, agyQuota: null }),
   );
   writeTelemetry({ ...telemetry, ...cells });
 };
