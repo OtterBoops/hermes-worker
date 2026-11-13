@@ -144,18 +144,39 @@ test("the boundary asks for targeted test filters and one full run", () => {
   );
 });
 
-test("the boundary reserves subagent parallelism for large tasks", () => {
+test("the boundary encourages parallel subagents for multi-file, paired and audit work", () => {
+  assert.ok(WORKER_BOUNDARY.includes("spawn parallel subagents by default"));
+  assert.ok(WORKER_BOUNDARY.includes("touches 2+ files"));
+  assert.ok(WORKER_BOUNDARY.includes("pairs implementation with test authoring"));
+  assert.ok(WORKER_BOUNDARY.includes("audits multiple areas"));
+  assert.ok(WORKER_BOUNDARY.includes("strictly disjoint file paths"));
+  assert.ok(WORKER_BOUNDARY.includes("perform shared entrypoint and integration work in the parent agent"));
   assert.ok(
-    WORKER_BOUNDARY.includes(
-      "Reserve `delegate_task` strictly for large tasks spanning 3+ independent modules or >150 LOC.",
-    ),
+    !WORKER_BOUNDARY.includes("Reserve `delegate_task` strictly for large tasks"),
+    "the old size reservation must be gone",
   );
   assert.ok(
-    WORKER_BOUNDARY.includes(
-      "For small or routine patches (1–2 files), execute directly in the parent session without " +
-        "spawning subagents.",
-    ),
+    !WORKER_BOUNDARY.includes("execute directly in the parent session"),
+    "the old small-patch opt-out must be gone",
   );
+});
+
+test("injectWorkerBoundary is idempotent on an already-guarded prompt", () => {
+  const prompt = "Add a /health endpoint to the worker.";
+
+  // Byte-identical on a prompt that starts with the full block.
+  const guarded = injectWorkerBoundary(prompt);
+  assert.equal(injectWorkerBoundary(guarded), guarded);
+
+  // Byte-identical when the marker only appears mid-text, with no boundary in front of it.
+  const midText = `Retry the failed job. Reuse the [WORKER OPERATIONAL BOUNDARY] block from the parent run.`;
+  assert.equal(injectWorkerBoundary(midText), midText);
+
+  // A double injection still carries exactly one boundary block.
+  const twice = injectWorkerBoundary(injectWorkerBoundary(prompt));
+  assert.equal(twice.split("[WORKER OPERATIONAL BOUNDARY]").length, 2);
+  assert.equal(twice.split("[TASK SPECIFICATION]").length, 2);
+  assert.equal(twice.split(prompt).length, 2);
 });
 
 test("injectWorkerBoundary tells the parent to integrate verified subagent results", () => {

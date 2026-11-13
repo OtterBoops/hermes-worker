@@ -6,6 +6,7 @@ import {
   clearRunState,
   formatDispatchSentinel,
   formatFailedSentinel,
+  isRunAbandoned,
   readRunState,
   runLogPath,
   type RunState,
@@ -14,6 +15,8 @@ import {
 const POLL_MS = 500;
 const MAX_WAIT_MS = 2 * 60 * 60 * 1000;
 const RULE = "=".repeat(60);
+/** A pending-write queue is a work backlog, not a report: cap the listing so the answer stays scannable. */
+const MAX_PENDING_LINES = 10;
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -113,7 +116,22 @@ interface ResultShape {
   durationMs?: unknown;
   toolEvents?: unknown;
   tokens?: unknown;
+  message?: unknown;
+  summary?: unknown;
+  model?: unknown;
+  provider?: unknown;
+  modelFallback?: unknown;
+  warning?: unknown;
+  modifiedFiles?: unknown;
+  pendingWrites?: unknown;
 }
+
+/** Detail lines are single-line by contract: a newline inside a value would forge extra report lines. */
+const asText = (value: unknown): string =>
+  typeof value === "string" ? value.replace(/\s+/g, " ").trim() : "";
+
+const clipText = (value: string, max: number): string =>
+  value.length <= max ? value : `${value.slice(0, Math.max(0, max - 1))}...`;
 
 const countToolCalls = (events: unknown, name: string | null): number =>
   Array.isArray(events)
@@ -156,12 +174,58 @@ const emitTelemetry = (telemetry: Telemetry): void => {
   );
 };
 
+/**
+ * The detail block is optional by construction: a result with no model, no files and no pending
+ * writes must print nothing at all, because an empty header reads as a real, empty answer.
+ */
+const buildDetailBlock = (result: ResultShape | null | undefined): string[] => {
+  const lines: string[] = [];
+
+  const model = asText(result?.model);
+  const provider = asText(result?.provider);
+  const fallback = result?.modelFallback === true;
+  if (model || provider || fallback) {
+    const parts = [model || "unknown"];
+    if (provider) parts.push(`provider: ${provider}`);
+    if (fallback) parts.push("FALLBACK");
+    lines.push(`- Model: ${parts.join(", ")}`);
+  }
+
+  const warning = asText(result?.warning);
+  if (warning) lines.push(`- Warning: ${clipText(warning, 500)}`);
+
+  const files = Array.isArray(result?.modifiedFiles)
+    ? result.modifiedFiles.map(asText).filter((name) => name !== "")
+    : [];
+  if (files.length > 0) {
+    // The count stays exact while the list is clipped: a giant change set must not flood the stream.
+    lines.push(`- Files Changed: ${files.length} (${clipText(files.join(", "), 400)})`);
+  }
+
+  const writes = Array.isArray(result?.pendingWrites) ? result.pendingWrites : [];
+  if (writes.length > 0) {
+    lines.push(`- Pending Writes: ${writes.length}`);
+    for (const entry of writes.slice(0, MAX_PENDING_LINES)) {
+      const record = entry && typeof entry === "object" ? (entry as Record<string, unknown>) : {};
+      const id = asText(record.id) || "?";
+      const subsystem = asText(record.subsystem);
+      const action = asText(record.action);
+      const summary = asText(record.summary);
+      const head = subsystem ? `${id} (${subsystem})` : id;
+      const tail = [action, summary].filter((part) => part !== "").join(" -> ");
+      lines.push(`  - ${clipText(tail ? `${head}: ${tail}` : head, 300)}`);
+    }
+    if (writes.length > MAX_PENDING_LINES) {
+      lines.push(`  - ... ${writes.length - MAX_PENDING_LINES} more`);
+    }
+  }
+
+  return lines.length > 0 ? ["", "[Hermes Result Detail]", ...lines] : [];
+};
+
 /** A crashed runner leaves no state file at all: that is a failure, not a reason to hang. */
 const finish = async (runId: string, state: RunState): Promise<void> => {
-  const result = state.result as
-    | { success?: unknown; message?: unknown; summary?: unknown }
-    | null
-    | undefined;
+  const result = state.result as ResultShape | null | undefined;
   const telemetry = buildTelemetry(runId, state);
   emitTelemetry(telemetry);
   // Exactly one sentinel, and its kind is the verdict: a caller parses the line rather than
@@ -173,6 +237,8 @@ const finish = async (runId: string, state: RunState): Promise<void> => {
   if (typeof result?.summary === "string" && result.summary.trim()) {
     process.stdout.write(`\n[Hermes Summary]\n${result.summary.trim()}\n`);
   }
+  const detail = buildDetailBlock(result);
+  if (detail.length > 0) process.stdout.write(`${detail.join("\n")}\n`);
   if (typeof result?.message === "string" && result.message.trim()) {
     process.stdout.write(`${result.message.trim()}\n`);
   }
@@ -206,6 +272,20 @@ const main = async (): Promise<void> => {
       // The dispatch closes the stream before publishing, so one final drain has everything.
       tail.close();
       await finish(runId, state);
+      return;
+    }
+
+    // A dead worker is an immediate verdict: waiting out the deadline for a process that can never
+    // publish a result hangs the caller for two hours on a run that is already over.
+    if (state && isRunAbandoned(state)) {
+      tail.close();
+      emitTelemetry(buildTelemetry(runId, state));
+      process.stdout.write(`${formatFailedSentinel(runId)}\n`);
+      // The record still names the worktree holding the work, so it is deliberately not cleared.
+      process.stderr.write(
+        `wait: run '${runId}' was abandoned by dead worker pid ${state.workerPid}; check the worktree and the run log.\n`,
+      );
+      process.exitCode = 1;
       return;
     }
 

@@ -5,14 +5,14 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
-import { isWindows, runGit } from "./exec.js";
+import { isWindows, killProcessTree, runGit } from "./exec.js";
 import {
   BLOCKED_PATH_PATTERNS,
   injectWorkerBoundary,
   scanPromptForSecrets,
   validateModifiedFiles,
 } from "./guardrails.js";
-import { hermesExe, stateDbPath } from "./hermes-paths.js";
+import { hermesCommand, hermesExe, stateDbPath } from "./hermes-paths.js";
 import {
   collectNewPendingWrites,
   snapshotPendingIds,
@@ -23,6 +23,7 @@ import { formatStreamLine, openRunLog, type RunLog } from "./run-log.js";
 import {
   RUN_ID_PATTERN,
   clearRunState,
+  isPidAlive,
   listActiveRuns,
   readRunState,
   runLogPath,
@@ -94,6 +95,10 @@ export interface DispatchResult {
   worktreeKept: boolean;
   /** True only when autoApply landed the diff on the caller's checkout. */
   applied?: boolean;
+  /** True when the fallback model answered turn 1 and the child was killed before it could finish. */
+  abortedFallback: boolean;
+  /** True when hermes_worktree_action cancelled the run while it was executing. */
+  cancelled: boolean;
   message: string;
 }
 
@@ -267,6 +272,13 @@ const listWorktrees = async (repoRoot: string): Promise<WorktreeEntry[]> => {
 };
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** A cancellation is a terminal record written by another process, so it is read, not remembered. */
+const isRunCancelled = (runId: string): boolean => {
+  const state = readRunState(runId);
+  const result = state?.result;
+  return Boolean(result && typeof result === "object" && (result as { cancelled?: unknown }).cancelled === true);
+};
 
 const REMOVE_MAX_RETRIES = 5;
 const REMOVE_RETRY_DELAY_MS = 150;
@@ -493,6 +505,9 @@ interface HermesRun {
   spawnError: string | null;
   stderr: string;
   code: number | null;
+  childPid: number | null;
+  /** Turn 1 was already answered by the fallback model, so the child was killed before it wrote more. */
+  abortedFallback: boolean;
 }
 
 export interface ChatArgsOptions {
@@ -502,10 +517,16 @@ export interface ChatArgsOptions {
   model?: string;
   reasoning?: string;
   skills?: string[];
+  /** The per-run usage ledger. A top-level flag, so it cannot travel with the chat arguments. */
+  usageFile?: string;
+  /** Chat-scoped wall-clock budget: the agent gets a wrap-up notice before the hard kill. */
+  runBudgetSeconds?: number;
 }
 
 export const buildChatArgs = (options: ChatArgsOptions): string[] => {
   const args = [
+    // Before `chat`: argparse rejects --usage-file as an unknown chat argument after the subcommand.
+    ...(options.usageFile ? ["--usage-file", options.usageFile] : []),
     "chat",
     "--query-file",
     options.promptFile,
@@ -529,22 +550,55 @@ export const buildChatArgs = (options: ChatArgsOptions): string[] => {
     "--reasoning",
     options.reasoning || DEFAULT_REASONING,
   ];
+  if (typeof options.runBudgetSeconds === "number" && options.runBudgetSeconds > 0) {
+    args.push("--run-budget", String(Math.round(options.runBudgetSeconds)));
+  }
   if (options.skills?.length) args.push("--skills", options.skills.join(","));
   return args;
 };
 
 /**
- * `log` receives every formatted line as the child emits it, which is what makes the run tailable
- * live: the stream is flushed per event rather than at exit.
+ * GIT_CONFIG_* is the documented way to set git config for one process tree: the value applies to
+ * every git the child spawns and dies with it. `git config core.hooksPath` instead mutates the
+ * caller's repository, so a crash leaves their hooks silently disabled, and two concurrent
+ * dispatches fight over the single setting.
  */
-const execHermes = (
-  args: string[],
-  cwd: string,
-  timeoutSeconds: number,
-  onSessionId?: (sessionId: string) => void,
-  log?: RunLog,
-): Promise<HermesRun> =>
+export const sandboxedGitEnv = (
+  base: NodeJS.ProcessEnv,
+  emptyHooksDir: string,
+  repoRoot: string,
+): NodeJS.ProcessEnv => {
+  const pathKey = Object.keys(base).find((key) => key.toUpperCase() === "PATH") ?? "PATH";
+  const binDir = path.join(repoRoot, "node_modules", ".bin");
+  const currentPath = base[pathKey] ?? "";
+  return {
+    ...base,
+    GIT_CONFIG_COUNT: "1",
+    GIT_CONFIG_KEY_0: "core.hooksPath",
+    GIT_CONFIG_VALUE_0: emptyHooksDir,
+    // A repo-local binary (tsc, tsx) is only on PATH through here: a bare `pnpm run build` inside
+    // the worktree would otherwise resolve nothing and report a spurious command-not-found.
+    [pathKey]: currentPath ? `${binDir}${path.delimiter}${currentPath}` : binDir,
+  };
+};
+
+interface ExecHermesOptions {
+  args: string[];
+  cwd: string;
+  timeoutSeconds: number;
+  /** The worktree's repository root, needed to read the session row for the turn-1 fallback check. */
+  repoRoot: string;
+  /** Layered child environment: hook sandboxing and the repo-local bin directory ride here. */
+  env: NodeJS.ProcessEnv;
+  onSessionId?: (sessionId: string) => void;
+  onChildPid?: (pid: number) => void;
+  /** `log` receives every formatted line as the child emits it, which is what makes the run tailable. */
+  log?: RunLog;
+}
+
+const execHermes = (options: ExecHermesOptions): Promise<HermesRun> =>
   new Promise((resolve) => {
+    const { args, cwd, timeoutSeconds, repoRoot, env, onSessionId, onChildPid, log } = options;
     const state: StreamState = {
       sessionId: null,
       text: "",
@@ -556,17 +610,25 @@ const execHermes = (
       error: null,
     };
 
-    const child = spawn(hermesExe(), args, {
+    const command = hermesCommand();
+    const child = spawn(command.file, [...command.prefixArgs, ...args], {
       cwd,
       windowsHide: true,
-      env: process.env,
+      env,
       stdio: ["ignore", "pipe", "pipe"],
     });
+    if (child.pid) onChildPid?.(child.pid);
 
     let buffer = "";
     let stderr = "";
+    let stderrBuffer = "";
     let timedOut = false;
     let spawnError: string | null = null;
+    // The gateway writes gateway_runtime as turn 1 gets under way, so a single probe can land
+    // before the row exists. A few bounded probes cover that window without polling forever.
+    let fallbackProbes = 0;
+    let turnOneSeen = false;
+    let abortedFallback = false;
 
     const timer = setTimeout(() => {
       timedOut = true;
@@ -576,6 +638,28 @@ const execHermes = (
         child.kill("SIGKILL");
       }
     }, timeoutSeconds * 1000);
+
+    /**
+     * The pinned model is a contract, not a preference: a turn already answered by the fallback
+     * means the diff cannot be reviewed, so continuing spends quota on output that will be thrown
+     * away. Probed only until turn 1 produces something, then never again.
+     */
+    const abortOnFallback = (): void => {
+      if (abortedFallback || turnOneSeen || !state.sessionId || fallbackProbes >= 3) return;
+      fallbackProbes += 1;
+      if (!readSessionAfterRun(state.sessionId, repoRoot).fallbackActive) return;
+      abortedFallback = true;
+      killProcessTree(child.pid);
+    };
+
+    const readSessionLine = (line: string): void => {
+      const sessionId = parseSessionIdLine(line);
+      if (!sessionId) return;
+      // The stream's own id wins: a compaction can advance the row past the one printed at start.
+      if (!state.sessionId) state.sessionId = sessionId;
+      onSessionId?.(state.sessionId);
+      abortOnFallback();
+    };
 
     child.stdout?.setEncoding("utf8");
     child.stdout?.on("data", (chunk: string) => {
@@ -587,12 +671,19 @@ const execHermes = (
         ingestStreamLine(line, state);
         log?.write(formatStreamLine(line));
         if (state.sessionId && state.sessionId !== previous) onSessionId?.(state.sessionId);
+        abortOnFallback();
+        // The turn has produced its first step: any fallback it was going to report is on disk.
+        if (state.toolEvents.length > 0 || state.text) turnOneSeen = true;
       }
     });
     child.stderr?.setEncoding("utf8");
     child.stderr?.on("data", (chunk: string) => {
       stderr += chunk;
       if (stderr.length > 40_000) stderr = stderr.slice(-40_000);
+      stderrBuffer += chunk;
+      const lines = stderrBuffer.split(/\r?\n/);
+      stderrBuffer = lines.pop() ?? "";
+      for (const line of lines) readSessionLine(line);
     });
 
     child.on("error", (error: Error) => {
@@ -607,7 +698,7 @@ const execHermes = (
         log?.write(formatStreamLine(buffer));
         if (state.sessionId && state.sessionId !== previous) onSessionId?.(state.sessionId);
       }
-      resolve({ state, timedOut, spawnError, stderr, code });
+      resolve({ state, timedOut, spawnError, stderr, code, childPid: child.pid ?? null, abortedFallback });
     });
   });
 
@@ -725,6 +816,88 @@ export const readSessionAfterRun = (sessionId: string, repoRoot: string): Sessio
   } finally {
     db?.close();
   }
+};
+
+/**
+ * The native usage ledger `hermes --usage-file` writes, which is the only source that names the
+ * model actually billed for the turn: `state.db` is written by the gateway and can be missing or
+ * stale for a run that is still settling. Every field is optional because a failed run writes a
+ * partial report (costs null, tokens zero) rather than no file at all.
+ */
+export interface UsageReport {
+  model: string | null;
+  provider: string | null;
+  sessionId: string | null;
+  tokens: Record<string, number> | null;
+  failed: boolean;
+  failure: string | null;
+}
+
+const usageText = (value: unknown): string | null => {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return trimmed ? trimmed : null;
+};
+
+const usageNumber = (record: Record<string, unknown>, key: string): number => {
+  const value = record[key];
+  return typeof value === "number" && Number.isFinite(value) ? value : 0;
+};
+
+/**
+ * The ledger echoes whatever the provider named itself, sometimes without the `provider/` prefix the
+ * dispatch was configured with. Comparing the bare model id keeps a spelling difference from being
+ * read as a fallback, which is a hard failure, while a genuinely different model still shows up.
+ */
+const sameModelId = (left: string, right: string): boolean => {
+  const bare = (value: string): string => value.trim().toLowerCase().split("/").pop() ?? "";
+  return left.trim().toLowerCase() === right.trim().toLowerCase() || bare(left) === bare(right);
+};
+
+/** Null when the run wrote no ledger: an absent report is not an attribution of "unknown model". */
+export const readUsageReport = (usageFile: string | null | undefined): UsageReport | null => {
+  if (!usageFile) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(fs.readFileSync(usageFile, "utf8"));
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+
+  const record = parsed as Record<string, unknown>;
+  // Hermes reports bare underscore keys; the camelCase and Anthropic spellings are accepted so a
+  // provider-side report shape still lands in the same buckets.
+  // Spelled the way the telemetry readers already read a stream usage record: a camelCase key here
+  // would merge into the result and then vanish from every total that counts cache tokens.
+  const tokens = {
+    input: usageNumber(record, "input_tokens") || usageNumber(record, "input"),
+    output: usageNumber(record, "output_tokens") || usageNumber(record, "output"),
+    cache_read: usageNumber(record, "cache_read_tokens") || usageNumber(record, "cache_read"),
+    total: usageNumber(record, "total_tokens") || usageNumber(record, "total"),
+  };
+  const anyTokens = tokens.input + tokens.output + tokens.cache_read + tokens.total > 0;
+
+  return {
+    model: usageText(record.model),
+    provider: usageText(record.provider),
+    sessionId: usageText(record.session_id),
+    tokens: anyTokens ? tokens : null,
+    failed: record.failed === true,
+    failure: usageText(record.failure),
+  };
+};
+
+/**
+ * `hermes chat` prints its durable session id on stderr at session.create, long before the stream
+ * emits its first event. Reading it here gives the run an id to report while it is still running;
+ * the stream's own id wins later because a compaction can advance it.
+ */
+export const SESSION_LINE_PATTERN = /^Session: ([^\s]+)$/;
+
+export const parseSessionIdLine = (line: string): string | null => {
+  const match = SESSION_LINE_PATTERN.exec(line.trim());
+  return match ? match[1] : null;
 };
 
 type HooksSnapshot = Map<string, number>;
@@ -1007,30 +1180,12 @@ export const dispatchHermesTask = async (options: DispatchOptions): Promise<Disp
   await ensureWorktreesExcluded(repoRoot);
 
   // Hooks are executable code inside the review boundary: a hook left behind by the worker would
-  // run on the caller's next git call. Point git at an empty dir and diff the real one afterwards.
+  // run on the caller's next git call. The sandbox travels in the child's environment and diffing
+  // the real hooks dir afterwards catches anything a hook wrote despite it.
   const hooksDir = await resolveHooksDir(repoRoot);
   const hooksBefore = hooksDir ? snapshotHooks(hooksDir) : null;
   const emptyHooksDir = path.join(os.tmpdir(), "hermes-worker-empty-hooks", runId);
-  let previousHooksPath: string | null = null;
-  let hooksSandboxed = false;
-
-  const restoreHooks = async (): Promise<void> => {
-    if (!hooksSandboxed) return;
-    hooksSandboxed = false;
-    // Only undo our own sandbox: a concurrent dispatch may already own the setting.
-    const live = await runGit(repoRoot, ["config", "--get", "core.hooksPath"]);
-    const current = live.ok ? live.stdout.trim() : "";
-    if (current && !samePath(current, emptyHooksDir)) return;
-    if (previousHooksPath) {
-      await runGit(repoRoot, ["config", "core.hooksPath", previousHooksPath]);
-    } else {
-      await runGit(repoRoot, ["config", "--unset", "core.hooksPath"]);
-    }
-  };
-
-  const clearEmptyHooks = async (): Promise<void> => {
-    await fsp.rm(emptyHooksDir, { recursive: true, force: true }).catch(() => undefined);
-  };
+  const usageFile = path.join(os.tmpdir(), `hermes-usage-${runId}.json`);
 
   // A run id that already owns a branch or a directory is a collision, not something to clean up:
   // `branch -D` on it would destroy an earlier run this dispatch never created.
@@ -1042,7 +1197,13 @@ export const dispatchHermesTask = async (options: DispatchOptions): Promise<Disp
     throw new Error(`Refused to dispatch: ${worktreePath} already exists. Pass a different runId.`);
   }
 
-  const created = await runGit(repoRoot, ["worktree", "add", "-b", branch, worktreePath, "HEAD"]);
+  await fsp.mkdir(emptyHooksDir, { recursive: true }).catch(() => undefined);
+
+  const created = await runGit(repoRoot, ["worktree", "add", "-b", branch, worktreePath, "HEAD"], {
+    // No hook -- sandboxed one -- may run against the caller's repository during setup, so the
+    // worktree's own creation carries the same environment as the run itself.
+    env: sandboxedGitEnv(process.env, emptyHooksDir, repoRoot),
+  });
   if (!created.ok) {
     // M11: a failed `worktree add` can still have registered the directory before refusing.
     await destroyWorktree(repoRoot, worktreePath, branch);
@@ -1050,7 +1211,7 @@ export const dispatchHermesTask = async (options: DispatchOptions): Promise<Disp
   }
 
   // The baseline commit is made before Hermes runs, so a caller's pre-commit hook is ordinary git
-  // behaviour rather than a hole in the review boundary; the hook sandbox below still guards the
+  // behaviour rather than a hole in the review boundary; the hook diff below still guards the
   // caller against anything Hermes does afterwards.
   let baselineSha = baseSha;
   let baselinePorted = 0;
@@ -1065,26 +1226,13 @@ export const dispatchHermesTask = async (options: DispatchOptions): Promise<Disp
     throw error;
   }
 
-  try {
-    await fsp.mkdir(emptyHooksDir, { recursive: true });
-    const current = await runGit(repoRoot, ["config", "--get", "core.hooksPath"]);
-    previousHooksPath = current.ok ? current.stdout.trim() || null : null;
-    const sandboxed = await runGit(repoRoot, ["config", "core.hooksPath", emptyHooksDir]);
-    if (!sandboxed.ok) {
-      throw new Error(`Could not disable git hooks in ${repoRoot}: ${(sandboxed.stderr || sandboxed.stdout).trim()}`);
-    }
-    hooksSandboxed = true;
-  } catch (error) {
-    await restoreHooks();
-    await clearEmptyHooks();
-    await destroyWorktree(repoRoot, worktreePath, branch);
-    throw error;
-  }
-
   const guarded = injectWorkerBoundary(options.prompt);
   const promptFile = path.join(os.tmpdir(), `hermes-prompt-${runId}.txt`);
   const before = snapshotPendingIds();
-  const live: { sessionId: string | null } = { sessionId: null };
+  const live: { sessionId: string | null; childPid: number | null } = {
+    sessionId: null,
+    childPid: null,
+  };
 
   const result: DispatchResult = {
     runId,
@@ -1114,6 +1262,8 @@ export const dispatchHermesTask = async (options: DispatchOptions): Promise<Disp
     violations: [],
     pendingWrites: [],
     worktreeKept: false,
+    abortedFallback: false,
+    cancelled: false,
     message: "",
   };
 
@@ -1129,19 +1279,39 @@ export const dispatchHermesTask = async (options: DispatchOptions): Promise<Disp
         model: options.model,
         reasoning: options.reasoning,
         skills: options.skills,
+        usageFile,
+        // The process timeout is the hard kill; the run budget is the softer notice that lets the
+        // agent wrap up and report instead of dying mid-write.
+        runBudgetSeconds: timeoutSeconds,
       });
 
       runLog = openRunLog(runLogPath(runId));
-      const execution = await execHermes(
+      const execution = await execHermes({
         args,
-        worktreePath,
+        cwd: worktreePath,
         timeoutSeconds,
-        (sessionId) => {
+        repoRoot,
+        env: sandboxedGitEnv(process.env, emptyHooksDir, repoRoot),
+        onSessionId: (sessionId) => {
           live.sessionId = sessionId;
           result.sessionId = sessionId;
+          // Published mid-run so a waiter can name the session while it is still going.
+          void publish({ ...runningState(), sessionId });
         },
-        runLog,
-      );
+        onChildPid: (pid) => {
+          live.childPid = pid;
+          void publish({ ...runningState(), childPid: pid });
+        },
+        log: runLog,
+      });
+      result.abortedFallback = execution.abortedFallback;
+      if (isRunCancelled(runId)) {
+        result.cancelled = true;
+        result.success = false;
+        result.worktreeKept = false;
+        result.message = "Cancelled while executing: the child was killed and the worktree removed.";
+        return result;
+      }
       result.timedOut = execution.timedOut;
       result.exitCode = execution.state.exitCode ?? execution.code;
       result.sessionId = execution.state.sessionId;
@@ -1151,6 +1321,12 @@ export const dispatchHermesTask = async (options: DispatchOptions): Promise<Disp
       result.durationMs = execution.state.durationMs;
 
       result.error = execution.state.error;
+      if (execution.abortedFallback) {
+        result.modelFallback = true;
+        result.warning =
+          `Aborted after turn 1: the fallback model answered instead of ${options.model || DEFAULT_MODEL}.`;
+        result.message = `Dispatch refused: cline pass exhausted, the fallback model answered turn 1. No changes are reviewable.`;
+      }
       // A missing exit status is not success, and a stream code of 0 must not mask a non-zero
       // process code (or the other way round).
       const codes = [execution.state.exitCode, execution.code].filter(
@@ -1234,24 +1410,38 @@ export const dispatchHermesTask = async (options: DispatchOptions): Promise<Disp
       }
       result.violations = violations;
 
+      // The native usage ledger is authoritative for the turn that was billed; state.db is only a
+      // fallback because the gateway writes it asynchronously and a settling run can be missing.
+      const usage = readUsageReport(usageFile);
+      const session = result.sessionId ? readSessionAfterRun(result.sessionId, repoRoot) : null;
+      if (session) result.reasoning = session.reasoning;
+      if (usage?.tokens) result.tokens = { ...(result.tokens ?? {}), ...usage.tokens };
+
       let attributionUnknown = false;
-      if (result.sessionId) {
-        const session = readSessionAfterRun(result.sessionId, repoRoot);
-        result.reasoning = session.reasoning;
-        result.model = session.model;
-        result.provider = session.provider;
-        result.modelFallback = session.fallbackActive;
-        if (session.fallbackActive) {
-          result.warning =
-            `Ran on the fallback model ${session.model ?? "unknown"} (${session.provider ?? "unknown"}): ` +
+      const attributedModel = usage?.model ?? session?.model ?? null;
+      const attributedProvider = usage?.provider ?? session?.provider ?? null;
+      result.model = attributedModel;
+      result.provider = attributedProvider;
+
+      const requestedModel = options.model || DEFAULT_MODEL;
+      // A fallback is either explicit in the session's routing record, or proven by the ledger
+      // naming a model nobody asked for. An absent ledger proves nothing in either direction.
+      const fallbackProven =
+        session?.fallbackActive === true ||
+        (usage !== null && usage.model !== null && !sameModelId(usage.model, requestedModel));
+      if (!result.abortedFallback) result.modelFallback = fallbackProven;
+
+      if (result.modelFallback) {
+        result.warning =
+          result.warning ??
+          `Ran on ${attributedModel ?? "unknown"} (${attributedProvider ?? "unknown"}) instead of ${requestedModel}: ` +
             "the requested model was refused by its provider.";
-          result.message = `Dispatch refused: cline pass exhausted, ran on fallback ${session.model ?? "unknown"}. No changes are reviewable.`;
-        } else if (!session.known) {
-          attributionUnknown = true;
-        }
-      } else {
+        result.message = `Dispatch refused: cline pass exhausted, ran on fallback ${attributedModel ?? "unknown"}. No changes are reviewable.`;
+      } else if (usage === null && !session?.known) {
         attributionUnknown = true;
       }
+
+      if (usage?.failed && usage.failure) result.error = result.error ?? usage.failure;
 
       if (result.modelFallback) {
         result.diff = "";
@@ -1316,8 +1506,8 @@ export const dispatchHermesTask = async (options: DispatchOptions): Promise<Disp
       // sees `completed`, so an unclosed stream would truncate the tail.
       await runLog?.close().catch(() => undefined);
       await fsp.rm(promptFile, { force: true }).catch(() => undefined);
-      await restoreHooks();
-      await clearEmptyHooks();
+      await fsp.rm(emptyHooksDir, { recursive: true, force: true }).catch(() => undefined);
+      await fsp.rm(usageFile, { force: true }).catch(() => undefined);
       try {
         result.pendingWrites = await collectNewPendingWrites(before);
       } catch {
@@ -1334,6 +1524,23 @@ export const dispatchHermesTask = async (options: DispatchOptions): Promise<Disp
     return stateQueue;
   };
 
+  /**
+   * Every `running` record carries the dispatcher's pid: without it a waiter cannot tell a crashed
+   * run from a slow one and hangs until its own deadline. The child pid and session id are added by
+   * the callbacks below as soon as the spawn and the first stderr line report them.
+   */
+  const runningState = (): RunState => ({
+    status: "running",
+    runId,
+    sessionName,
+    worktreePath,
+    branch,
+    startedAt,
+    workerPid: process.pid,
+    childPid: live.childPid ?? undefined,
+    sessionId: live.sessionId,
+  });
+
   const completion: Promise<DispatchResult> = (async () => {
     const settled = await runPipeline().catch(
       // runPipeline already converts its own throws, so this only guards the wrapper itself.
@@ -1345,7 +1552,14 @@ export const dispatchHermesTask = async (options: DispatchOptions): Promise<Disp
         message: `Dispatch failed: ${errorMessage(error)}`,
       }),
     );
-    if (options.autoApply === true && settled.success && settled.worktreeKept && !settled.securityViolation && settled.branch) {
+    if (
+      options.autoApply === true &&
+      settled.success &&
+      settled.worktreeKept &&
+      !settled.securityViolation &&
+      !settled.cancelled &&
+      settled.branch
+    ) {
       const applied = await manageWorktree({
         action: "apply",
         cwd: repoRoot,
@@ -1361,27 +1575,19 @@ export const dispatchHermesTask = async (options: DispatchOptions): Promise<Disp
       }
     }
     settled.status = "completed";
-    // The state file is the callback channel; a tmpdir failure must not lose the result itself.
-    await publish({
-      status: "completed",
-      runId,
-      sessionName,
-      worktreePath,
-      branch,
-      startedAt,
-      result: settled,
-    });
+    // A cancelled run already has its terminal record, and the waiter that wrote it owns it: writing
+    // again would resurrect a file that the waiter has just consumed.
+    if (!settled.cancelled) {
+      await publish({
+        ...runningState(),
+        status: "completed",
+        result: settled,
+      });
+    }
     return settled;
   })();
 
-  await publish({
-    status: "running",
-    runId,
-    sessionName,
-    worktreePath,
-    branch,
-    startedAt,
-  });
+  await publish(runningState());
 
   const raced = await raceFastWait(completion, fastWaitSeconds);
   if (raced.done) {
@@ -1413,7 +1619,7 @@ export const dispatchHermesTask = async (options: DispatchOptions): Promise<Disp
  * the repository with no bridge worktree and no temporary branch behind.
  */
 export const manageWorktree = async (options: {
-  action: "apply" | "discard";
+  action: "apply" | "discard" | "cancel";
   cwd: string;
   worktreeBranch: string;
   /** The run that is itself calling this after finishing; its state file still says `running`. */
@@ -1430,15 +1636,56 @@ export const manageWorktree = async (options: {
     };
   }
 
+  const runId = branchMatch[1];
+  const activeRun = readRunState(runId);
+
+  // Cancel is the only action allowed to interrupt a live run: it kills the tree, settles the run
+  // record, then removes the worktree through the same path discard uses.
+  if (options.action === "cancel") {
+    // Only the child is killed. `workerPid` is this very bridge process, whose own liveness the
+    // record reports: signalling it would take the MCP server down with the run.
+    const childPid = activeRun?.childPid;
+    const hadChild = typeof childPid === "number" && Number.isFinite(childPid) && childPid > 0;
+
+    // Published before the kill, never after: the pipeline notices its own cancellation by reading
+    // this record when the child's close event lands, and a record written afterwards would arrive
+    // too late to stop it from diffing a worktree this call is about to delete.
+    if (activeRun) {
+      await writeRunState({
+        ...activeRun,
+        status: "completed",
+        result: {
+          success: false,
+          cancelled: true,
+          message: hadChild
+            ? `Cancelled: killed the run's process tree (pid ${childPid}).`
+            : "Cancelled: the run had no live child process.",
+          timedOut: false,
+        },
+      }).catch(() => undefined);
+    }
+
+    if (hadChild && isPidAlive(childPid)) {
+      killProcessTree(childPid);
+      // Bounded wait: returning before the process actually dies would let it write into a worktree
+      // the very next line deletes.
+      for (let attempt = 0; attempt < 20 && isPidAlive(childPid); attempt += 1) await sleep(100);
+    }
+  }
+
   // Refuse to touch a worktree whose Hermes process/session is actively executing. A run that is
   // applying its own result names itself here: it cannot be mid-execution by definition.
-  const activeRun = readRunState(branchMatch[1]);
-  if (activeRun && activeRun.status === "running" && options.activeRunId !== branchMatch[1]) {
+  if (
+    options.action !== "cancel" &&
+    activeRun &&
+    activeRun.status === "running" &&
+    options.activeRunId !== runId
+  ) {
     return {
       success: false,
       message:
-        `Refusing to ${options.action} '${options.worktreeBranch}': Hermes run '${branchMatch[1]}' ` +
-        "is still actively executing. Wait for the run to finish before managing the worktree.",
+        `Refusing to ${options.action} '${options.worktreeBranch}': Hermes run '${runId}' ` +
+        "is still actively executing. Wait for the run to finish, or cancel it.",
     };
   }
 
@@ -1457,8 +1704,13 @@ export const manageWorktree = async (options: {
   const target = entries.find((entry) => entry.branch === options.worktreeBranch);
   if (!target) {
     return {
-      success: false,
-      message: `No worktree for branch '${options.worktreeBranch}' under ${repoRoot}.`,
+      // A cancel that killed a live run has already achieved its purpose; a missing worktree is only
+      // a failure when the caller expected one to be there to act on.
+      success: options.action === "cancel",
+      message:
+        options.action === "cancel"
+          ? `Cancelled run '${runId}'; no worktree for '${options.worktreeBranch}' was left under ${repoRoot}.`
+          : `No worktree for branch '${options.worktreeBranch}' under ${repoRoot}.`,
     };
   }
   if (!isInsidePath(worktreesRoot, target.path)) {
@@ -1473,11 +1725,12 @@ export const manageWorktree = async (options: {
     return removed.ok ? null : (removed.error ?? "worktree cleanup failed");
   };
 
-  if (options.action === "discard") {
+  if (options.action === "discard" || options.action === "cancel") {
     const cleanupError = await cleanup();
+    const verb = options.action === "cancel" ? "Cancelled and discarded" : "Discarded";
     return cleanupError
-      ? { success: false, message: `Discarded the worktree but ${cleanupError}.` }
-      : { success: true, message: `Discarded worktree and branch '${options.worktreeBranch}'.` };
+      ? { success: false, message: `${verb} the worktree but ${cleanupError}.` }
+      : { success: true, message: `${verb} worktree and branch '${options.worktreeBranch}'.` };
   }
 
   // `merge-base` is the branch point, which is caller HEAD — it sits BELOW the baseline commit,

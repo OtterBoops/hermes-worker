@@ -18,6 +18,11 @@ export interface RunState {
   branch: string;
   startedAt: number;
   result?: unknown;
+  /** The dispatcher's own pid: the only field that can tell a crashed run from a slow one. */
+  workerPid?: number;
+  /** The runner child's pid, for diagnostics only: the worker outlives it by design. */
+  childPid?: number;
+  sessionId?: string | null;
 }
 
 export const runStatePath = (runId: string): string => path.join(RUN_STATE_DIR, `${runId}.json`);
@@ -87,6 +92,28 @@ export const readRunState = (runId: string): RunState | null => {
 };
 
 /**
+ * A pid is the only evidence a run is still being driven: signalling 0 probes for existence without
+ * touching the process. EPERM means it exists but belongs to another user, so treating that as dead
+ * would abandon a perfectly live run that merely runs under a different account.
+ */
+export const isPidAlive = (pid: number | null | undefined): boolean => {
+  if (typeof pid !== "number" || !Number.isFinite(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException | null)?.code === "EPERM";
+  }
+};
+
+/**
+ * A record written before liveness existed carries no pid, so an absent pid must mean live: reading
+ * a missing pid as dead would drop every in-flight run out of the status listing and prune its worktree.
+ */
+export const isRunAbandoned = (state: RunState): boolean =>
+  state.status === "running" && typeof state.workerPid === "number" && !isPidAlive(state.workerPid);
+
+/**
  * Synchronous because the caller is a status render, and an await between the listing and the
  * records would let a run finish midway and report itself as still active.
  */
@@ -103,7 +130,9 @@ export const listActiveRuns = (): RunState[] => {
   for (const entry of entries) {
     if (!entry.endsWith(".json")) continue;
     const state = readRunState(entry.slice(0, -".json".length));
-    if (state?.status === "running") active.push(state);
+    // An abandoned record is still `running` on disk but no process will ever complete it, so it
+    // must not keep a worktree alive in the status listing.
+    if (state?.status === "running" && !isRunAbandoned(state)) active.push(state);
   }
 
   // Newest first, so a status listing is stable regardless of readdir order. startedAt is coerced

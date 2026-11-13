@@ -5,6 +5,7 @@ import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { spawn } from "node:child_process";
 import { run } from "../src/exec.js";
 import type { DispatchResult } from "../src/hermes-cli.js";
 import {
@@ -14,8 +15,11 @@ import {
   buildChatArgs,
   dispatchHermesTask,
   parseGatewayRuntime,
+  parseSessionIdLine,
   raceFastWait,
   readSessionAfterRun,
+  readUsageReport,
+  sandboxedGitEnv,
   listHermesSessions,
   manageWorktree,
   pruneOrphanWorktrees,
@@ -29,6 +33,8 @@ import {
   clearRunState,
   formatDispatchSentinel,
   formatFailedSentinel,
+  isPidAlive,
+  isRunAbandoned,
   listActiveRuns,
   pruneStaleRuns,
   readRunState,
@@ -267,23 +273,56 @@ test("a dispatch carrying a credential is refused before any git work happens", 
 });
 
 /**
- * Stands in for the `hermes` binary: HERMES_BIN is this Node binary and a committed, extensionless
- * `chat` script makes Node treat the dispatch argv as a script run from the worktree it is spawned in.
+ * Stands in for the `hermes` binary. A `.mjs` HERMES_BIN is spawned through the running node, which
+ * is what lets the fixture see the real argv: the top-level --usage-file has to be readable here or
+ * a regression that puts it after `chat` would pass silently.
  */
-const CHAT_STUB = [
-  'const fs = require("node:fs");',
-  'const path = require("node:path");',
-  'fs.writeFileSync(path.join(process.cwd(), "auto-applied.ts"), "export const autoApplied = true;\\n");',
-  'process.stdout.write(JSON.stringify({',
-  '  type: "result",',
-  '  result: "wrote auto-applied.ts",',
-  '  session_id: "sess-auto-apply",',
-  '  exit_code: 0,',
-  '}) + "\\n");',
-].join("\n");
+const chatStub = (options: {
+  sessionId: string;
+  writeUsage?: Record<string, unknown>;
+  sleepMs?: number;
+}): string =>
+  [
+    'import fs from "node:fs";',
+    'import path from "node:path";',
+    `const SESSION_ID = ${JSON.stringify(options.sessionId)};`,
+    `const WRITE_USAGE = ${JSON.stringify(options.writeUsage ?? null)};`,
+    `const SLEEP_MS = ${options.sleepMs ?? 0};`,
+    "const argv = process.argv.slice(2);",
+    'const flag = (name) => { const i = argv.indexOf(name); return i === -1 ? undefined : argv[i + 1]; };',
+    '// The ledger flag is top-level: argparse rejects it anywhere after the subcommand.',
+    'if (argv.indexOf("--usage-file") > argv.indexOf("chat")) {',
+    '  process.stderr.write("argparse: --usage-file belongs before the subcommand\\n");',
+    "  process.exit(9);",
+    "}",
+    'const usageFile = flag("--usage-file");',
+    'fs.writeFileSync(path.join(process.cwd(), "auto-applied.ts"), "export const autoApplied = true;\\n");',
+    'process.stderr.write("Session: " + SESSION_ID + "\\n");',
+    `if (SLEEP_MS > 0) await new Promise((resolve) => setTimeout(resolve, SLEEP_MS));`,
+    "if (usageFile) {",
+    "  fs.writeFileSync(",
+    "    usageFile,",
+    "    JSON.stringify(WRITE_USAGE ?? { session_id: SESSION_ID, completed: true, failed: false }) + \"\\n\",",
+    "  );",
+    "}",
+    'process.stdout.write(JSON.stringify({',
+    '  type: "result",',
+    '  result: "wrote auto-applied.ts",',
+    "  session_id: SESSION_ID,",
+    "  exit_code: 0,",
+    '}) + "\\n");',
+  ].join("\n");
 
-/** A fixture repo that carries the stub, plus a session store that attributes the run to a model. */
-const makeDispatchRepo = async (t: TestContext): Promise<{ repo: string; home: string }> => {
+/** A fixture repo, plus a session store that attributes the run to a model. */
+const makeDispatchRepo = async (
+  t: TestContext,
+  options: {
+    sessionId?: string;
+    usage?: Record<string, unknown> | null;
+    sleepMs?: number;
+    fallbackActive?: boolean;
+  } = {},
+): Promise<{ repo: string; home: string }> => {
   const repo = fs.mkdtempSync(path.join(os.tmpdir(), "hermes-worker-dispatch-"));
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "hermes-worker-dispatch-home-"));
   const previousHome = process.env.HERMES_HOME;
@@ -297,9 +336,16 @@ const makeDispatchRepo = async (t: TestContext): Promise<{ repo: string; home: s
     fs.rmSync(home, { recursive: true, force: true });
   });
 
+  const sessionId = options.sessionId ?? "sess-auto-apply";
+  const bin = path.join(home, "hermes-bin.mjs");
+  fs.writeFileSync(
+    bin,
+    chatStub({ sessionId, sleepMs: options.sleepMs, writeUsage: options.usage ?? undefined }),
+    "utf8",
+  );
+
   await git(repo, ["init", "-b", "main"]);
   fs.writeFileSync(path.join(repo, "README.md"), "# fixture\n", "utf8");
-  fs.writeFileSync(path.join(repo, "chat"), CHAT_STUB, "utf8");
   await git(repo, ["add", "."]);
   await git(repo, ["commit", "-m", "initial"]);
 
@@ -307,14 +353,18 @@ const makeDispatchRepo = async (t: TestContext): Promise<{ repo: string; home: s
   const db = new DatabaseSync(path.join(home, "state.db"));
   db.exec("CREATE TABLE sessions (id TEXT PRIMARY KEY, model TEXT, model_config TEXT)");
   db.prepare("INSERT INTO sessions (id, model, model_config) VALUES (?, ?, ?)").run(
-    "sess-auto-apply",
+    sessionId,
     DEFAULT_MODEL,
-    JSON.stringify({ gateway_runtime: { provider: "clinepass" } }),
+    JSON.stringify({
+      gateway_runtime: options.fallbackActive
+        ? { provider: "openrouter", fallback_active: true }
+        : { provider: "clinepass" },
+    }),
   );
   db.close();
 
   process.env.HERMES_HOME = home;
-  process.env.HERMES_BIN = process.execPath;
+  process.env.HERMES_BIN = bin;
   return { repo, home };
 };
 
@@ -1213,4 +1263,500 @@ test("pruneOrphanWorktrees is a no-op on a repository that never dispatched", as
   await git(repo, ["commit", "-m", "initial"]);
 
   assert.equal(await pruneOrphanWorktrees(repo), 0);
+});
+
+test("the usage-file flag is top-level and the run budget rides with chat", () => {
+  const args = buildChatArgs({
+    promptFile: "p.txt",
+    worktreePath: "w",
+    sessionName: "s",
+    usageFile: "C:\\Temp\\usage.json",
+    runBudgetSeconds: 900,
+  });
+
+  // argparse refuses --usage-file after the subcommand, so a later edit that appends it to the
+  // chat argument list breaks every dispatch instead of failing one option.
+  assert.ok(args.indexOf("--usage-file") < args.indexOf("chat"), "the ledger flag must precede chat");
+  assert.equal(args[args.indexOf("--usage-file") + 1], "C:\\Temp\\usage.json");
+  assert.equal(args[args.indexOf("--run-budget") + 1], "900");
+  assert.ok(args.indexOf("--run-budget") > args.indexOf("chat"), "--run-budget is a chat flag");
+
+  // No usage file, no flags: a call without a ledger must not carry an empty path.
+  const bare = buildChatArgs({ promptFile: "p.txt", worktreePath: "w", sessionName: "s" });
+  assert.equal(bare.includes("--usage-file"), false);
+  assert.equal(bare.includes("--run-budget"), false);
+});
+
+test("readUsageReport reads the native ledger and tolerates a partial one", (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "hermes-usage-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+
+  const full = path.join(dir, "full.json");
+  fs.writeFileSync(
+    full,
+    JSON.stringify({
+      model: "cline-pass/deepseek-v4.1-flash-1017",
+      provider: "clinepass",
+      session_id: "sess-9",
+      input_tokens: 100,
+      output_tokens: 20,
+      cache_read_tokens: 5,
+      total_tokens: 125,
+      failed: false,
+    }),
+    "utf8",
+  );
+  const report = readUsageReport(full);
+  assert.equal(report?.model, "cline-pass/deepseek-v4.1-flash-1017");
+  assert.equal(report?.provider, "clinepass");
+  assert.equal(report?.sessionId, "sess-9");
+  assert.deepEqual(report?.tokens, { input: 100, output: 20, cache_read: 5, total: 125 });
+  assert.equal(report?.failed, false);
+
+  // A failed run writes nulls rather than no file: it must still name its failure.
+  const failed = path.join(dir, "failed.json");
+  fs.writeFileSync(failed, JSON.stringify({ model: null, failed: true, failure: "boom" }), "utf8");
+  const failedReport = readUsageReport(failed);
+  assert.equal(failedReport?.model, null);
+  assert.equal(failedReport?.tokens, null, "an all-zero ledger is no count at all");
+  assert.equal(failedReport?.failed, true);
+  assert.equal(failedReport?.failure, "boom");
+
+  assert.equal(readUsageReport(null), null);
+  assert.equal(readUsageReport(path.join(dir, "missing.json")), null);
+  const corrupt = path.join(dir, "corrupt.json");
+  fs.writeFileSync(corrupt, "{not json", "utf8");
+  assert.equal(readUsageReport(corrupt), null);
+});
+
+test("the session id is parsed off stderr before the stream reports one", () => {
+  assert.equal(parseSessionIdLine("Session: 20261113_173352_f15a8a"), "20261113_173352_f15a8a");
+  assert.equal(parseSessionIdLine("  Session: abc123  "), "abc123");
+  // The gateway prints "session_id: ..." after the turn: that line must not be mistaken for it.
+  assert.equal(parseSessionIdLine("session_id: other"), null);
+  assert.equal(parseSessionIdLine("Warning: Session: bogus"), null);
+  assert.equal(parseSessionIdLine(""), null);
+});
+
+test("the hook sandbox and the repo bin directory travel in the child env", () => {
+  const env = sandboxedGitEnv({ PATH: "/usr/bin" }, "C:\\temp\\hooks", "C:\\repo");
+  assert.equal(env.GIT_CONFIG_COUNT, "1");
+  assert.equal(env.GIT_CONFIG_KEY_0, "core.hooksPath");
+  assert.equal(env.GIT_CONFIG_VALUE_0, "C:\\temp\\hooks");
+  assert.equal(env.PATH, `C:\\repo\\node_modules\\.bin${path.delimiter}/usr/bin`);
+  assert.equal(env["PATH ".trim()], env.PATH);
+
+  // Windows passes Path, not PATH: appending to the wrong key would leave the bin dir invisible.
+  const windows = sandboxedGitEnv({ Path: "C:\\Windows" }, "h", "C:\\repo");
+  assert.equal(windows.Path, `C:\\repo\\node_modules\\.bin${path.delimiter}C:\\Windows`);
+  assert.equal(windows.PATH, undefined);
+
+  const empty = sandboxedGitEnv({}, "h", "C:\\repo");
+  assert.equal(empty.PATH, `C:\\repo\\node_modules\\.bin`);
+});
+
+test("isPidAlive proves a live pid and rejects a dead or absent one", async (t) => {
+  assert.equal(isPidAlive(process.pid), true);
+  assert.equal(isPidAlive(null), false);
+  assert.equal(isPidAlive(undefined), false);
+  assert.equal(isPidAlive(0), false);
+  assert.equal(isPidAlive(-1), false);
+  assert.equal(isPidAlive(Number.NaN), false);
+  assert.equal(isPidAlive(2_147_483_647), false, "an unused pid is not a live run");
+
+  // A child that has really exited is the case the registry has to get right, against a live parent.
+  const exited = spawn(process.execPath, ["-e", "process.exit(0)"], { stdio: "ignore" });
+  const exitedPid = exited.pid;
+  await new Promise((resolve) => exited.on("exit", resolve));
+  assert.equal(isPidAlive(exitedPid), false, "an exited child's pid is not a live run");
+});
+
+test("a running record whose worker pid is dead is abandoned, and one with no pid is not", () => {
+  const base = {
+    status: "running" as const,
+    runId: "r",
+    sessionName: "s",
+    worktreePath: "w",
+    branch: "hermes/agy-r",
+    startedAt: 1,
+  };
+  assert.equal(isRunAbandoned({ ...base, workerPid: 2_147_483_647 }), true);
+  assert.equal(isRunAbandoned(base), false, "a record written before liveness must stay live");
+  assert.equal(isRunAbandoned({ ...base, workerPid: process.pid }), false);
+  assert.equal(
+    isRunAbandoned({ ...base, status: "completed", workerPid: 2_147_483_647 }),
+    false,
+    "a finished record is settled, not abandoned",
+  );
+});
+
+test("listActiveRuns drops an abandoned record and keeps a pid-less one", async (t) => {
+  const stamp = `${process.pid}-${Date.now().toString(36)}`;
+  const abandoned = `abandoned-${stamp}`;
+  const legacy = `legacy-${stamp}`;
+  t.after(() => Promise.all([clearRunState(abandoned), clearRunState(legacy)]));
+
+  await writeRunState({
+    status: "running",
+    runId: abandoned,
+    sessionName: "s",
+    worktreePath: "w",
+    branch: "hermes/agy-abandoned",
+    startedAt: 2,
+    workerPid: 2_147_483_647,
+  });
+  await writeRunState({
+    status: "running",
+    runId: legacy,
+    sessionName: "s",
+    worktreePath: "w",
+    branch: "hermes/agy-legacy",
+    startedAt: 1,
+  });
+
+  const listed = listActiveRuns().filter((state) => state.runId.endsWith(stamp));
+  assert.deepEqual(
+    listed.map((state) => state.runId),
+    [legacy],
+    "a dead worker is not an active run, but a record without a pid still is",
+  );
+});
+
+test("wait.js fails immediately when the worker pid is already dead", async (t) => {
+  const runId = `test-dead-${process.pid}-${Date.now().toString(36)}`;
+  await writeRunState({
+    status: "running",
+    runId,
+    sessionName: "s",
+    worktreePath: "w",
+    branch: "hermes/agy-x",
+    startedAt: Date.now(),
+    workerPid: 2_147_483_647,
+  });
+  t.after(() => clearRunState(runId));
+
+  const startedAt = Date.now();
+  const output = await run(process.execPath, ["--import", "tsx", "src/wait.ts", runId], {
+    cwd: path.resolve(import.meta.dirname, ".."),
+    timeoutMs: 30_000,
+  });
+  const elapsed = Date.now() - startedAt;
+
+  assert.equal(output.code, 1);
+  assert.ok(output.stdout.includes(formatFailedSentinel(runId)));
+  assert.match(output.stdout, /\(Status: FAILED\)/);
+  assert.match(output.stderr, /abandoned by dead worker pid 2147483647/);
+  // The whole point: a two-hour deadline is not waited out for a process that is already gone.
+  assert.ok(elapsed < 20_000, `a dead run must not be waited out, took ${elapsed}ms`);
+  // The record still names the worktree that holds the work, so it survives the report.
+  assert.notEqual(readRunState(runId), null, "an abandoned run's record must not be cleared");
+});
+
+test("wait.js reports the model, files, warning and pending writes before clearing state", async (t) => {
+  const runId = `test-detail-${process.pid}-${Date.now().toString(36)}`;
+  await writeRunState({
+    status: "completed",
+    runId,
+    sessionName: "s",
+    worktreePath: "w",
+    branch: "hermes/agy-x",
+    startedAt: Date.now(),
+    result: {
+      success: true,
+      durationMs: 1_000,
+      message: "2 file(s) changed on hermes/agy-x.",
+      model: "cline-pass/deepseek-v4.1-flash-1017",
+      provider: "clinepass",
+      warning: "Attribution came from the native ledger.",
+      modifiedFiles: ["src/a.ts", "tests/a.test.ts"],
+      pendingWrites: [
+        { id: "mem-1", subsystem: "memory", action: "add", summary: "Recorded the invariant." },
+        { id: "skill-2", subsystem: "skills", action: "patch", summary: "Extended the playbook." },
+      ],
+    },
+  });
+  t.after(() => clearRunState(runId));
+
+  const output = await run(process.execPath, ["--import", "tsx", "src/wait.ts", runId], {
+    cwd: path.resolve(import.meta.dirname, ".."),
+    timeoutMs: 30_000,
+  });
+  assert.equal(output.code, 0, output.stderr);
+
+  assert.match(output.stdout, /\[Hermes Result Detail\]/);
+  assert.match(output.stdout, /- Model: cline-pass\/deepseek-v4\.1-flash-1017, provider: clinepass/);
+  assert.match(output.stdout, /- Warning: Attribution came from the native ledger\./);
+  assert.match(output.stdout, /- Files Changed: 2 \(src\/a\.ts, tests\/a\.test\.ts\)/);
+  assert.match(output.stdout, /- Pending Writes: 2/);
+  assert.match(output.stdout, /mem-1 \(memory\): add -> Recorded the invariant\./);
+  assert.match(output.stdout, /skill-2 \(skills\): patch -> Extended the playbook\./);
+
+  // The detail is a verdict partner: it has to be on screen before the run state is consumed.
+  assert.ok(output.stdout.indexOf("[Hermes Result Detail]") < output.stdout.indexOf("2 file(s) changed"));
+  assert.equal(readRunState(runId), null, "the completed path still consumes the record");
+});
+
+test("wait.js prints no detail block when the result carries nothing to report", async (t) => {
+  const runId = `test-nodetail-${process.pid}-${Date.now().toString(36)}`;
+  await writeRunState({
+    status: "completed",
+    runId,
+    sessionName: "s",
+    worktreePath: "w",
+    branch: "hermes/agy-x",
+    startedAt: Date.now(),
+    result: { success: true, durationMs: 10 },
+  });
+  t.after(() => clearRunState(runId));
+
+  const output = await run(process.execPath, ["--import", "tsx", "src/wait.ts", runId], {
+    cwd: path.resolve(import.meta.dirname, ".."),
+    timeoutMs: 30_000,
+  });
+  assert.equal(output.code, 0, output.stderr);
+  // An empty header would read as a real, empty answer.
+  assert.equal(output.stdout.includes("[Hermes Result Detail]"), false);
+});
+
+test("a dispatch attributes the run from the native ledger", async (t) => {
+  const runId = `ledger-${process.pid}-${Date.now().toString(36)}`;
+  const { repo } = await makeDispatchRepo(t, {
+    usage: {
+      model: DEFAULT_MODEL,
+      provider: "clinepass",
+      session_id: "sess-auto-apply",
+      input_tokens: 210,
+      output_tokens: 40,
+      cache_read_tokens: 10,
+      total_tokens: 260,
+      completed: true,
+      failed: false,
+    },
+  });
+
+  const result = (await dispatchHermesTask({
+    cwd: repo,
+    prompt: "Add auto-applied.ts to the repository root.",
+    runId,
+    fastWaitSeconds: 120,
+  })) as DispatchResult;
+
+  assert.equal(result.success, true, result.message);
+  assert.equal(result.model, DEFAULT_MODEL);
+  assert.equal(result.provider, "clinepass");
+  assert.equal(result.modelFallback, false);
+  // The stderr session line names the run before the stream does.
+  assert.equal(result.sessionId, "sess-auto-apply");
+  // The ledger's token counts win over a stream payload that reports none.
+  assert.equal(result.tokens?.input, 210);
+  assert.equal(result.tokens?.total, 260);
+  // Cache tokens have to survive the merge: an unreconciled key silently drops out of every total.
+  assert.equal(result.tokens?.cache_read, 10);
+  assert.equal(runMetadata(result).brackets.includes("[tokens: 260]"), true);
+});
+
+test("a ledger that spells the requested model without its provider prefix is not a fallback", async (t) => {
+  const runId = `ledger-bare-${process.pid}-${Date.now().toString(36)}`;
+  const { repo } = await makeDispatchRepo(t, {
+    usage: {
+      // The provider echoed only the model id: a string comparison against the configured
+      // "provider/model" would read this as a fallback and hard-fail an otherwise clean run.
+      model: DEFAULT_MODEL.split("/").pop() as string,
+      provider: "clinepass",
+      session_id: "sess-auto-apply",
+      total_tokens: 12,
+      completed: true,
+      failed: false,
+    },
+  });
+
+  const result = (await dispatchHermesTask({
+    cwd: repo,
+    prompt: "Add auto-applied.ts to the repository root.",
+    runId,
+    fastWaitSeconds: 120,
+  })) as DispatchResult;
+
+  assert.equal(result.success, true, result.message);
+  assert.equal(result.modelFallback, false, "the same model under a different spelling is not a fallback");
+});
+
+test("a ledger naming a model nobody asked for is a fallback, and fails closed", async (t) => {
+  const runId = `ledger-fallback-${process.pid}-${Date.now().toString(36)}`;
+  const { repo } = await makeDispatchRepo(t, {
+    usage: {
+      model: "openrouter/some-free-model",
+      provider: "openrouter",
+      session_id: "sess-auto-apply",
+      total_tokens: 10,
+      completed: true,
+      failed: false,
+    },
+  });
+
+  const result = (await dispatchHermesTask({
+    cwd: repo,
+    prompt: "Add auto-applied.ts to the repository root.",
+    runId,
+    fastWaitSeconds: 120,
+  })) as DispatchResult;
+
+  assert.equal(result.success, false, "a fallback model may never report success");
+  assert.equal(result.modelFallback, true);
+  assert.equal(result.model, "openrouter/some-free-model");
+  assert.match(result.message, /Dispatch refused: cline pass exhausted/);
+  assert.deepEqual(result.modifiedFiles, [], "a fallback diff is not reviewable");
+  assert.equal(await branchExists(repo, `hermes/agy-${runId}`), false);
+});
+
+test("a dispatch publishes its worker and child pids while the run is going", async (t) => {
+  const runId = `pid-${process.pid}-${Date.now().toString(36)}`;
+  const { repo } = await makeDispatchRepo(t, { sleepMs: 4_000 });
+  t.after(() => clearRunState(runId));
+
+  const outcome = await dispatchHermesTask({
+    cwd: repo,
+    prompt: "Add auto-applied.ts to the repository root.",
+    runId,
+    fastWaitSeconds: 0.5,
+  });
+  assert.ok("waitCommand" in outcome, "the slow run must answer with a running descriptor");
+
+  const state = readRunState(runId);
+  assert.equal(state?.status, "running");
+  assert.equal(state?.workerPid, process.pid, "the dispatcher pid is what proves the run is alive");
+  assert.equal(typeof state?.childPid, "number", "the runner's pid is what cancel has to kill");
+
+  // Let the run finish so the fixture repo is not torn down mid-flight.
+  for (let attempt = 0; attempt < 60 && readRunState(runId)?.status === "running"; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  assert.equal(readRunState(runId)?.status, "completed");
+});
+
+test("cancel kills the run's child, settles the record and removes the worktree", async (t) => {
+  const runId = `cancel-${process.pid}-${Date.now().toString(36)}`;
+  const { repo } = await makeDispatchRepo(t, { sleepMs: 30_000 });
+  t.after(() => clearRunState(runId));
+
+  const outcome = await dispatchHermesTask({
+    cwd: repo,
+    prompt: "Add auto-applied.ts to the repository root.",
+    runId,
+    fastWaitSeconds: 0.5,
+  });
+  assert.ok("waitCommand" in outcome);
+  const childPid = readRunState(runId)?.childPid;
+  assert.equal(typeof childPid, "number");
+
+  const startedAt = Date.now();
+  const cancelled = await manageWorktree({
+    action: "cancel",
+    cwd: repo,
+    worktreeBranch: `hermes/agy-${runId}`,
+  });
+  const elapsed = Date.now() - startedAt;
+
+  assert.equal(cancelled.success, true, cancelled.message);
+  assert.equal(isPidAlive(childPid), false, "the child tree must be dead");
+  assert.match(cancelled.message, /Cancelled/);
+  // Bounded teardown, not a 30s wait for the child's own sleep to elapse.
+  assert.ok(elapsed < 20_000, `cancel must not wait out the child, took ${elapsed}ms`);
+  assert.equal(fs.existsSync(path.join(repo, ".worktrees", `agy-${runId}`)), false);
+  assert.equal(await branchExists(repo, `hermes/agy-${runId}`), false);
+  // The dispatcher itself must survive: cancel kills the child, never the bridge that reports it.
+  assert.equal(isPidAlive(process.pid), true);
+
+  // The cancelled pipeline unwinds on its own: it must not republish the run or re-create the
+  // worktree once that record has already told the waiter the run is over.
+  const settledRecord = readRunState(runId);
+  assert.equal(settledRecord?.status, "completed");
+  assert.equal((settledRecord?.result as { cancelled?: unknown } | undefined)?.cancelled, true);
+  await new Promise((resolve) => setTimeout(resolve, 1_500));
+  const after = readRunState(runId);
+  assert.equal((after?.result as { cancelled?: unknown } | undefined)?.cancelled, true);
+  assert.deepEqual(after?.result, settledRecord?.result, "the pipeline must not overwrite the record");
+  assert.equal(fs.existsSync(path.join(repo, ".worktrees", `agy-${runId}`)), false);
+});
+
+test("apply and discard still refuse a live run, naming cancel as the way out", async (t) => {
+  const { repo, worktree, branch } = await makeRepo(t);
+  // The record is keyed by the run id inside the branch: that is the only handle the tool receives.
+  const runId = branch.replace("hermes/agy-", "");
+  t.after(() => clearRunState(runId));
+
+  await writeRunState({
+    status: "running",
+    runId,
+    sessionName: "s",
+    worktreePath: worktree,
+    branch,
+    startedAt: Date.now(),
+    workerPid: process.pid,
+  });
+
+  const applied = await manageWorktree({ action: "apply", cwd: repo, worktreeBranch: branch });
+  assert.equal(applied.success, false);
+  assert.match(applied.message, /still actively executing/);
+  assert.match(applied.message, /cancel/);
+  assert.equal(fs.existsSync(worktree), true, "a refusal must delete nothing");
+});
+
+test("a fallback already recorded at session start aborts the run on turn 1", async (t) => {
+  const runId = `abort-${process.pid}-${Date.now().toString(36)}`;
+  const { repo } = await makeDispatchRepo(t, { fallbackActive: true, sleepMs: 30_000 });
+
+  const startedAt = Date.now();
+  const result = (await dispatchHermesTask({
+    cwd: repo,
+    prompt: "Add auto-applied.ts to the repository root.",
+    runId,
+    fastWaitSeconds: 120,
+  })) as DispatchResult;
+  const elapsed = Date.now() - startedAt;
+
+  assert.equal(result.success, false);
+  assert.equal(result.abortedFallback, true, "the run must be reported as an early abort");
+  assert.equal(result.modelFallback, true);
+  assert.match(result.message, /cline pass exhausted/);
+  // Turn 1 is where the fallback shows up: the rest of the run would spend quota on output that
+  // cannot be reviewed, so it is killed rather than waited out.
+  assert.ok(elapsed < 20_000, `the abort must not wait out the child's 30s, took ${elapsed}ms`);
+  assert.equal(await branchExists(repo, `hermes/agy-${runId}`), false);
+});
+
+test("a dispatch never writes core.hooksPath into the caller's repository", async (t) => {
+  const runId = `hooks-${process.pid}-${Date.now().toString(36)}`;
+  const { repo } = await makeDispatchRepo(t);
+
+  const result = (await dispatchHermesTask({
+    cwd: repo,
+    prompt: "Add auto-applied.ts to the repository root.",
+    runId,
+    fastWaitSeconds: 120,
+  })) as DispatchResult;
+  assert.equal(result.success, true, result.message);
+
+  // The sandbox travels in the child env: a repo config write would survive a crashed dispatch and
+  // silently disable the caller's hooks for good.
+  const config = await git(repo, ["config", "--local", "--list"]);
+  assert.equal(config.includes("hooksPath"), false, `the run mutated the repo config:\n${config}`);
+});
+
+test("the sandboxed env overrides the caller's hooksPath without touching the repository", async (t) => {
+  const { repo } = await makeRepo(t);
+  await git(repo, ["config", "--local", "core.hooksPath", ".husky"]);
+  const emptyHooks = fs.mkdtempSync(path.join(os.tmpdir(), "hermes-empty-hooks-"));
+  t.after(() => fs.rmSync(emptyHooks, { recursive: true, force: true }));
+
+  const seen = await run("git", ["config", "--get", "core.hooksPath"], {
+    cwd: repo,
+    env: sandboxedGitEnv(process.env, emptyHooks, repo),
+    timeoutMs: 30_000,
+  });
+  assert.equal(seen.code, 0, seen.stderr);
+  assert.equal(seen.stdout.trim(), emptyHooks, "the child must see the sandboxed hooks dir");
+
+  // The repository setting is untouched: the override dies with the child process.
+  assert.equal((await git(repo, ["config", "--local", "--get", "core.hooksPath"])).trim(), ".husky");
 });

@@ -45,9 +45,13 @@ const append = (capture: Capture, chunk: string): void => {
   capture.text += `\n${TRUNCATION_MARKER}`;
 };
 
-/** `taskkill /T` is the only kill that reaches a detached grandchild tree on Windows. */
-const killTree = (child: ChildProcess, pid: number | undefined): void => {
-  if (isWindows && pid !== undefined) {
+/**
+ * `taskkill /T` is the only kill that reaches a detached grandchild tree on Windows. Exported on its
+ * own because a run's child can outlive the handle that spawned it: cancelling only has the pid.
+ */
+export const killProcessTree = (pid: number | null | undefined): void => {
+  if (typeof pid !== "number" || !Number.isFinite(pid) || pid <= 0) return;
+  if (isWindows) {
     try {
       const killer = spawn("taskkill", ["/PID", String(pid), "/T", "/F"], {
         stdio: "ignore",
@@ -60,6 +64,18 @@ const killTree = (child: ChildProcess, pid: number | undefined): void => {
     } catch {
       // fall through to the direct kill
     }
+  }
+  try {
+    process.kill(pid, "SIGKILL");
+  } catch {
+    // already gone
+  }
+};
+
+const killTree = (child: ChildProcess, pid: number | undefined): void => {
+  if (pid !== undefined) {
+    killProcessTree(pid);
+    return;
   }
   try {
     child.kill("SIGKILL");
@@ -138,8 +154,12 @@ export interface GitResult extends RunResult {
   ok: boolean;
 }
 
-export const runGit = async (cwd: string, args: string[]): Promise<GitResult> => {
-  const result = await run("git", args, { cwd, timeoutMs: 120_000 });
+export const runGit = async (
+  cwd: string,
+  args: string[],
+  options: Pick<RunOptions, "env"> = {},
+): Promise<GitResult> => {
+  const result = await run("git", args, { cwd, env: options.env, timeoutMs: 120_000 });
   return { ...result, ok: result.code === 0 };
 };
 

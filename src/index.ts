@@ -39,7 +39,16 @@ server.registerTool(
       "clinepass provider; if cline pass is refused (quota exhausted), the dispatch fails closed " +
       "(success: false, modelFallback: true) instead of silently landing on a fallback model.",
     inputSchema: {
-      prompt: z.string().describe("The full task specification for Hermes."),
+      prompt: z
+        .string()
+        .describe(
+          "The full task specification for Hermes. Do NOT paste the [WORKER OPERATIONAL " +
+            "BOUNDARY] block into it: the bridge prepends the boundary itself and a prompt that " +
+            "already carries it is passed through unchanged. Write the objective, the files, the " +
+            "acceptance criteria and the verification command. Split multi-file work into " +
+            "workstreams and tell Hermes to fan them out with parallel delegate_task subagents, " +
+            "giving each subagent strictly disjoint file paths.",
+        ),
       cwd: z.string().optional().describe("Repository path the task belongs to (defaults to the bound project)."),
       conversationId: z.string().optional().describe("Antigravity conversation id, used to resolve the project."),
       project: z.string().optional().describe("Antigravity project name or id."),
@@ -117,10 +126,13 @@ server.registerTool(
   {
     title: "Apply or discard a bridge worktree",
     description:
-      "Land a Hermes run on your working checkout (apply) or throw it away (discard). Apply patches " +
-      "with git apply --3way and then removes the temporary worktree and branch.",
+      "Land a Hermes run on your working checkout (apply), throw it away (discard), or stop a live " +
+      "run and throw its work away (cancel). Apply patches with git apply --3way and then removes " +
+      "the temporary worktree and branch. Cancel is the only action that interrupts a running " +
+      "dispatch: it kills the run's process tree, settles the run state so no waiter hangs, then " +
+      "removes the worktree and branch.",
     inputSchema: {
-      action: z.enum(["apply", "discard"]),
+      action: z.enum(["apply", "discard", "cancel"]),
       cwd: z.string().describe("Repository root."),
       worktreeBranch: z.string().describe("Branch name reported by hermes_dispatch."),
     },

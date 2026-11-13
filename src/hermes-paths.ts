@@ -22,6 +22,16 @@ export const hermesExe = (): string => {
   return path.join(hermesHome(), "bin", isWindows ? "hermes.exe" : "hermes");
 };
 
+/**
+ * Windows cannot exec a `.js` entrypoint, and the shipped `hermes.cmd` wrapper is refused by
+ * spawn without a shell, so a script-shaped HERMES_BIN (source checkout, test double) is handed to
+ * the running node instead. An `.exe` bin is spawned as itself.
+ */
+export const hermesCommand = (): { file: string; prefixArgs: string[] } => {
+  const bin = hermesExe();
+  return /\.[cm]?js$/i.test(bin) ? { file: process.execPath, prefixArgs: [bin] } : { file: bin, prefixArgs: [] };
+};
+
 export const projectsDbPath = (): string => path.join(hermesHome(), "projects.db");
 export const stateDbPath = (): string => path.join(hermesHome(), "state.db");
 export const pendingDir = (subsystem: "memory" | "skills"): string =>
