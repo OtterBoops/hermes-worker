@@ -60,7 +60,10 @@ const git = async (cwd: string, args: string[]): Promise<string> => {
 };
 
 /** A throwaway repository with one commit and a bridge-style worktree, mirroring a dispatch. */
-const makeRepo = async (t: TestContext): Promise<{ repo: string; worktree: string; branch: string }> => {
+const makeRepo = async (
+  t: TestContext,
+  runId = "test",
+): Promise<{ repo: string; worktree: string; branch: string }> => {
   const repo = fs.mkdtempSync(path.join(os.tmpdir(), "hermes-worker-repo-"));
   t.after(() => fs.rmSync(repo, { recursive: true, force: true }));
 
@@ -69,8 +72,8 @@ const makeRepo = async (t: TestContext): Promise<{ repo: string; worktree: strin
   await git(repo, ["add", "."]);
   await git(repo, ["commit", "-m", "initial"]);
 
-  const branch = "hermes/agy-test";
-  const worktree = path.join(repo, ".worktrees", "agy-test");
+  const branch = `hermes/agy-${runId}`;
+  const worktree = path.join(repo, ".worktrees", `agy-${runId}`);
   fs.mkdirSync(path.join(repo, ".worktrees"), { recursive: true });
   await git(repo, ["worktree", "add", "-b", branch, worktree, "HEAD"]);
   // `.worktrees/` is excluded in production so a bridge worktree never appears in a diff.
@@ -1211,10 +1214,6 @@ const makeOrphan = (repo: string, runId: string): string => {
 /**
  * Windows holds a directory handle open briefly after its process exits, so an rm lands on EPERM
  * and a single attempt leaks the directory. The helper must retry rather than surrender.
- */
-/**
- * Windows holds a directory handle open briefly after its process exits, so an rm lands on EPERM
- * and a single attempt leaks the directory. The helper must retry rather than surrender.
  *
  * A worktree missing its `.git` file is the cheapest way to make git refuse the removal, which is
  * what pushes the cleanup onto the disk sweep the mock is watching.
@@ -1250,7 +1249,7 @@ test("a transient EPERM on the worktree directory is retried, not reported as a 
   assert.equal(result.success, true, `a lock that clears must not be a failure: ${result.message}`);
   assert.equal(fs.existsSync(worktree), false, "the worktree directory must be gone");
   assert.equal(attempts, 3, "two EPERM attempts must be retried until the removal succeeds");
-  // 150ms then 300ms of backoff: proves the retries are paced, not spun.
+  // Paced backoff, not a spin: two retries have to cost real time.
   assert.ok(elapsed >= 400, `retries must back off, took ${elapsed}ms`);
   assert.equal(await branchExists(repo, branch), false);
 });
@@ -1303,6 +1302,163 @@ test("a worktree git refuses to remove is still a clean removal once the directo
 
   const registered = await git(repo, ["worktree", "list", "--porcelain"]);
   assert.equal(registered.includes(worktree.replace(/\\/g, "/")), false, "the admin record must be pruned");
+});
+
+/** A process sitting in a directory holds that directory open: the handle Windows reports as EBUSY. */
+const holdDirectoryOpen = async (t: TestContext, cwd: string): Promise<number> => {
+  const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60000)"], {
+    cwd,
+    stdio: "ignore",
+    windowsHide: true,
+  });
+  t.after(() => {
+    try {
+      child.kill("SIGKILL");
+    } catch {
+      // already gone
+    }
+  });
+  await new Promise((resolve) => child.once("spawn", resolve));
+  assert.equal(typeof child.pid, "number");
+  return child.pid as number;
+};
+
+/**
+ * EBUSY is Windows reporting the directory still being held open, and the lock clears on its own:
+ * abandoning the removal on the first attempt is the leak this retry exists to prevent.
+ */
+test("a transient EBUSY on the worktree directory is retried, not reported as a failure", async (t) => {
+  const { repo, worktree, branch } = await makeRepo(t);
+  breakWorktree(worktree);
+  const realRm = fsp.rm.bind(fsp);
+  let attempts = 0;
+
+  const handle = mock.method(fsp, "rm", async (target: unknown, options?: unknown) => {
+    if (path.resolve(String(target)) === path.resolve(worktree)) {
+      attempts += 1;
+      if (attempts <= 2) {
+        throw Object.assign(new Error(`EBUSY: resource busy or locked, rmdir '${worktree}'`), {
+          code: "EBUSY",
+        });
+      }
+    }
+    return realRm(target as Parameters<typeof fsp.rm>[0], options as Parameters<typeof fsp.rm>[1]);
+  });
+  t.after(() => handle.mock.restore());
+
+  const result = await manageWorktree({ action: "discard", cwd: repo, worktreeBranch: branch });
+
+  assert.equal(result.success, true, `a lock that clears must not be a failure: ${result.message}`);
+  assert.equal(fs.existsSync(worktree), false, "the worktree directory must be gone");
+  assert.equal(attempts, 3, "two EBUSY attempts must be retried until the removal succeeds");
+});
+
+test("a removal locked by EBUSY for good is reported with the path and the OS error", async (t) => {
+  const { repo, worktree, branch } = await makeRepo(t);
+  breakWorktree(worktree);
+  const realRm = fsp.rm.bind(fsp);
+
+  const handle = mock.method(fsp, "rm", async (target: unknown, options?: unknown) => {
+    if (path.resolve(String(target)) === path.resolve(worktree)) {
+      throw Object.assign(new Error(`EBUSY: resource busy or locked, rmdir '${worktree}'`), {
+        code: "EBUSY",
+      });
+    }
+    return realRm(target as Parameters<typeof fsp.rm>[0], options as Parameters<typeof fsp.rm>[1]);
+  });
+  t.after(() => handle.mock.restore());
+
+  const result = await manageWorktree({ action: "discard", cwd: repo, worktreeBranch: branch });
+
+  assert.equal(result.success, false, "a directory that survives on disk is a real failure");
+  assert.match(result.message, /could not delete/);
+  assert.match(result.message, /EBUSY/);
+  assert.equal(fs.existsSync(worktree), true, "the surviving directory must be reported, not hidden");
+});
+
+test("a child still running in the worktree is killed before the removal is attempted", async (t) => {
+  const runId = `held-${process.pid}-${Date.now().toString(36)}`;
+  const { repo, worktree, branch } = await makeRepo(t, runId);
+  const childPid = await holdDirectoryOpen(t, worktree);
+  await writeRunState({
+    status: "completed",
+    runId,
+    sessionName: "s",
+    worktreePath: worktree,
+    branch,
+    startedAt: Date.now(),
+    childPid,
+  });
+  t.after(() => clearRunState(runId));
+
+  const realRm = fsp.rm.bind(fsp);
+  const root = path.resolve(worktree);
+  let touchesWhileAlive = 0;
+  const handle = mock.method(fsp, "rm", async (target: unknown, options?: unknown) => {
+    // Anything inside the worktree counts: even a file removal starts taking the directory apart
+    // while the child can still write into it.
+    const resolved = path.resolve(String(target));
+    if ((resolved === root || resolved.startsWith(root + path.sep)) && isPidAlive(childPid)) {
+      touchesWhileAlive += 1;
+    }
+    return realRm(target as Parameters<typeof fsp.rm>[0], options as Parameters<typeof fsp.rm>[1]);
+  });
+  t.after(() => handle.mock.restore());
+
+  const result = await manageWorktree({ action: "discard", cwd: repo, worktreeBranch: branch });
+
+  assert.equal(result.success, true, result.message);
+  assert.equal(isPidAlive(childPid), false, "the run's child must not survive its worktree");
+  assert.equal(touchesWhileAlive, 0, "nothing may be deleted while the child still holds the directory");
+  assert.equal(fs.existsSync(worktree), false);
+  assert.equal(await branchExists(repo, branch), false);
+});
+
+test("a recorded child is left alone when the run's record names another worktree", async (t) => {
+  const runId = `foreign-${process.pid}-${Date.now().toString(36)}`;
+  const { repo, branch } = await makeRepo(t, runId);
+  // Anywhere but the repository: this test is about the pid, and a child inside the fixture would
+  // make the fixture's own teardown fail instead of the removal under test.
+  const childPid = await holdDirectoryOpen(t, os.tmpdir());
+  await writeRunState({
+    status: "completed",
+    runId,
+    sessionName: "s",
+    // An abandoned record's pid can be recycled by an unrelated process, so the worktree the record
+    // names decides whether that pid belongs to this cleanup at all.
+    worktreePath: path.join(repo, ".worktrees", "agy-somewhere-else"),
+    branch,
+    startedAt: Date.now(),
+    childPid,
+  });
+  t.after(() => clearRunState(runId));
+
+  const result = await manageWorktree({ action: "discard", cwd: repo, worktreeBranch: branch });
+
+  assert.equal(result.success, true, result.message);
+  assert.equal(isPidAlive(childPid), true, "a pid from a record naming another worktree must not be signalled");
+});
+
+test("pruneOrphanWorktrees kills the child a crashed run left holding its worktree", async (t) => {
+  const runId = `crashed-${process.pid}-${Date.now().toString(36)}`;
+  const { repo, worktree, branch } = await makeRepo(t, runId);
+  const childPid = await holdDirectoryOpen(t, worktree);
+  await writeRunState({
+    status: "completed",
+    runId,
+    sessionName: "s",
+    worktreePath: worktree,
+    branch,
+    startedAt: Date.now(),
+    childPid,
+  });
+  t.after(() => clearRunState(runId));
+
+  const removed = await pruneOrphanWorktrees(repo);
+
+  assert.equal(removed, 1, `the orphan must be swept, removed ${removed}`);
+  assert.equal(isPidAlive(childPid), false, "the sweep is the last caller that can reap the child");
+  assert.equal(fs.existsSync(worktree), false);
 });
 
 test("a directory already deleted from disk removes without error", async (t) => {

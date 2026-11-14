@@ -288,8 +288,23 @@ const isRunCancelled = (runId: string): boolean => {
 };
 
 const REMOVE_MAX_RETRIES = 5;
-const REMOVE_RETRY_DELAY_MS = 150;
+const REMOVE_RETRY_DELAY_MS = 200;
 const REMOVE_MAX_DELAY_MS = 2_000;
+const CHILD_EXIT_WAIT_ATTEMPTS = 20;
+const CHILD_EXIT_WAIT_MS = 100;
+
+/**
+ * A live child keeps its worktree directory open, so a removal that races it fails EBUSY on Windows
+ * until the process exits. Killing is not enough on its own: the caller must also wait, or the child
+ * writes into a directory the next line deletes.
+ */
+const stopChildProcess = async (pid: number | null | undefined): Promise<boolean> => {
+  if (typeof pid !== "number" || !Number.isFinite(pid) || pid <= 0 || pid === process.pid) return false;
+  if (!isPidAlive(pid)) return false;
+  killProcessTree(pid);
+  for (let attempt = 0; attempt < CHILD_EXIT_WAIT_ATTEMPTS && isPidAlive(pid); attempt += 1) await sleep(CHILD_EXIT_WAIT_MS);
+  return !isPidAlive(pid);
+};
 
 /**
  * Windows keeps a directory handle open for a moment after the process that owned it exits, so a
@@ -411,6 +426,13 @@ export const pruneOrphanWorktrees = async (repoRoot: string): Promise<number> =>
     }
     // lstat, then reject links: rm -r follows a junction and would delete outside the tree.
     if (!stat.isDirectory() || stat.isSymbolicLink()) continue;
+
+    // A crashed run can leave its child behind, and the sweep is the last caller that will ever
+    // reap it: the directory stays EBUSY for as long as that process holds it.
+    const abandoned = readRunState(entry.slice("agy-".length));
+    if (abandoned && typeof abandoned.worktreePath === "string" && samePath(abandoned.worktreePath, target)) {
+      await stopChildProcess(abandoned.childPid);
+    }
 
     const swept = await removeDirectory(target);
     if (swept.ok) removed += 1;
@@ -1687,12 +1709,7 @@ export const manageWorktree = async (options: {
       }).catch(() => undefined);
     }
 
-    if (hadChild && isPidAlive(childPid)) {
-      killProcessTree(childPid);
-      // Bounded wait: returning before the process actually dies would let it write into a worktree
-      // the very next line deletes.
-      for (let attempt = 0; attempt < 20 && isPidAlive(childPid); attempt += 1) await sleep(100);
-    }
+    if (hadChild) await stopChildProcess(childPid);
   }
 
   // Refuse to touch a worktree whose Hermes process/session is actively executing. A run that is
@@ -1740,6 +1757,18 @@ export const manageWorktree = async (options: {
       success: false,
       message: `Refusing to touch '${target.path}': it is outside ${worktreesRoot}.`,
     };
+  }
+
+  // Removal needs the directory to itself. A child still recorded for this run holds it open, so a
+  // Windows rm lands on EBUSY until that process exits. The pid is trusted only when the record
+  // names this worktree, because an abandoned record's pid may since have been recycled.
+  if (
+    options.action !== "cancel" &&
+    activeRun &&
+    typeof activeRun.worktreePath === "string" &&
+    samePath(activeRun.worktreePath, target.path)
+  ) {
+    await stopChildProcess(activeRun.childPid);
   }
 
   const cleanup = async (): Promise<string | null> => {
