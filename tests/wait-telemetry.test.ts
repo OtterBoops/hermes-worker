@@ -6,6 +6,7 @@ import { run } from "../src/exec.js";
 import {
   RUN_STATE_DIR,
   formatDispatchSentinel,
+  formatFailedSentinel,
   readRunState,
   runLogPath,
   runStatePath,
@@ -19,6 +20,13 @@ import {
 } from "../src/run-log.js";
 
 const D = "\u00b7";
+
+/** The CLI as a caller runs it: a real child process, so exit codes and stream order are real too. */
+const waitFor = (runId: string): ReturnType<typeof run> =>
+  run(process.execPath, ["--import", "tsx", "src/wait.ts", runId], {
+    cwd: path.resolve(import.meta.dirname, ".."),
+    timeoutMs: 20_000,
+  });
 
 const baseTelemetry = (overrides: Partial<Telemetry> = {}): Telemetry => ({
   runId: "20261108234625-4u18",
@@ -191,6 +199,79 @@ test("NOISY_RESULT_TOOLS covers exploration and never the tools with readable ou
   for (const name of ["terminal", "write_file", "patch", "delegate_task", "task"]) {
     assert.equal(NOISY_RESULT_TOOLS.has(name), false, `${name} output is worth reading`);
   }
+});
+
+test("a real cost below the sixth decimal is not rounded down to a free run", () => {
+  const table = renderTelemetryTable(baseTelemetry({ costUsd: 4.2e-7 }));
+  const cost = table.filter((line) => line.startsWith("| cost_usd |"));
+  assert.deepEqual(cost, ["| cost_usd | 4.2e-7 |"]);
+
+  // A reported zero is still a real price and keeps its plain spelling.
+  assert.ok(renderTelemetryTable(baseTelemetry({ costUsd: 0 })).includes("| cost_usd | 0 |"));
+  // The common shape stays byte-exact.
+  assert.ok(
+    renderTelemetryTable(baseTelemetry({ costUsd: 0.000312 })).includes("| cost_usd | 0.000312 |"),
+  );
+});
+
+test("an unknown duration prints no row rather than the epoch", () => {
+  const table = renderTelemetryTable(baseTelemetry({ durationSeconds: null }));
+  assert.equal(table.some((line) => line.startsWith("| duration |")), false);
+  assert.ok(table.includes("| run | 20261108234625-4u18 |"));
+});
+
+test("the wait CLI settles a run with no record as FAILED instead of tailing for two hours", async (t) => {
+  const runId = `test-absent-${process.pid}-${Date.now().toString(36)}`;
+  const statePath = runStatePath(runId);
+  const logPath = runLogPath(runId);
+  t.after(() => {
+    fs.rmSync(statePath, { force: true });
+    fs.rmSync(logPath, { force: true });
+  });
+  assert.equal(readRunState(runId), null, "the fixture must start with no record at all");
+
+  const output = await waitFor(runId);
+
+  assert.equal(output.timedOut, false, "a missing record must settle, not poll out the deadline");
+  assert.equal(output.code, 1, output.stderr);
+  const lines = output.stdout.split(/\r?\n/);
+  assert.ok(lines.includes("[Hermes Dispatch Telemetry] FAILED"), output.stdout);
+  const sentinels = lines.filter((line) => line.startsWith("<<<HERMES_DISPATCH_"));
+  assert.deepEqual(sentinels, [formatFailedSentinel(runId)], "exactly one sentinel, and it is the failure");
+  assert.equal(
+    lines.some((line) => line.startsWith("| duration |")),
+    false,
+    "an unknown duration must not be fabricated from the epoch",
+  );
+  assert.match(output.stderr, /no run record/);
+});
+
+test("a timed-out record gets the same verdict from the exit code and the sentinel", async (t) => {
+  const runId = `test-timeout-${process.pid}-${Date.now().toString(36)}`;
+  const statePath = runStatePath(runId);
+  const logPath = runLogPath(runId);
+  t.after(() => {
+    fs.rmSync(statePath, { force: true });
+    fs.rmSync(logPath, { force: true });
+  });
+
+  await writeRunState({
+    status: "completed",
+    runId,
+    sessionName: "s",
+    worktreePath: "w",
+    branch: "hermes/agy-telemetry",
+    startedAt: Date.now() - 2_000,
+    result: { success: true, timedOut: true, durationMs: 2_000, message: "Hermes exceeded 1800s and was killed." },
+  });
+
+  const output = await waitFor(runId);
+
+  const lines = output.stdout.split(/\r?\n/);
+  assert.ok(lines.includes("[Hermes Dispatch Telemetry] FAILED"), output.stdout);
+  assert.ok(lines.includes(formatFailedSentinel(runId)), output.stdout);
+  assert.equal(lines.includes(formatDispatchSentinel(runId)), false, "a killed run is never a success sentinel");
+  assert.equal(output.code, 1, "the exit code must carry the same verdict as the sentinel");
 });
 
 test("the wait CLI renders the table, emits its sentinel and consumes the state", async (t) => {

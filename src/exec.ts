@@ -19,7 +19,8 @@ export interface RunOptions {
 /** 16MB per stream: a runaway command must not be able to exhaust the host's memory. */
 const MAX_BUFFER_BYTES = 16 * 1024 * 1024;
 const TRUNCATION_MARKER = "[output truncated at 16MB]";
-const EXIT_GRACE_MS = 200;
+/** Exported so a second spawn wrapper settles on the same 'exit'-plus-grace budget. */
+export const EXIT_GRACE_MS = 200;
 const KILL_FALLBACK_MS = 500;
 
 interface Capture {
@@ -30,6 +31,15 @@ interface Capture {
 
 const newCapture = (): Capture => ({ text: "", bytes: 0, truncated: false });
 
+/** The budget counts bytes, so a cut has to land on a codepoint boundary or it fabricates a U+FFFD. */
+const decodePrefix = (chunk: string, room: number): string => {
+  const bytes = Buffer.from(chunk, "utf8");
+  if (bytes.length <= room) return chunk;
+  let end = room;
+  while (end > 0 && (bytes[end] & 0xc0) === 0x80) end -= 1;
+  return bytes.subarray(0, end).toString("utf8");
+};
+
 const append = (capture: Capture, chunk: string): void => {
   if (capture.truncated) return;
   const chunkBytes = Buffer.byteLength(chunk, "utf8");
@@ -38,11 +48,13 @@ const append = (capture: Capture, chunk: string): void => {
     capture.bytes += chunkBytes;
     return;
   }
-  const room = MAX_BUFFER_BYTES - capture.bytes;
-  if (room > 0) capture.text += Buffer.from(chunk, "utf8").subarray(0, room).toString("utf8");
-  capture.bytes = MAX_BUFFER_BYTES;
+  const kept = decodePrefix(chunk, MAX_BUFFER_BYTES - capture.bytes);
+  capture.text += kept;
+  capture.bytes += Buffer.byteLength(kept, "utf8");
   capture.truncated = true;
-  capture.text += `\n${TRUNCATION_MARKER}`;
+  const marker = `\n${TRUNCATION_MARKER}`;
+  capture.text += marker;
+  capture.bytes += Buffer.byteLength(marker, "utf8");
 };
 
 /**
@@ -58,7 +70,14 @@ export const killProcessTree = (pid: number | null | undefined): void => {
         windowsHide: true,
         detached: true,
       });
-      killer.on("error", () => {});
+      // A host with no taskkill on PATH must still lose the child: the error is never a success.
+      killer.on("error", () => {
+        try {
+          process.kill(pid, "SIGKILL");
+        } catch {
+          // already gone
+        }
+      });
       killer.unref();
       return;
     } catch {

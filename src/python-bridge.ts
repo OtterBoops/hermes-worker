@@ -65,6 +65,31 @@ def _ops(payload):
     return [payload]
 
 
+def _safe_record_id(rec):
+    """An id read back from disk becomes a filename component here, so it is re-validated."""
+    value = rec.get("id") if isinstance(rec, dict) else None
+    if isinstance(value, str) and value != "all" and ID_PATTERN.match(value):
+        return value
+    return None
+
+
+def _unreadable(subsystem, rec, exc):
+    """A record that cannot be described is still reported, because the operator can reject it."""
+    record = rec if isinstance(rec, dict) else {}
+    ident, created, origin = record.get("id"), record.get("created_at"), record.get("origin")
+    return {
+        "id": ident if isinstance(ident, str) else "",
+        "subsystem": subsystem,
+        "action": "",
+        "origin": origin if isinstance(origin, str) else "unknown",
+        "summary": "unreadable pending record: {}: {}".format(type(exc).__name__, exc),
+        "created_at": created if isinstance(created, (int, float)) else 0,
+        "target": "memory",
+        "ops": [],
+        "preview": "(this record could not be read; reject it by id)",
+    }
+
+
 def _content_of(op):
     """MemoryStore writes 'new_text' on legacy patch records; both fields mean the same here."""
     return op.get("content") or op.get("new_text") or ""
@@ -117,11 +142,12 @@ def _walk(ops, working, budget):
         elif action in DESTRUCTIVE:
             if not old_text.strip():
                 status, detail = "CONFLICT", "{} requires old_text".format(action)
+            elif action != "remove" and not content.strip():
+                # Checked before the pin: a pinned entry must not turn an empty patch into a deletion.
+                status, detail = "CONFLICT", "{} requires content".format(action)
             elif idx is not None:
                 pass
-            elif action != "remove" and not content.strip():
-                status, detail = "CONFLICT", "{} requires content".format(action)
-            elif action != "remove" and content.strip() and content.strip() in [e.strip() for e in entries]:
+            elif action != "remove" and content.strip() in [e.strip() for e in entries]:
                 status, detail = "REDUNDANT_NOOP", "patched text already present"
             else:
                 ridx, ambiguous = _find_unique_match(entries, old_text.strip())
@@ -198,7 +224,9 @@ def _memory_preview(ops):
 
 
 def _describe(rec):
-    payload = rec.get("payload") or {}
+    payload = rec.get("payload")
+    if not isinstance(payload, dict):
+        raise ValueError("pending record has no payload object")
     subsystem = rec.get("subsystem") or "memory"
     item = {
         "id": rec.get("id"),
@@ -264,8 +292,39 @@ def op_pending(request):
         for rec in wa.list_pending(subsystem):
             if only_id and rec.get("id") != only_id:
                 continue
-            records.append(_describe(rec))
+            try:
+                records.append(_describe(rec))
+            except Exception as exc:  # one unreadable record must not fail the whole listing
+                records.append(_unreadable(subsystem, rec, exc))
     return {"subsystem": requested, "count": len(records), "records": records}
+
+
+def _diagnose_one(store, subsystem, rec):
+    payload = rec.get("payload")
+    if not isinstance(payload, dict):
+        raise ValueError("pending record has no payload object")
+    target = payload.get("target") or "memory"
+    item = {
+        "id": rec.get("id"),
+        "subsystem": subsystem,
+        "origin": rec.get("origin"),
+        "summary": rec.get("summary"),
+        "created_at": rec.get("created_at"),
+        "target": target,
+        "ops": [],
+    }
+    if subsystem != "memory":
+        item["note"] = "skill records are classified by their diff; approve or reject directly"
+        return item, []
+    # Fresh per record: each one is judged against live state, not against a copy mutated by
+    # an earlier record.
+    entries, limit = _entries_and_limit(store, target)
+    if entries is None:
+        item["note"] = "unknown target '{}'; record is not approvable".format(target)
+        return item, []
+    ops = _classify_ops(_ops(payload), entries, limit)
+    item["ops"] = ops
+    return item, [result["status"] for result in ops]
 
 
 def _diagnose_records(store, subsystem, only_id):
@@ -275,33 +334,15 @@ def _diagnose_records(store, subsystem, only_id):
     for rec in wa.list_pending(subsystem):
         if only_id and rec.get("id") != only_id:
             continue
-        payload = rec.get("payload") or {}
-        target = payload.get("target") or "memory"
-        item = {
-            "id": rec.get("id"),
-            "subsystem": subsystem,
-            "origin": rec.get("origin"),
-            "summary": rec.get("summary"),
-            "created_at": rec.get("created_at"),
-            "target": target,
-            "ops": [],
-        }
-        if subsystem == "memory":
-            # Fresh per record: each one is judged against live state, not against a copy
-            # mutated by an earlier record.
-            entries, limit = _entries_and_limit(store, target)
-            if entries is None:
-                item["ops"] = []
-                item["note"] = "unknown target '{}'; record is not approvable".format(target)
-                records.append(item)
-                continue
-            ops = _classify_ops(_ops(payload), entries, limit)
-            item["ops"] = ops
-            for result in ops:
-                counts[result["status"]] = counts.get(result["status"], 0) + 1
-        else:
-            item["note"] = "skill records are classified by their diff; approve or reject directly"
+        try:
+            item, statuses = _diagnose_one(store, subsystem, rec)
+        except Exception as exc:  # one unreadable record must not fail the whole diagnosis
+            item, statuses = _unreadable(subsystem, rec, exc), []
+            item.pop("preview")
+            item["note"] = "unreadable record; reject it by id"
         records.append(item)
+        for status in statuses:
+            counts[status] = counts.get(status, 0) + 1
 
     usage = {}
     for target in limits:
@@ -333,7 +374,20 @@ def op_salvage(request):
     for rec in wa.list_pending("memory"):
         if target_id != "all" and rec.get("id") != target_id:
             continue
-        payload = rec.get("payload") or {}
+        record_id = _safe_record_id(rec)
+        if record_id is None:
+            outcomes.append({
+                "id": rec.get("id") if isinstance(rec.get("id"), str) else "",
+                "outcome": "unchanged",
+                "kept": 0,
+                "dropped": 0,
+                "unresolvable_ops": [],
+                "message": "record id is not a bare token; the record was left in place",
+            })
+            continue
+        payload = rec.get("payload")
+        if not isinstance(payload, dict):
+            payload = {}
         target = payload.get("target") or "memory"
         entries, limit = _entries_and_limit(store, target)
         if entries is None:
@@ -362,7 +416,7 @@ def op_salvage(request):
                 kept.append(patched)
 
         if not kept and dropped:
-            wa.discard_pending("memory", rec["id"])
+            wa.discard_pending("memory", record_id)
             outcomes.append({
                 "id": rec.get("id"),
                 "outcome": "auto_pruned_redundant",
@@ -396,7 +450,7 @@ def op_salvage(request):
         if changed:
             updated = dict(rec)
             updated["payload"] = new_payload
-            atomic_json_write(wa._pending_path("memory", rec["id"]), updated)
+            atomic_json_write(wa._pending_path("memory", record_id), updated)
 
         outcomes.append({
             "id": rec.get("id"),
@@ -504,22 +558,31 @@ let scriptPathPromise: Promise<string> | null = null;
 
 /**
  * The script is written once per process into a private mkdtemp dir: a predictable shared name
- * would let any local user pre-create or read it.
+ * would let any local user pre-create or read it. A scratch cleaner can delete os.tmpdir() under a
+ * long-lived server, so a missing file is rebuilt instead of failing every call from then on.
  */
-const ensureScript = (): Promise<string> => {
-  if (!scriptPathPromise) {
-    scriptPathPromise = (async () => {
-      const dir = await fs.mkdtemp(path.join(os.tmpdir(), "hermes-worker-script-"));
-      const file = path.join(dir, "hermes_bridge.py");
-      await fs.writeFile(file, BRIDGE_SCRIPT, { encoding: "utf8", mode: 0o600 });
-      return file;
-    })();
-    // One transient failure must not be cached for the life of the process.
-    scriptPathPromise.catch(() => {
+const ensureScript = async (): Promise<string> => {
+  if (scriptPathPromise) {
+    try {
+      const existing = await scriptPathPromise;
+      await fs.access(existing);
+      return existing;
+    } catch {
       scriptPathPromise = null;
-    });
+    }
   }
-  return scriptPathPromise;
+  const created = (async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "hermes-worker-script-"));
+    const file = path.join(dir, "hermes_bridge.py");
+    await fs.writeFile(file, BRIDGE_SCRIPT, { encoding: "utf8", mode: 0o600 });
+    return file;
+  })();
+  scriptPathPromise = created;
+  // One transient failure must not be cached for the life of the process.
+  created.catch(() => {
+    if (scriptPathPromise === created) scriptPathPromise = null;
+  });
+  return created;
 };
 
 export const runBridge = async <T = unknown>(

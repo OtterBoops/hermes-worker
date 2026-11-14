@@ -226,8 +226,12 @@ export const createStreamFormatter = (): ((line: string) => string[]) => {
 
     const emitted: string[] = [];
     for (const entry of body) {
-      if (entry === "") continue;
       // Adjacency is the whole signal: the same read twice in a row says nothing the first did not.
+      if (entry === "") {
+        // A suppressed line still separates the lines around it, so it ends a duplicate run.
+        previousLine = null;
+        continue;
+      }
       if (entry === previousLine && entry.startsWith(TOOL_PREFIX)) continue;
       emitted.push(entry);
       previousLine = entry;

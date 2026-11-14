@@ -15,6 +15,15 @@ const call = (id, method, params) =>
     send({ jsonrpc: "2.0", id, method, params });
   });
 
+// A stray banner or log line on stdout must not kill the probe mid-handshake.
+const parse = (line) => {
+  try {
+    return JSON.parse(line);
+  } catch {
+    return null;
+  }
+};
+
 server.stdout.setEncoding("utf8");
 server.stdout.on("data", (chunk) => {
   buffer += chunk;
@@ -22,7 +31,8 @@ server.stdout.on("data", (chunk) => {
   buffer = lines.pop() ?? "";
   for (const line of lines) {
     if (!line.trim()) continue;
-    const message = JSON.parse(line);
+    const message = parse(line);
+    if (!message) continue;
     const resolve = pending.get(message.id);
     if (resolve) {
       pending.delete(message.id);
@@ -67,21 +77,21 @@ const sessions = await call(4, "tools/call", {
 const sessionPayload = JSON.parse(sessions.result?.content?.[0]?.text ?? "{}");
 console.log("sessions:", sessionPayload.sessions?.length, sessionPayload.sessions?.[0]?.title ?? "");
 
-const diagnosed = await call(6, "tools/call", {
+const diagnosed = await call(5, "tools/call", {
   name: "hermes_pending_writes",
   arguments: { action: "diagnose", subsystem: "memory" },
 });
 const diagnosis = JSON.parse(diagnosed.result?.content?.[0]?.text ?? "{}");
 console.log("diagnose:", diagnosis.records?.length ?? 0, "records", diagnosis.counts ?? {});
 
-const rejected = await call(5, "tools/call", {
+const rejected = await call(6, "tools/call", {
   name: "hermes_worktree_action",
   arguments: { action: "apply", cwd: process.argv[3], worktreeBranch: "hermes/agy-none" },
 });
 console.log("worktree guard:", rejected.result?.isError === true, JSON.parse(rejected.result?.content?.[0]?.text ?? "{}").success);
 
 clearTimeout(timeout);
-send({ jsonrpc: "2.0", id: 6, method: "shutdown" });
+send({ jsonrpc: "2.0", id: 7, method: "shutdown" });
 server.stdin.end();
 setTimeout(() => {
   server.kill();

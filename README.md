@@ -20,7 +20,7 @@ pnpm test          # node --test against tests/*.test.ts
 | `hermes_dispatch` | Run a task on Hermes inside a worktree branched from local `HEAD`. Supports `autoApply: true` to land clean verified diffs automatically. Returns the diff, session id, tool summary, DeepSeek reasoning and any staged memory writes. |
 | `hermes_pending_writes` | `list` / `preview` / `diagnose` / `salvage` / `approve` / `reject` against Hermes' `write_approval` queue. |
 | `hermes_inspect_memory` | `MEMORY.md` / `USER.md` contents, entry counts and character usage, gate state, queue depth. |
-| `hermes_worktree_action` | `apply` a run's diff with `git apply --3way`, or `discard` it. Either way the worktree and temporary branch are removed. |
+| `hermes_worktree_action` | `apply` a run's diff with `git apply --3way`, `discard` it, or `cancel` a live run (kills its process tree, then removes the worktree). `apply` and `discard` both remove the worktree and temporary branch. |
 | `hermes_prune_worktrees` | Sweep `.worktrees/agy-*` directories no running run owns, and prune git's worktree records. Leaves a running run's worktree and every branch untouched. |
 | `hermes_list_sessions` | Recent Hermes sessions, optionally scoped to a project path. |
 
@@ -41,10 +41,10 @@ pnpm test          # node --test against tests/*.test.ts
    --yolo --source cli --provider opencode-go --model deepseek-v4.1-flash --reasoning high`
    runs the turn on the shared gateway, so Desktop streams it live. Model, reasoning and provider
    are pinned defaults; the caller can override model/reasoning per dispatch.
-6. If cline pass is refused (quota exhausted), the dispatch fails closed: `success: false`,
+6. If the Go allowance is refused (quota exhausted), the dispatch fails closed: `success: false`,
    `modelFallback: true`, and a `warning` naming the fallback model. No diff is produced and no
-   worktree is kept for review — Antigravity never sees fallback-model output presented as cline
-   pass work.
+   worktree is kept for review — Antigravity never sees fallback-model output presented as work
+   from the pinned model.
 7. Modified files are checked against the guardrails. A violation destroys the worktree; an empty
    run cleans up after itself; when `autoApply: true` is set, clean diffs are applied to the working
    checkout immediately; otherwise the worktree is kept for review. An applied run returns no diff
@@ -90,11 +90,11 @@ table and one sentinel line:
 1 file(s) changed on hermes/agy-20261108234625-4u18 in 22.4s. Apply with hermes_worktree_action. [session: sess-1] [tokens: 140]
 ```
 
-The `opencode` and `agy_quota` rows come from probes that spend no model tokens: the opencode row
-reads the Go usage endpoint, and the key
-statuses in `$HERMES_HOME/auth.json`, and Antigravity's `RetrieveUserQuotaSummary` over loopback
-Connect-RPC (`ANTIGRAVITY_ENDPOINT_URL`/`ANTIGRAVITY_CSRF_TOKEN`, else the daemon's `hub_*.json`
-descriptor, else process discovery). Either row is omitted when the probe finds nothing.
+The `opencode` and `agy_quota` rows come from probes that spend no model tokens. The opencode row
+reads the Go usage endpoint, falling back to the key statuses in `$HERMES_HOME/auth.json`; the
+`agy_quota` row reads Antigravity's `RetrieveUserQuotaSummary` over loopback Connect-RPC
+(`ANTIGRAVITY_ENDPOINT_URL`/`ANTIGRAVITY_CSRF_TOKEN`, else the daemon's `hub_*.json` descriptor,
+else process discovery). Either row is omitted when the probe finds nothing.
 
 The sentinel is emitted on every path — success, failure, timeout and crash — so a caller can tail
 the command instead of guessing a timeout. `<<<HERMES_DISPATCH_FAILED:<runId>>>` replaces the
@@ -123,7 +123,8 @@ Add to `.gemini/config/mcp_config.json`:
 }
 ```
 
-`scripts/mcp-probe.mjs` performs a handshake, lists the tools and calls the read-only ones:
+`scripts/mcp-probe.mjs` performs a handshake, lists the tools, calls the read-only ones and checks
+that the worktree guard refuses a branch this bridge never created:
 
 ```bash
 node scripts/mcp-probe.mjs D:/Code/OtterBoops/hermes-worker/dist/index.js D:/Code/OtterBoops/hermes-worker

@@ -64,9 +64,10 @@ const isInside = (root: string, target: string): boolean => {
 
 /**
  * A colon in a repo-relative path is an NTFS alternate data stream (`file.txt:secret.txt`) or a
- * drive-relative path, and it defeats the patterns below: `.env:stream` is not `.env`.
+ * drive-relative path, and it defeats the patterns below: `.env:stream` is not `.env`. POSIX
+ * forbids nothing here, so a legitimate filename containing ':' must not be refused.
  */
-const hasAlternateDataStream = (relative: string): boolean => relative.includes(":");
+const hasAlternateDataStream = (relative: string): boolean => isWindows && relative.includes(":");
 
 const isMissing = (error: unknown): boolean => {
   const code = (error as NodeJS.ErrnoException).code;
@@ -82,8 +83,17 @@ const physicalEscape = (root: string, target: string, realRoot: string): boolean
   let current = root;
   for (const component of components) {
     current = path.join(current, component);
+    let isLink: boolean;
     try {
-      if (fs.lstatSync(current).isSymbolicLink()) return true;
+      isLink = fs.lstatSync(current).isSymbolicLink();
+    } catch (error) {
+      if (!isMissing(error)) return true;
+      break;
+    }
+    // A link is only an escape when what it resolves to leaves the worktree.
+    if (!isLink) continue;
+    try {
+      if (!isInside(realRoot, fs.realpathSync(current))) return true;
     } catch (error) {
       if (!isMissing(error)) return true;
     }

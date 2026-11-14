@@ -47,6 +47,13 @@ export const formatFailedSentinel = (runId: string): string =>
 /** A crashed dispatch never reaches clearRunState, so its files would otherwise stay in tmpdir forever. */
 const STALE_RUN_ENTRY = /\.(json|tmp|log)$/;
 
+/** Age is not evidence of death: a record whose worker pid still answers must survive every prune. */
+const holdsLiveWorker = (entry: string): boolean => {
+  if (!entry.endsWith(".json")) return false;
+  const state = readRunState(entry.slice(0, -".json".length));
+  return state !== null && state.status === "running" && isPidAlive(state.workerPid);
+};
+
 export const pruneStaleRuns = async (maxAgeMs: number = 24 * 60 * 60 * 1000): Promise<number> => {
   let entries: string[];
   try {
@@ -63,6 +70,7 @@ export const pruneStaleRuns = async (maxAgeMs: number = 24 * 60 * 60 * 1000): Pr
     try {
       const stat = await fsp.stat(target);
       if (!stat.isFile() || stat.mtimeMs > cutoff) continue;
+      if (holdsLiveWorker(entry)) continue;
       await fsp.unlink(target);
       removed += 1;
     } catch {
@@ -72,20 +80,48 @@ export const pruneStaleRuns = async (maxAgeMs: number = 24 * 60 * 60 * 1000): Pr
   return removed;
 };
 
+/** A Windows replace can be refused while another writer holds the target: retry, never lose the record. */
+const renameIntoPlace = async (temp: string, target: string): Promise<void> => {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      await fsp.rename(temp, target);
+      return;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (attempt >= 5 || (code !== "EPERM" && code !== "EBUSY" && code !== "EACCES")) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 5 * (attempt + 1)));
+    }
+  }
+};
+
 /** A rename is atomic on NTFS and POSIX alike, so a poller never reads a half-written record. */
 export const writeRunState = async (state: RunState): Promise<void> => {
   void pruneStaleRuns().catch(() => undefined);
   await fsp.mkdir(RUN_STATE_DIR, { recursive: true });
   const target = runStatePath(state.runId);
-  await fsp.writeFile(`${target}.tmp`, JSON.stringify(state), "utf8");
-  await fsp.rename(`${target}.tmp`, target);
+  // A shared temp name lets two writers interleave their bytes into one unparseable record.
+  const temp = `${target}.${process.pid}.${Math.random().toString(36).slice(2, 10)}.tmp`;
+  await fsp.writeFile(temp, JSON.stringify(state), "utf8");
+  try {
+    await renameIntoPlace(temp, target);
+  } catch (error) {
+    await fsp.rm(temp, { force: true }).catch(() => undefined);
+    throw error;
+  }
 };
 
 export const readRunState = (runId: string): RunState | null => {
   if (!RUN_ID_PATTERN.test(runId)) return null;
   try {
-    const parsed = JSON.parse(fs.readFileSync(runStatePath(runId), "utf8")) as RunState;
-    return parsed && typeof parsed === "object" && typeof parsed.status === "string" ? parsed : null;
+    const parsed = JSON.parse(fs.readFileSync(runStatePath(runId), "utf8")) as Partial<RunState> | null;
+    if (!parsed || typeof parsed !== "object") return null;
+    // Only the shape this module writes is a record: anything else crashes or misleads its readers.
+    if (parsed.status !== "running" && parsed.status !== "completed") return null;
+    if (parsed.runId !== runId) return null;
+    for (const field of ["sessionName", "worktreePath", "branch"] as const) {
+      if (parsed[field] !== undefined && typeof parsed[field] !== "string") return null;
+    }
+    return parsed as RunState;
   } catch {
     return null;
   }
@@ -144,7 +180,21 @@ export const listActiveRuns = (): RunState[] => {
 
 /** The log is part of the run's state: leaving it behind leaks a full transcript into tmpdir. */
 export const clearRunState = async (runId: string): Promise<void> => {
-  await fsp.rm(runStatePath(runId), { force: true });
-  await fsp.rm(`${runStatePath(runId)}.tmp`, { force: true });
+  // Unvalidated, the id would resolve outside the state dir and delete a file this module never wrote.
+  if (!RUN_ID_PATTERN.test(runId)) return;
+  const statePath = runStatePath(runId);
+  await fsp.rm(statePath, { force: true });
+  await fsp.rm(`${statePath}.tmp`, { force: true });
   await fsp.rm(runLogPath(runId), { force: true });
+  // Each write leaves its own temp name behind if its rename lost the race against this removal.
+  const prefix = `${runId}.json.`;
+  try {
+    for (const entry of await fsp.readdir(RUN_STATE_DIR)) {
+      if (entry.startsWith(prefix) && entry.endsWith(".tmp")) {
+        await fsp.rm(path.join(RUN_STATE_DIR, entry), { force: true });
+      }
+    }
+  } catch {
+    // No state directory left to sweep.
+  }
 };

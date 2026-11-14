@@ -1,12 +1,14 @@
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
-import { isWindows, killProcessTree, runGit } from "./exec.js";
+import { EXIT_GRACE_MS, isWindows, killProcessTree, runGit } from "./exec.js";
 import {
+  BLOCKED_DIRECTORY_SEGMENTS,
   BLOCKED_PATH_PATTERNS,
   injectWorkerBoundary,
   scanPromptForSecrets,
@@ -127,6 +129,8 @@ export type DispatchOutcome = DispatchResult | RunningDispatchResult;
 
 const MAX_DIFF_CHARS = 400_000;
 const BRANCH_PATTERN = /^hermes\/agy-[A-Za-z0-9_-]+$/;
+/** `Skipped patch 'x'` is git's refusal and always starts a line; a filename may contain the words. */
+const SKIPPED_PATCH = /^\s*Skipped patch/m;
 /** `.env` itself is secret, `.env.example` is the documented template. */
 const ENV_TEMPLATE = /^\.env\.(example|template)$/i;
 
@@ -642,6 +646,9 @@ const execHermes = (options: ExecHermesOptions): Promise<HermesRun> =>
     let stderrBuffer = "";
     let timedOut = false;
     let spawnError: string | null = null;
+    let settled = false;
+    let exitCode: number | null = null;
+    let graceTimer: NodeJS.Timeout | null = null;
     // The gateway writes gateway_runtime as turn 1 gets under way, so a single probe can land
     // before the row exists. A few bounded probes cover that window without polling forever.
     let fallbackProbes = 0;
@@ -708,8 +715,12 @@ const execHermes = (options: ExecHermesOptions): Promise<HermesRun> =>
       spawnError = error.message;
     });
 
-    child.on("close", (code: number | null) => {
+    const settle = (code: number | null): void => {
+      if (settled) return;
+      settled = true;
       clearTimeout(timer);
+      if (graceTimer !== null) clearTimeout(graceTimer);
+      graceTimer = null;
       if (buffer.trim()) {
         const previous = state.sessionId;
         ingestStreamLine(buffer, state);
@@ -717,7 +728,17 @@ const execHermes = (options: ExecHermesOptions): Promise<HermesRun> =>
         if (state.sessionId && state.sessionId !== previous) onSessionId?.(state.sessionId);
       }
       resolve({ state, timedOut, spawnError, stderr, code, childPid: child.pid ?? null, abortedFallback });
+    };
+
+    // A detached grandchild that inherited the pipes keeps 'close' from ever firing, so the run
+    // would outlive its own timeout: exit is the proof the child itself is done.
+    child.on("exit", (code: number | null) => {
+      exitCode = code;
+      if (settled) return;
+      graceTimer = setTimeout(() => settle(code), EXIT_GRACE_MS);
     });
+
+    child.on("close", (code: number | null) => settle(code ?? exitCode));
   });
 
 export interface GatewayRuntime {
@@ -773,6 +794,9 @@ export const readSessionAfterRun = (sessionId: string, repoRoot: string): Sessio
     fallbackActive: false,
     known: false,
   };
+  // Opening the store read-write creates it when it is absent, which hands the user an empty
+  // `state.db` that every later reader has to treat as present.
+  if (!fs.existsSync(stateDbPath())) return unknown;
   let db: DatabaseSync | null = null;
   try {
     db = new DatabaseSync(stateDbPath());
@@ -938,7 +962,21 @@ export const parseSessionIdLine = (line: string): string | null => {
   return match ? match[1] : null;
 };
 
-type HooksSnapshot = Map<string, number>;
+type HooksSnapshot = Map<string, string>;
+
+/**
+ * mtime alone misses a rewrite inside one tick and a rewrite that puts the mtime back, and this
+ * guard has to fail closed: the bytes are part of the key alongside the stat a hook cannot fake.
+ */
+const hookSignature = (absolute: string): string => {
+  try {
+    const stat = fs.statSync(absolute);
+    const digest = createHash("sha1").update(fs.readFileSync(absolute)).digest("hex");
+    return `${stat.mtimeMs}:${stat.size}:${digest}`;
+  } catch {
+    return "0";
+  }
+};
 
 const snapshotHooks = (hooksDir: string): HooksSnapshot => {
   const snapshot: HooksSnapshot = new Map();
@@ -957,11 +995,7 @@ const snapshotHooks = (hooksDir: string): HooksSnapshot => {
         walk(absolute, relative, depth + 1);
         continue;
       }
-      try {
-        snapshot.set(relative, fs.statSync(absolute).mtimeMs);
-      } catch {
-        snapshot.set(relative, 0);
-      }
+      snapshot.set(relative, hookSignature(absolute));
     }
   };
   walk(hooksDir, "", 0);
@@ -1000,8 +1034,18 @@ const secretViolations = (porcelain: string, alreadyBlocked: Set<string>): strin
     const code = entry.slice(0, 2);
     const file = entry.slice(3);
     if (!file) continue;
-    if (ENV_TEMPLATE.test(file)) continue;
-    if (!BLOCKED_PATH_PATTERNS.some((pattern) => pattern.test(file.replace(/\\/g, "/")))) continue;
+    const posix = file.replace(/\\/g, "/");
+    const segments = posix.split("/").filter(Boolean);
+    // An ignored directory is listed as the directory alone, so every segment of it is a directory.
+    const directories = posix.endsWith("/") ? segments : segments.slice(0, -1);
+    // The same precedence validateModifiedFiles uses: a blocked directory wins over the exemption.
+    const blockedDirectory = BLOCKED_DIRECTORY_SEGMENTS.some((pattern) =>
+      directories.some((directory) => pattern.test(directory)),
+    );
+    if (!blockedDirectory) {
+      if (ENV_TEMPLATE.test(file)) continue;
+      if (!BLOCKED_PATH_PATTERNS.some((pattern) => pattern.test(posix))) continue;
+    }
     // `!!` is ignored: an excluded .env never reaches the diff, so it has to be named here.
     violations.add(code === "!!" ? `ignored secret file: ${file}` : file);
   }
@@ -1018,6 +1062,9 @@ const isBlockedBaselinePath = (relative: string): boolean => {
   const posix = relative.replace(/\\/g, "/");
   const segments = posix.split("/").filter(Boolean);
   if (segments.some((segment) => BASELINE_SKIP_SEGMENTS.has(segment))) return true;
+  // A blocked directory is blocked whole: the name patterns alone miss `.env/local`.
+  const directories = segments.slice(0, -1);
+  if (BLOCKED_DIRECTORY_SEGMENTS.some((pattern) => directories.some((dir) => pattern.test(dir)))) return true;
   const base = segments[segments.length - 1] ?? "";
   if (ENV_TEMPLATE.test(base)) return false;
   return BLOCKED_PATH_PATTERNS.some((pattern) => pattern.test(posix));
@@ -1096,7 +1143,7 @@ export const snapshotCallerWorkingTree = async (
         await fsp.writeFile(patchFile, diff.stdout, "utf8");
         // `--3way` is wrong here: the worktree is branched from HEAD, so the patch is exact.
         const applied = await runGit(worktreePath, ["apply", "--binary", "--whitespace=nowarn", patchFile]);
-        if (!applied.ok || /Skipped patch/i.test(`${applied.stdout}${applied.stderr}`)) {
+        if (!applied.ok || SKIPPED_PATCH.test(`${applied.stdout}${applied.stderr}`)) {
           throw new Error(
             `git apply of the caller's tracked changes failed: ${(applied.stderr || applied.stdout).trim()}`,
           );
@@ -1108,7 +1155,6 @@ export const snapshotCallerWorkingTree = async (
   }
 
   const skippedUntracked: string[] = [];
-  let ported = trackedAllowed.length;
   for (const file of untracked) {
     if (isBlockedBaselinePath(file)) {
       skippedUntracked.push(file);
@@ -1125,19 +1171,33 @@ export const snapshotCallerWorkingTree = async (
       }
       await fsp.mkdir(path.dirname(target), { recursive: true });
       await fsp.copyFile(source, target);
-      ported += 1;
     } catch {
       skippedUntracked.push(file);
     }
   }
   skipped.push(...skippedUntracked);
 
-  if (ported === 0) return { baseSha: headSha, ported: 0, skipped };
-
   const staged = await runGit(worktreePath, ["add", "-A"]);
   if (!staged.ok) {
     throw new Error(`git add -A failed in the worktree: ${(staged.stderr || staged.stdout).trim()}`);
   }
+  // Counted from the index, not the status list: an edit that lives only in the caller's index
+  // writes no bytes here, and counting it also committed an empty baseline.
+  const portedNames = await runGit(worktreePath, [
+    "-c",
+    "core.quotePath=false",
+    "diff",
+    "--cached",
+    "--name-only",
+    "-z",
+    "HEAD",
+  ]);
+  if (!portedNames.ok) {
+    throw new Error(`git diff --cached failed in the worktree: ${(portedNames.stderr || portedNames.stdout).trim()}`);
+  }
+  const ported = splitNul(portedNames.stdout).length;
+  if (ported === 0) return { baseSha: headSha, ported: 0, skipped };
+
   const committed = await runGit(worktreePath, [
     "commit",
     "-m",
@@ -1557,7 +1617,12 @@ export const dispatchHermesTask = async (options: DispatchOptions): Promise<Disp
   // record and resurrect a finished run.
   let stateQueue: Promise<void> = Promise.resolve();
   const publish = (state: RunState): Promise<void> => {
-    stateQueue = stateQueue.then(() => writeRunState(state).catch(() => undefined));
+    stateQueue = stateQueue.then(async () => {
+      // One-way: a cancel settles the record from another process, and a queued `running` write
+      // landing afterwards would restore a run whose worktree that cancel already deleted.
+      if (state.status === "running" && readRunState(runId)?.status === "completed") return;
+      await writeRunState(state).catch(() => undefined);
+    });
     return stateQueue;
   };
 
@@ -1620,8 +1685,9 @@ export const dispatchHermesTask = async (options: DispatchOptions): Promise<Disp
     }
     settled.status = "completed";
     // A cancelled run already has its terminal record, and the waiter that wrote it owns it: writing
-    // again would resurrect a file that the waiter has just consumed.
-    if (!settled.cancelled) {
+    // again would replace a file the waiter has just consumed. Anything else still settles the run,
+    // because a record left at `running` keeps a waiter polling a process that has already finished.
+    if (!isRunCancelled(runId)) {
       await publish({
         ...runningState(),
         status: "completed",
@@ -1668,7 +1734,7 @@ export const manageWorktree = async (options: {
   worktreeBranch: string;
   /** The run that is itself calling this after finishing; its state file still says `running`. */
   activeRunId?: string;
-}): Promise<{ success: boolean; message: string; patchPath?: string }> => {
+}): Promise<{ success: boolean; message: string; patchPath?: string; violations?: string[] }> => {
   // Anything else is a user branch: `branch -D` on it would destroy work this bridge never made.
   const branchMatch = options.worktreeBranch.match(/^hermes\/agy-([A-Za-z0-9_-]+)$/);
   if (!branchMatch) {
@@ -1837,6 +1903,8 @@ export const manageWorktree = async (options: {
     const cleanupError = await cleanup();
     return {
       success: false,
+      // The paths travel as a list: a caller re-splitting the message breaks on a name with ', '.
+      violations,
       message:
         `Refused to apply '${options.worktreeBranch}': ${violations.join(", ")}. ` +
         (cleanupError
@@ -1875,11 +1943,12 @@ export const manageWorktree = async (options: {
   // has uncommitted/unstaged edits in any of the patched files. Try `--3way` first; if rejected by
   // the index mismatch, fall back to applying directly to the working tree.
   let applied = await runGit(repoRoot, ["apply", "--3way", "--binary", patchPath]);
+  const threeWay = applied.ok;
   if (!applied.ok && /does not match index/i.test(`${applied.stdout}${applied.stderr}`)) {
     applied = await runGit(repoRoot, ["apply", "--binary", patchPath]);
   }
   // A skipped hunk still exits 0: `Skipped patch 'x'` on either stream is a refusal, not a success.
-  if (!applied.ok || /Skipped patch/i.test(`${applied.stdout}${applied.stderr}`)) {
+  if (!applied.ok || SKIPPED_PATCH.test(`${applied.stdout}${applied.stderr}`)) {
     return {
       success: false,
       message:
@@ -1887,6 +1956,11 @@ export const manageWorktree = async (options: {
         `The patch is at ${patchPath} and the worktree was kept.`,
       patchPath,
     };
+  }
+  // `--index` staged what the plain path leaves alone, so the same apply would sometimes hand the
+  // caller a staged index. The run lands in the working tree either way.
+  if (threeWay && modifiedFiles.length > 0) {
+    await runGit(repoRoot, ["reset", "-q", "--", ...modifiedFiles.map((file) => `:(literal)${file}`)]);
   }
 
   const cleanupError = await cleanup();
@@ -1917,16 +1991,20 @@ export const listHermesSessions = (options: { cwd?: string; limit?: number } = {
   const dbPath = stateDbPath();
   if (!fs.existsSync(dbPath)) return [];
   const limit = Math.min(Math.max(options.limit ?? 25, 1), 200);
-  const db = new DatabaseSync(dbPath, { readOnly: true });
+  let db: DatabaseSync | null = null;
   try {
+    db = new DatabaseSync(dbPath, { readOnly: true });
     const columns = "id, title, model, started_at, message_count, tool_call_count, cwd";
     if (options.cwd) {
       const root = path.resolve(options.cwd).replace(/[\\/]+$/, "");
       const prefix = `${escapeLike(root + path.sep)}%`;
+      // A path is case-insensitive where the filesystem is, so `= ?` alone hides a session
+      // anchored at the same repository in another case.
+      const equality = (column: string): string => (isWindows ? `lower(${column}) = lower(?)` : `${column} = ?`);
       const rows = db
         .prepare(
           `SELECT ${columns} FROM sessions
-            WHERE cwd = ? OR cwd LIKE ? ESCAPE '\\' OR git_repo_root = ? OR git_repo_root LIKE ? ESCAPE '\\'
+            WHERE ${equality("cwd")} OR cwd LIKE ? ESCAPE '\\' OR ${equality("git_repo_root")} OR git_repo_root LIKE ? ESCAPE '\\'
             ORDER BY started_at DESC LIMIT ?`,
         )
         .all(root, prefix, root, prefix, limit) as unknown as SessionSummaryRow[];
@@ -1935,7 +2013,10 @@ export const listHermesSessions = (options: { cwd?: string; limit?: number } = {
     return db
       .prepare(`SELECT ${columns} FROM sessions ORDER BY started_at DESC LIMIT ?`)
       .all(limit) as unknown as SessionSummaryRow[];
+  } catch (error) {
+    // A locked or corrupt store is the caller's to act on, and a bare sqlite error is not: name it.
+    throw new Error(`Could not read Hermes sessions from ${dbPath}: ${errorMessage(error)}`);
   } finally {
-    db.close();
+    db?.close();
   }
 };

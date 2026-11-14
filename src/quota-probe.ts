@@ -195,11 +195,14 @@ const parseQuotaBody = (payload: unknown): QuotaBucket[] | null => {
       if (!isRecord(bucket)) continue;
       const bucketId = asText(bucket.bucketId, "");
       if (!bucketId) continue;
+      // Not a number means "not measured", and rendering that as 0% would read as an empty quota.
+      const remainingFraction = bucket.remainingFraction;
+      if (typeof remainingFraction !== "number" || !Number.isFinite(remainingFraction)) continue;
       buckets.push({
         bucketId,
         group: name,
         window: asText(bucket.window, ""),
-        remainingFraction: asNumber(bucket.remainingFraction),
+        remainingFraction,
         resetTime: asNullableText(bucket.resetTime),
       });
     }
@@ -318,13 +321,17 @@ const discoverOnWindows = async (budgetMs: number): Promise<DiscoveredServer | n
 };
 
 const discoverOnPosix = async (budgetMs: number): Promise<DiscoveredServer | null> => {
+  const deadline = Date.now() + budgetMs;
   const listing = await run("pgrep", ["-af", "language_server"], { timeoutMs: budgetMs });
   const line = listing.stdout.split("\n").find((entry) => entry.includes("--csrf_token")) ?? "";
   const csrfToken = /--csrf_token[= ](\S+)/.exec(line)?.[1] ?? "";
   const pid = Number(/^(\d+)/.exec(line)?.[1] ?? 0);
   if (!csrfToken || pid <= 0) return null;
 
-  const sockets = await run("ss", ["-ltnp"], { timeoutMs: budgetMs });
+  // The socket listing shares the one budget: a second full timeout would double the caller's wait.
+  const left = deadline - Date.now();
+  if (left <= 0) return null;
+  const sockets = await run("ss", ["-ltnp"], { timeoutMs: left });
   const ports = sockets.stdout
     .split("\n")
     .filter((entry) => entry.includes(`pid=${pid}`))

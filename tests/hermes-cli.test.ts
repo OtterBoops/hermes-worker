@@ -6,7 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { spawn } from "node:child_process";
-import { run } from "../src/exec.js";
+import { isWindows, run } from "../src/exec.js";
 import type { DispatchResult } from "../src/hermes-cli.js";
 import {
   DEFAULT_FAST_WAIT_SECONDS,
@@ -285,14 +285,22 @@ const chatStub = (options: {
   writeUsage?: Record<string, unknown>;
   sleepMs?: number;
   emitToolCalls?: boolean;
+  /** Leaves a detached grandchild holding the inherited stream pipes, which keeps 'close' away. */
+  leakStdoutMs?: number;
+  /** Rewrites a hook before restoring its mtime: only the content changes. */
+  mutateHook?: boolean;
 }): string =>
   [
     'import fs from "node:fs";',
+    'import os from "node:os";',
     'import path from "node:path";',
+    'import { spawn } from "node:child_process";',
     `const SESSION_ID = ${JSON.stringify(options.sessionId)};`,
     `const WRITE_USAGE = ${JSON.stringify(options.writeUsage ?? null)};`,
     `const SLEEP_MS = ${options.sleepMs ?? 0};`,
     `const EMIT_TOOL_CALLS = ${options.emitToolCalls === true};`,
+    `const LEAK_MS = ${options.leakStdoutMs ?? 0};`,
+    `const MUTATE_HOOK = ${options.mutateHook === true};`,
     "const argv = process.argv.slice(2);",
     'const flag = (name) => { const i = argv.indexOf(name); return i === -1 ? undefined : argv[i + 1]; };',
     '// The ledger flag is top-level: argparse rejects it anywhere after the subcommand.',
@@ -303,6 +311,23 @@ const chatStub = (options: {
     'const usageFile = flag("--usage-file");',
     'fs.writeFileSync(path.join(process.cwd(), "auto-applied.ts"), "export const autoApplied = true;\\n");',
     'process.stderr.write("Session: " + SESSION_ID + "\\n");',
+    "// A detached grandchild inherits the pipe handles: 'close' on this child can never fire.",
+    "if (LEAK_MS > 0) {",
+    '  const leaked = spawn(process.execPath, ["-e", "setTimeout(() => {}, " + LEAK_MS + ")"], {',
+    '    stdio: "inherit", detached: true, windowsHide: true, cwd: os.tmpdir(),',
+    "  });",
+    "  leaked.unref();",
+    '  if (process.env.HCLI_LEAK_PID_FILE) {',
+    "    fs.writeFileSync(process.env.HCLI_LEAK_PID_FILE, String(leaked.pid));",
+    "  }",
+    "}",
+    "// Same mtime, different bytes: only a content hash can see this rewrite.",
+    "if (MUTATE_HOOK && process.env.HCLI_HOOK_FILE) {",
+    "  const hookFile = process.env.HCLI_HOOK_FILE;",
+    "  const before = fs.statSync(hookFile);",
+    '  fs.writeFileSync(hookFile, "#!/bin/sh\\necho pwned\\n");',
+    "  fs.utimesSync(hookFile, before.atime, before.mtime);",
+    "}",
     `if (SLEEP_MS > 0) await new Promise((resolve) => setTimeout(resolve, SLEEP_MS));`,
     "if (usageFile) {",
     "  fs.writeFileSync(",
@@ -334,6 +359,8 @@ const makeDispatchRepo = async (
     sleepMs?: number;
     fallbackActive?: boolean;
     emitToolCalls?: boolean;
+    leakStdoutMs?: number;
+    mutateHook?: boolean;
   } = {},
 ): Promise<{ repo: string; home: string }> => {
   const repo = fs.mkdtempSync(path.join(os.tmpdir(), "hermes-worker-dispatch-"));
@@ -358,6 +385,8 @@ const makeDispatchRepo = async (
       sleepMs: options.sleepMs,
       writeUsage: options.usage ?? undefined,
       emitToolCalls: options.emitToolCalls,
+      leakStdoutMs: options.leakStdoutMs,
+      mutateHook: options.mutateHook,
     }),
     "utf8",
   );
@@ -2140,4 +2169,312 @@ test("the sandboxed env overrides the caller's hooksPath without touching the re
 
   // The repository setting is untouched: the override dies with the child process.
   assert.equal((await git(repo, ["config", "--local", "--get", "core.hooksPath"])).trim(), ".husky");
+});
+
+/**
+ * 'close' waits for every holder of the child's stdout/stderr pipes, so a detached grandchild that
+ * inherited them can keep it away forever. The exit event is the only proof the run itself is over.
+ */
+test("a run whose child leaves a grandchild on the stream still settles", async (t) => {
+  const runId = `leak-${process.pid}-${Date.now().toString(36)}`;
+  const pidFile = path.join(os.tmpdir(), `hermes-worker-leak-${runId}.pid`);
+  const previousPidFile = process.env.HCLI_LEAK_PID_FILE;
+  process.env.HCLI_LEAK_PID_FILE = pidFile;
+  t.after(() => {
+    if (previousPidFile === undefined) delete process.env.HCLI_LEAK_PID_FILE;
+    else process.env.HCLI_LEAK_PID_FILE = previousPidFile;
+    try {
+      const pid = Number(fs.readFileSync(pidFile, "utf8").trim());
+      if (Number.isFinite(pid) && pid > 0) process.kill(pid, "SIGKILL");
+    } catch {
+      // already gone
+    }
+    fs.rmSync(pidFile, { force: true });
+  });
+  const { repo } = await makeDispatchRepo(t, { leakStdoutMs: 25_000 });
+
+  const startedAt = Date.now();
+  const result = (await dispatchHermesTask({
+    cwd: repo,
+    prompt: "Add auto-applied.ts to the repository root.",
+    runId,
+    fastWaitSeconds: 120,
+  })) as DispatchResult;
+  const elapsed = Date.now() - startedAt;
+
+  assert.equal(result.success, true, result.message);
+  assert.equal(result.worktreeKept, true);
+  assert.ok(elapsed < 12_000, `the dispatch waited out the leaked stream handle (${elapsed}ms)`);
+});
+
+/**
+ * A cancellation is a terminal record written from another process, so the dispatcher reads it
+ * rather than remembering it. A `running` record queued before that write must not land after it:
+ * the pipeline would then diff a worktree the cancel is deleting.
+ */
+test("a cancelled record is never downgraded by a late running publish", async (t) => {
+  const runId = `downgrade-${process.pid}-${Date.now().toString(36)}`;
+  const { repo } = await makeDispatchRepo(t, { sleepMs: 6_000 });
+  const branch = `hermes/agy-${runId}`;
+  t.after(() => clearRunState(runId));
+
+  // What manageWorktree('cancel') writes: the run is settled from outside the dispatcher.
+  const started = {
+    status: "running" as const,
+    runId,
+    sessionName: "s",
+    worktreePath: path.join(repo, ".worktrees", `agy-${runId}`),
+    branch,
+    startedAt: Date.now(),
+  };
+  const terminal = {
+    ...started,
+    status: "completed" as const,
+    result: { success: false, cancelled: true, message: "Cancelled: killed the run's process tree.", timedOut: false },
+  };
+  await writeRunState(started);
+
+  const realWriteFile = fsp.writeFile.bind(fsp);
+  const stateTarget = path.resolve(`${runStatePath(runId)}.tmp`);
+  const handle = mock.method(fsp, "writeFile", async (target: unknown, data: unknown, options?: unknown) => {
+    if (path.resolve(String(target)) === stateTarget && String(data).includes('"status":"running"')) {
+      await new Promise((resolve) => setTimeout(resolve, 1_500));
+    }
+    return realWriteFile(
+      target as Parameters<typeof fsp.writeFile>[0],
+      data as Parameters<typeof fsp.writeFile>[1],
+      options as Parameters<typeof fsp.writeFile>[2],
+    );
+  });
+  t.after(() => handle.mock.restore());
+
+  const dispatched = dispatchHermesTask({
+    cwd: repo,
+    prompt: "Add auto-applied.ts to the repository root.",
+    runId,
+    fastWaitSeconds: 0.2,
+  });
+  // The dispatch's own `running` writes are still queued when the cancel record lands.
+  await new Promise((resolve) => setTimeout(resolve, 1_000));
+  await writeRunState(terminal);
+
+  // Outlast the child, so the queued writes and the pipeline have both settled.
+  await new Promise((resolve) => setTimeout(resolve, 8_000));
+  const outcome = await dispatched;
+  assert.equal(outcome.runId, runId);
+
+  const after = readRunState(runId);
+  assert.equal(after?.status, "completed", "a terminal record must never be downgraded to running");
+  assert.equal(
+    (after?.result as { cancelled?: unknown } | undefined)?.cancelled,
+    true,
+    "the cancel verdict must survive the queued running write",
+  );
+});
+
+/**
+ * `git diff HEAD` compares the working tree, so an edit that lives only in the index produces no
+ * patch at all. Counting the status list instead claims files were ported that never left.
+ */
+test("an edit that lives only in the index ports nothing and makes no baseline commit", async (t) => {
+  const { repo, worktree } = await makeRepo(t);
+  const headSha = (await git(repo, ["rev-parse", "HEAD"])).trim();
+
+  fs.writeFileSync(path.join(repo, "README.md"), "# fixture\n\nstaged only\n", "utf8");
+  await git(repo, ["add", "README.md"]);
+  fs.writeFileSync(path.join(repo, "README.md"), "# fixture\n", "utf8");
+  assert.match(await git(repo, ["status", "--porcelain"]), /^MM README\.md$/m, "the fixture must be index-only");
+
+  const snapshot = await snapshotCallerWorkingTree(repo, worktree, headSha);
+  assert.equal(snapshot.ported, 0, "no file reached the worktree, so nothing was ported");
+  assert.equal(snapshot.baseSha, headSha, "an empty baseline commit must not be made");
+  assert.equal((await git(worktree, ["rev-parse", "HEAD"])).trim(), headSha);
+});
+
+test("a tracked deletion is ported into the baseline and counted once", async (t) => {
+  const { repo, worktree } = await makeRepo(t);
+  fs.writeFileSync(path.join(repo, "obsolete.ts"), "export const obsolete = 1;\n", "utf8");
+  await git(repo, ["add", "obsolete.ts"]);
+  await git(repo, ["commit", "-m", "track obsolete"]);
+  const headSha = (await git(repo, ["rev-parse", "HEAD"])).trim();
+  await git(worktree, ["reset", "--hard", headSha]);
+  fs.rmSync(path.join(repo, "obsolete.ts"));
+
+  const snapshot = await snapshotCallerWorkingTree(repo, worktree, headSha);
+  assert.equal(snapshot.ported, 1, `expected the deletion to count once, skipped: ${snapshot.skipped.join(", ")}`);
+  assert.equal(fs.existsSync(path.join(worktree, "obsolete.ts")), false, "the deletion must reach the worktree");
+  const tree = await git(worktree, ["ls-tree", "--name-only", snapshot.baseSha]);
+  assert.equal(tree.includes("obsolete.ts"), false, "the baseline commit must not carry the deleted file");
+  assert.equal(await git(worktree, ["status", "--porcelain"]), "");
+});
+
+/**
+ * BLOCKED_DIRECTORY_SEGMENTS is the guard that catches a blocked *directory*; the path patterns
+ * only catch a blocked name. Both the port and the apply have to agree with it.
+ */
+test("a file under a blocked directory is never ported into the baseline", async (t) => {
+  const { repo, worktree } = await makeRepo(t);
+  const headSha = (await git(repo, ["rev-parse", "HEAD"])).trim();
+
+  fs.mkdirSync(path.join(repo, ".env"), { recursive: true });
+  fs.writeFileSync(path.join(repo, ".env", "local"), "SECRET=do-not-copy\n", "utf8");
+  fs.writeFileSync(path.join(repo, "keep.ts"), "export const keep = 1;\n", "utf8");
+
+  const snapshot = await snapshotCallerWorkingTree(repo, worktree, headSha);
+  assert.ok(
+    snapshot.skipped.includes(".env/local"),
+    `expected .env/local to be skipped, got ${JSON.stringify(snapshot.skipped)}`,
+  );
+  assert.equal(fs.existsSync(path.join(worktree, ".env")), false, "a blocked directory must not travel");
+  assert.equal(fs.existsSync(path.join(worktree, "keep.ts")), true, "other files still travel");
+});
+
+test("an ignored secret directory blocks the apply", async (t) => {
+  const { repo, worktree, branch } = await makeRepo(t);
+  fs.appendFileSync(path.join(repo, ".git", "info", "exclude"), ".env/\n", "utf8");
+  fs.writeFileSync(path.join(worktree, "innocuous.ts"), "export const innocent = true;\n", "utf8");
+  fs.mkdirSync(path.join(worktree, ".env"), { recursive: true });
+  fs.writeFileSync(path.join(worktree, ".env", "local"), "TOKEN=please-do-not-land\n", "utf8");
+
+  const result = await manageWorktree({ action: "apply", cwd: repo, worktreeBranch: branch });
+  assert.equal(result.success, false, "a secret directory must block the apply");
+  assert.match(result.message, /Refused to apply/);
+  assert.match(result.message, /\.env/);
+  assert.equal(fs.existsSync(path.join(repo, ".env")), false);
+  assert.equal(fs.existsSync(path.join(repo, "innocuous.ts")), false);
+});
+
+/**
+ * `Skipped patch 'x'` is git reporting a refusal, and it only ever starts a line. A filename that
+ * happens to contain the words is not a refusal.
+ */
+test("a filename that mentions a skipped patch still applies", async (t) => {
+  const { repo, worktree, branch } = await makeRepo(t);
+  const named = "Skipped patch notes.md";
+  fs.writeFileSync(path.join(repo, named), "# notes\n", "utf8");
+  await git(repo, ["add", named]);
+  await git(repo, ["commit", "-m", "track the notes"]);
+  const headSha = (await git(repo, ["rev-parse", "HEAD"])).trim();
+  await git(worktree, ["reset", "--hard", headSha]);
+  fs.writeFileSync(path.join(worktree, named), "# notes\n\nhermes edit\n", "utf8");
+
+  const result = await manageWorktree({ action: "apply", cwd: repo, worktreeBranch: branch });
+  assert.equal(result.success, true, result.message);
+  assert.equal(fs.readFileSync(path.join(repo, named), "utf8"), "# notes\n\nhermes edit\n");
+});
+
+/**
+ * `git apply --3way` implies `--index`, so the merge path stages what the plain path leaves
+ * unstaged. The caller's index is theirs: an apply lands in the working tree either way.
+ */
+test("apply leaves the caller's index alone whichever git path it took", async (t) => {
+  const { repo, worktree, branch } = await makeRepo(t);
+  fs.writeFileSync(path.join(worktree, "README.md"), "# fixture\n\nhermes edit\n", "utf8");
+
+  const result = await manageWorktree({ action: "apply", cwd: repo, worktreeBranch: branch });
+  assert.equal(result.success, true, result.message);
+  const status = await git(repo, ["status", "--porcelain"]);
+  assert.match(status, /^ M README\.md$/m, `the applied file must stay unstaged, got:\n${status}`);
+});
+
+test("a corrupt session store fails with a named error instead of an opaque one", (t) => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "hermes-worker-home-"));
+  const previous = process.env.HERMES_HOME;
+  process.env.HERMES_HOME = home;
+  t.after(() => {
+    if (previous === undefined) delete process.env.HERMES_HOME;
+    else process.env.HERMES_HOME = previous;
+    fs.rmSync(home, { recursive: true, force: true });
+  });
+  fs.writeFileSync(path.join(home, "state.db"), "not a database", "utf8");
+
+  assert.throws(
+    () => listHermesSessions({ limit: 5 }),
+    /Could not read Hermes sessions from/,
+    "a store the bridge cannot read must name itself, not leak a sqlite error",
+  );
+});
+
+test("listHermesSessions matches a differently-cased cwd on a case-insensitive platform", (t) => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "hermes-worker-home-"));
+  const previous = process.env.HERMES_HOME;
+  process.env.HERMES_HOME = home;
+  t.after(() => {
+    if (previous === undefined) delete process.env.HERMES_HOME;
+    else process.env.HERMES_HOME = previous;
+    fs.rmSync(home, { recursive: true, force: true });
+  });
+
+  const db = new DatabaseSync(path.join(home, "state.db"));
+  db.exec(
+    `CREATE TABLE sessions (
+       id TEXT PRIMARY KEY, title TEXT, model TEXT, started_at INTEGER,
+       message_count INTEGER, tool_call_count INTEGER, cwd TEXT, git_repo_root TEXT
+     )`,
+  );
+  const root = path.join(home, "Proj");
+  db.prepare(
+    "INSERT INTO sessions (id, title, model, started_at, message_count, tool_call_count, cwd, git_repo_root) VALUES (?,?,?,?,?,?,?,?)",
+  ).run("cased", "t", "m", 1, 0, 0, root.toUpperCase(), null);
+  db.close();
+
+  const rows = listHermesSessions({ cwd: root, limit: 5 });
+  if (!isWindows) {
+    assert.deepEqual(rows.map((row) => row.id), [], "case is significant where the filesystem says so");
+    return;
+  }
+  assert.deepEqual(
+    rows.map((row) => row.id),
+    ["cased"],
+    "a session anchored at the same path in another case is the same repository",
+  );
+});
+
+test("probing a session does not create a session store that is not there", (t) => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "hermes-worker-home-"));
+  const previous = process.env.HERMES_HOME;
+  process.env.HERMES_HOME = home;
+  t.after(() => {
+    if (previous === undefined) delete process.env.HERMES_HOME;
+    else process.env.HERMES_HOME = previous;
+    fs.rmSync(home, { recursive: true, force: true });
+  });
+
+  const session = readSessionAfterRun("sess-missing", home);
+  assert.equal(session.known, false);
+  assert.equal(
+    fs.existsSync(path.join(home, "state.db")),
+    false,
+    "a read must not leave an empty store in the user's Hermes home",
+  );
+});
+
+/**
+ * A hook rewritten inside one mtime tick, or with its mtime restored, is a hook that changed: the
+ * mtime alone cannot see it, and this guard exists to fail closed.
+ */
+test("a hook rewritten with its mtime restored is still a security violation", async (t) => {
+  const runId = `hookhash-${process.pid}-${Date.now().toString(36)}`;
+  const { repo } = await makeDispatchRepo(t, { mutateHook: true });
+  const hookFile = path.join(repo, ".git", "hooks", "pre-commit");
+  fs.mkdirSync(path.dirname(hookFile), { recursive: true });
+  fs.writeFileSync(hookFile, "#!/bin/sh\nexit 0\n", "utf8");
+
+  const previousHook = process.env.HCLI_HOOK_FILE;
+  process.env.HCLI_HOOK_FILE = hookFile;
+  t.after(() => {
+    if (previousHook === undefined) delete process.env.HCLI_HOOK_FILE;
+    else process.env.HCLI_HOOK_FILE = previousHook;
+  });
+
+  const result = (await dispatchHermesTask({
+    cwd: repo,
+    prompt: "Add auto-applied.ts to the repository root.",
+    runId,
+    fastWaitSeconds: 120,
+  })) as DispatchResult;
+
+  assert.equal(result.securityViolation, true, `a content-only hook rewrite must be caught: ${result.message}`);
+  assert.match(result.message, /git hooks changed/);
+  assert.equal(await branchExists(repo, `hermes/agy-${runId}`), false, "a violation destroys the worktree");
 });

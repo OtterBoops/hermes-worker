@@ -6,7 +6,7 @@ import {
   antigravityConfigDir,
   antigravitySummariesDb,
   hermesAgentRoot,
-  hermesExe,
+  hermesCommand,
   hermesHome,
   projectsDbPath,
 } from "./hermes-paths.js";
@@ -61,8 +61,9 @@ export const fileUriToPath = (uri: string): string => {
   if (/^\/[a-z]:(\/|$)/i.test(rest)) rest = rest.slice(1);
   if (/^[a-z]:(\/|$)/i.test(rest)) {
     const drive = rest[0].toUpperCase();
-    const tail = rest.slice(2).replace(/\//g, "\\");
-    return `${drive}:${tail}`.replace(/\\+$/, "") || `${drive}:\\`;
+    const tail = rest.slice(2).replace(/\/+$/, "").replace(/\//g, "\\");
+    // `D:` alone is drive-relative (it means the shell's cwd on D:), so a bare drive must keep its root.
+    return tail ? `${drive}:${tail}` : `${drive}:\\`;
   }
   if (/^\/\//.test(rest)) return rest.replace(/\//g, "\\");
   return isWindows ? rest.replace(/\//g, "\\") : rest;
@@ -71,11 +72,16 @@ export const fileUriToPath = (uri: string): string => {
 /** Case- and separator-insensitive form used for every path comparison. */
 export const normalizeForCompare = (value: string): string => {
   const normal = isWindows ? value.replace(/\//g, "\\").toLowerCase() : value.replace(/\/+/g, "/");
-  return normal.replace(/[\\/]+$/, "");
+  const trimmed = normal.replace(/[\\/]+$/, "");
+  // A filesystem root must keep its separator, or "/" normalises to "" and stops being an ancestor.
+  return trimmed || normal;
 };
 
-const isAncestor = (folder: string, target: string): boolean =>
-  target === folder || target.startsWith(folder + (isWindows ? "\\" : "/"));
+export const isAncestor = (folder: string, target: string): boolean => {
+  if (target === folder) return true;
+  const prefix = /[\\/]$/.test(folder) ? folder : folder + (isWindows ? "\\" : "/");
+  return target.startsWith(prefix);
+};
 
 const readJson = (file: string): unknown => {
   try {
@@ -191,24 +197,52 @@ const slugify = (value: string): string =>
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-+|-+$/g, "")
-    .slice(0, 60);
+    .slice(0, 60)
+    // The cap can land on a separator, so the truncation must not leave a trailing hyphen behind.
+    .replace(/-+$/, "");
+
+/** Segment count, so a deeper workspace folder outranks one that is merely longer in characters. */
+const pathDepth = (folder: string): number =>
+  folder.split(/[\\/]+/).filter((segment) => segment.length > 0).length;
+
+/** The deepest folder of `project` that contains `target`, which is the most specific workspace match. */
+const deepestWorkspaceFolder = (project: AntigravityProject, target: string): string | undefined =>
+  project.folders
+    .filter((folder) => isAncestor(normalizeForCompare(folder), target))
+    .sort(
+      (a, b) =>
+        pathDepth(normalizeForCompare(b)) - pathDepth(normalizeForCompare(a)) ||
+        a.localeCompare(b),
+    )[0];
 
 const provisionHermesProject = async (name: string, repoRoot: string, slug: string): Promise<void> => {
-  const result = await run(hermesExe(), ["project", "create", name, repoRoot, "--slug", slug], {
-    cwd: repoRoot,
-    env: {
-      ...process.env,
-      HERMES_HOME: hermesHome(),
-      HERMES_AGENT_ROOT: hermesAgentRoot(),
+  // hermesCommand(), not hermesExe(): a script-shaped HERMES_BIN cannot be spawned as itself.
+  const command = hermesCommand();
+  const result = await run(
+    command.file,
+    [...command.prefixArgs, "project", "create", name, repoRoot, "--slug", slug],
+    {
+      cwd: repoRoot,
+      env: {
+        ...process.env,
+        HERMES_HOME: hermesHome(),
+        HERMES_AGENT_ROOT: hermesAgentRoot(),
+      },
+      timeoutMs: 120_000,
     },
-    timeoutMs: 120_000,
-  });
+  );
   if (result.code !== 0) {
     throw new Error(
       `hermes project create failed (${result.code}): ${(result.stderr || result.stdout).trim()}`,
     );
   }
 };
+
+/** Deepest folder wins; equal-length claims are ordered by id so the same store always answers the same. */
+const bestPathMatch = (projects: HermesProjectRow[], target: string): HermesProjectRow | undefined =>
+  projects
+    .filter((project) => isAncestor(project.path, target))
+    .sort((a, b) => b.path.length - a.path.length || a.id.localeCompare(b.id))[0];
 
 /** A subdirectory, worktree or bare cwd must still resolve to the repository it belongs to. */
 const gitToplevel = async (candidate: string): Promise<string> => {
@@ -247,19 +281,22 @@ export const resolveAntigravityProject = async (options: ResolveOptions = {}): P
   }
   if (!selected && cwd) {
     const normalCwd = normalizeForCompare(cwd);
-    const matching = projects
-      .filter((project) => project.folders.some((folder) => isAncestor(normalizeForCompare(folder), normalCwd)))
-      .sort((a, b) => {
-        const depth = (project: AntigravityProject): number =>
-          Math.max(...project.folders.map((folder) => folder.length));
-        return depth(b) - depth(a);
-      });
-    selected = matching[0] ?? null;
+    const ranked = projects
+      .map((project) => ({ project, folder: deepestWorkspaceFolder(project, normalCwd) ?? "" }))
+      .filter((entry) => entry.folder.length > 0)
+      // Most specific workspace first; the id makes an exact tie the same answer on every run.
+      .sort(
+        (a, b) =>
+          pathDepth(normalizeForCompare(b.folder)) - pathDepth(normalizeForCompare(a.folder)) ||
+          b.folder.length - a.folder.length ||
+          a.project.id.localeCompare(b.project.id),
+      );
+    selected = ranked[0]?.project ?? null;
   }
 
   // A worktree must branch from the repository root, never from the subdirectory the call came from.
-  const owningFolder = cwd
-    ? selected?.folders.find((folder) => isAncestor(normalizeForCompare(folder), normalizeForCompare(cwd)))
+  const owningFolder = cwd && selected
+    ? deepestWorkspaceFolder(selected, normalizeForCompare(cwd))
     : undefined;
   const candidate = owningFolder
     ? path.resolve(owningFolder)
@@ -275,9 +312,7 @@ export const resolveAntigravityProject = async (options: ResolveOptions = {}): P
   const hermesProjects = loadHermesProjects();
 
   // Path only: the same basename or slug in an unrelated directory is a different project.
-  const byPath = hermesProjects
-    .filter((project) => isAncestor(project.path, target))
-    .sort((a, b) => b.path.length - a.path.length)[0];
+  const byPath = bestPathMatch(hermesProjects, target);
 
   if (byPath) {
     return {
@@ -308,7 +343,7 @@ export const resolveAntigravityProject = async (options: ResolveOptions = {}): P
   const slug = slugify(projectName) || slugify(path.basename(repoRoot)) || "project";
   await provisionHermesProject(projectName, repoRoot, slug);
 
-  const created = loadHermesProjects().find((project) => isAncestor(project.path, target));
+  const created = bestPathMatch(loadHermesProjects(), target);
   if (!created) {
     throw new Error(`Provisioned Hermes project "${slug}" but could not find it in ${projectsDbPath()}.`);
   }

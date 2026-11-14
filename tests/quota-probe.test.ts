@@ -407,6 +407,88 @@ test("probeAntigravityQuota honours its budget when the server never answers", a
   assert.ok(elapsed < 2_000, `probe should give up near its budget, took ${elapsed}ms`);
 });
 
+test("a zero budget probes nothing at all", async (t) => {
+  const { hubDir } = sandbox(t);
+  const server = await startServer(t, () => {
+    // Reached only if the zero budget were ignored.
+  });
+
+  const startedAt = Date.now();
+  const quota = await probeAntigravityQuota({
+    hubDir,
+    endpointUrl: `http://127.0.0.1:${server.port}`,
+    csrfToken: "zero-budget-fixture",
+    timeoutMs: 0,
+  });
+
+  assert.equal(quota, null);
+  assert.equal(server.hits(), 0, "a zero budget must not reach the server");
+  assert.ok(Date.now() - startedAt < 1_000);
+});
+
+
+test("a bucket with no usable remainingFraction is dropped, not rendered as 0%", async (t) => {
+  const { hubDir } = sandbox(t);
+  const csrfToken = "unmeasured-bucket-fixture";
+  const buckets = [
+    { bucketId: "gemini-weekly", window: "weekly", remainingFraction: 0.82 },
+    { bucketId: "gemini-unknown", window: "weekly" },
+    { bucketId: "gemini-text", window: "weekly", remainingFraction: "0.5" },
+    { bucketId: "gemini-spent", window: "weekly", remainingFraction: 0 },
+  ];
+  const server = await startServer(t, (request, response) => {
+    if (request.headers["x-codeium-csrf-token"] !== csrfToken) {
+      response.writeHead(403).end();
+      return;
+    }
+    response
+      .writeHead(200, { "Content-Type": "application/json" })
+      .end(JSON.stringify({ response: { groups: [{ displayName: "Gemini Models", buckets }] } }));
+  });
+
+  const quota = await probeAntigravityQuota({
+    hubDir,
+    endpointUrl: `http://127.0.0.1:${server.port}`,
+    csrfToken,
+    timeoutMs: 2_000,
+  });
+
+  // A reported 0 is a real reading and survives; a missing or non-numeric one is not a reading at all.
+  assert.deepEqual(
+    quota?.buckets.map((entry) => [entry.bucketId, entry.remainingFraction]),
+    [
+      ["gemini-weekly", 0.82],
+      ["gemini-spent", 0],
+    ],
+  );
+  assert.equal(formatQuota(quota), `gemini-spent 0%${SEPARATOR}gemini-weekly 82%`);
+});
+
+test("a quota body whose every bucket is unmeasured reports no data", async (t) => {
+  const { hubDir } = sandbox(t);
+  const csrfToken = "all-unmeasured-fixture";
+  const server = await startServer(t, (_request, response) => {
+    response
+      .writeHead(200, { "Content-Type": "application/json" })
+      .end(
+        JSON.stringify({
+          response: {
+            groups: [{ displayName: "Gemini Models", buckets: [{ bucketId: "gemini-weekly", window: "weekly" }] }],
+          },
+        }),
+      );
+  });
+
+  // Below the discovery floor, so the host's own language server cannot answer for the fixture.
+  const quota = await probeAntigravityQuota({
+    hubDir,
+    endpointUrl: `http://127.0.0.1:${server.port}`,
+    csrfToken,
+    timeoutMs: 300,
+  });
+  assert.equal(quota, null);
+});
+
 
 const OPENCODE_USAGE = {
   usage: {
@@ -455,6 +537,14 @@ test("probeOpenCodeQuota reports no data rather than zeroes for a bad key or an 
 
   // No key at all must not reach the network.
   assert.equal(await probeOpenCodeQuota({ openCodeUrl: unauthorised, openCodeKey: "" }), null);
+});
+
+test("a zero timeout never waits for an OpenCode answer", async (t) => {
+  const url = await serveOnce(t, OPENCODE_USAGE);
+  const startedAt = Date.now();
+  const quota = await probeOpenCodeQuota({ openCodeUrl: url, openCodeKey: "oc_sk_test", timeoutMs: 0 });
+  assert.equal(quota, null);
+  assert.ok(Date.now() - startedAt < 1_000, "a zero budget must abort at once");
 });
 
 test("formatOpenCodeQuota leads with the tightest window and caps at two segments", () => {

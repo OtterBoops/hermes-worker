@@ -511,3 +511,94 @@ test("a corrupt pending record neither stalls collection nor appears in results"
   assert.deepEqual(none, []);
   assert.ok(quietElapsed < 1_500, `deadline must bound the wait (took ${quietElapsed}ms)`);
 });
+
+test("a legacy new_text record is collected with its real content", async (t) => {
+  const sandbox = await makeSandbox(t);
+  const before = snapshotPendingIds();
+  sandbox.write("leg77777", {
+    action: "batch",
+    target: "memory",
+    operations: [
+      {
+        action: "patch",
+        old_text: "self-hosted runner",
+        new_text: "legacy replaced span",
+        matched_entry: BETA,
+      },
+    ],
+  });
+
+  const created = await collectNewPendingWrites(before, 400);
+  assert.equal(created.length, 1);
+  assert.equal(
+    created[0].ops?.[0].content,
+    "legacy replaced span",
+    "new_text is the content of a legacy patch record",
+  );
+  assert.equal(created[0].ops?.[0].old_text, "self-hosted runner");
+});
+
+test("one malformed operation does not discard the whole staged record", async (t) => {
+  const sandbox = await makeSandbox(t);
+  const before = snapshotPendingIds();
+  sandbox.writeRaw(
+    "mix00001",
+    JSON.stringify({
+      id: "mix00001",
+      subsystem: "memory",
+      origin: "background_review",
+      summary: "record with a junk operation",
+      created_at: 1_700_000_900,
+      payload: {
+        action: "batch",
+        target: "memory",
+        operations: [{ action: "add", content: "Survivor entry." }, null, "not-an-operation", 7],
+      },
+    }),
+  );
+
+  const created = await collectNewPendingWrites(before, 400);
+  assert.equal(created.length, 1, "the record itself is readable");
+  assert.equal(created[0].ops?.length, 1, "only the well-formed operation survives");
+  assert.equal(created[0].ops?.[0].content, "Survivor entry.");
+});
+
+test("a net-budget batch approves even though one op alone would overflow", async (t) => {
+  const sandbox = await makeSandbox(t, {
+    entries: [nearEntry, staleEntry],
+    limits: { memory: NET_BUDGET_LIMIT, user: 100 },
+  });
+  seedNetBudgetRecord(sandbox);
+
+  const approved = await managePendingWrites({ action: "approve", subsystem: "memory", id: "fed77777" });
+  assert.ok("output" in approved);
+  assert.match(approved.output, /Approved 1 memory write/);
+
+  const memory = fs.readFileSync(sandbox.memoryFile, "utf8");
+  assert.ok(memory.includes(freshEntry), "the added entry landed");
+  assert.equal(memory.includes(staleEntry), false, "the stale entry was removed");
+  assert.ok(memory.length <= NET_BUDGET_LIMIT, `final state must fit the limit (${memory.length})`);
+});
+
+test("a destructive op without content is a CONFLICT even when it is pinned", async (t) => {
+  const sandbox = await makeSandbox(t);
+  sandbox.write("noc00001", {
+    action: "batch",
+    target: "memory",
+    operations: [
+      // MemoryStore refuses an empty patch/new_content, so a pinned pin must not hide it.
+      { action: "patch", old_text: "self-hosted runner", matched_entry: BETA },
+      { action: "replace", old_text: "theme tokens", content: "   ", matched_entry: GAMMA },
+    ],
+  });
+
+  const diagnosis = (await managePendingWrites({
+    action: "diagnose",
+    subsystem: "memory",
+  })) as Extract<PendingWritesResult, { action: "diagnose" }> & Diagnosis;
+  const record = diagnosis.records.find((entry) => entry.id === "noc00001");
+  assert.ok(record);
+  assert.deepEqual(record.ops.map((op) => op.status), ["CONFLICT", "CONFLICT"]);
+  assert.equal(record.ops[0].detail, "patch requires content");
+  assert.equal(record.ops[1].detail, "replace requires content");
+});

@@ -316,3 +316,26 @@ test("a missing repoRoot falls back to lexical containment only", () => {
   assert.equal(validateModifiedFiles([path.join("src", "index.ts")], missingRoot).valid, true);
   assert.equal(validateModifiedFiles([path.join("..", "outside.ts")], missingRoot).valid, false);
 });
+
+test("a symlink that stays inside the worktree is not an escape", (t) => {
+  const inside = fs.mkdtempSync(path.join(os.tmpdir(), "hermes-guard-inner-link-"));
+  t.after(() => fs.rmSync(inside, { recursive: true, force: true }));
+  fs.mkdirSync(path.join(inside, "real"), { recursive: true });
+  fs.writeFileSync(path.join(inside, "real", "file.ts"), "export const x = 1;\n", "utf8");
+
+  const alias = path.join(inside, "alias");
+  if (!linkDirectory(path.join(inside, "real"), alias)) return;
+
+  assert.equal(
+    validateModifiedFiles([path.join("alias", "file.ts")], inside).valid,
+    true,
+    "a link whose target is inside the worktree must not be a violation",
+  );
+  assert.equal(validateModifiedFiles([path.join("alias", "new.ts")], inside).valid, true);
+});
+
+test("a colon is only an alternate-data-stream hazard on Windows", () => {
+  const verdict = validateModifiedFiles(["docs/notes:1.md"], repo);
+  // Windows forbids ':' in a filename, so it can only be an ADS or drive-relative escape there.
+  assert.equal(verdict.valid, process.platform !== "win32");
+});

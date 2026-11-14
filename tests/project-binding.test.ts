@@ -4,9 +4,10 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { run } from "../src/exec.js";
+import { isWindows, run } from "../src/exec.js";
 import {
   fileUriToPath,
+  isAncestor,
   normalizeForCompare,
   resolveAntigravityProject,
 } from "../src/project-binding.js";
@@ -88,6 +89,30 @@ test("a malformed percent-escape is an error, not a silently raw string", () => 
   assert.throws(() => fileUriToPath("file:///d%3A/bad%ZZ"), /percent-encoding/);
 });
 
+test("a drive-root workspace URI keeps the root separator instead of going drive-relative", () => {
+  // `D:` is the process's current directory on D:, not the root, so it must never come back bare.
+  assert.equal(fileUriToPath("file:///d:"), "D:\\");
+  assert.equal(fileUriToPath("file:///d:/"), "D:\\");
+  assert.equal(fileUriToPath("file:///d%3A"), "D:\\");
+  assert.equal(fileUriToPath("file:///d%3A/"), "D:\\");
+  if (isWindows) assert.equal(path.resolve(fileUriToPath("file:///d%3A")), path.resolve("D:\\"));
+});
+
+test("normalizeForCompare keeps a filesystem root, and the root is an ancestor of everything under it", () => {
+  const root = isWindows ? "\\" : "/";
+  const parent = isWindows ? "D:\\Code\\" : "/code/";
+  const child = isWindows ? "D:/Code/proj" : "/code/proj";
+  assert.equal(normalizeForCompare(root), root);
+  assert.equal(normalizeForCompare(parent), isWindows ? "d:\\code" : "/code");
+  assert.equal(isAncestor(normalizeForCompare(parent), normalizeForCompare(child)), true);
+  assert.equal(isAncestor(root, isWindows ? "\\code" : "/code"), true);
+  // A sibling that merely shares a prefix is not a child.
+  assert.equal(
+    isAncestor(normalizeForCompare(isWindows ? "D:\\alpha" : "/alpha"), normalizeForCompare(isWindows ? "D:\\alpha2" : "/alpha2")),
+    false,
+  );
+});
+
 /** Identity so git can commit inside a throwaway repository without a global config. */
 const GIT_IDENTITY = {
   ...process.env,
@@ -103,9 +128,10 @@ const git = async (cwd: string, args: string[]): Promise<void> => {
   if (result.code !== 0) throw new Error(`git ${args.join(" ")}: ${result.stderr || result.stdout}`);
 };
 
-/** A one-commit repository under the OS temp dir, so no real project can be involved. */
-const makeTempRepo = async (t: TestContext): Promise<string> => {
-  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "hermes-bind-repo-"));
+/** A one-commit repository under the OS temp dir (or at `at`), so no real project can be involved. */
+const makeTempRepo = async (t: TestContext, at?: string): Promise<string> => {
+  const repo = at ?? fs.mkdtempSync(path.join(os.tmpdir(), "hermes-bind-repo-"));
+  fs.mkdirSync(repo, { recursive: true });
   t.after(() => fs.rmSync(repo, { recursive: true, force: true }));
   await git(repo, ["init", "-b", "main"]);
   await git(repo, ["config", "core.autocrlf", "false"]);
@@ -319,4 +345,128 @@ test("without Antigravity evidence and without allowProvision nothing is created
   } finally {
     db.close();
   }
+});
+
+/** Antigravity writes the drive colon percent-encoded, so the fixture does too. */
+const folderUri = (folder: string): string =>
+  `file:///${folder.replace(/\\/g, "/").replace(":", "%3A")}`;
+
+const writeWorkspace = (configDir: string, name: string, folders: string[]): void => {
+  fs.mkdirSync(configDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(configDir, `${name}.json`),
+    JSON.stringify({
+      id: `ws-${name}`,
+      name,
+      projectResources: { resources: folders.map((folder) => ({ gitFolder: { folderUri: folderUri(folder) } })) },
+    }),
+    "utf8",
+  );
+};
+
+/** Antigravity's config dir hangs off the home directory, and os.homedir() follows these variables. */
+const withFakeHome = (t: TestContext): string => {
+  const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "hermes-bind-profile-")));
+  const previousProfile = process.env.USERPROFILE;
+  const previousHome = process.env.HOME;
+  process.env.USERPROFILE = home;
+  process.env.HOME = home;
+  t.after(() => {
+    if (previousProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = previousProfile;
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    fs.rmSync(home, { recursive: true, force: true });
+  });
+  return home;
+};
+
+test("the deepest matching workspace folder wins over a workspace with a longer folder name", async (t) => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "hermes-bind-ws-")));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const repoRoot = await makeTempRepo(t, path.join(root, "repo"));
+  const shallow = path.join(repoRoot, "a");
+  const deep = path.join(shallow, "b");
+  const cwd = path.join(deep, "src");
+  fs.mkdirSync(cwd, { recursive: true });
+
+  const configDir = path.join(withFakeHome(t), ".gemini", "config", "projects");
+  // `wide` only reaches the cwd through the shallow folder; its second folder is just longer.
+  writeWorkspace(configDir, "wide", [shallow, path.join(root, "z".repeat(80))]);
+  writeWorkspace(configDir, "narrow", [deep]);
+  makeTempHome(t, [{ id: "p_ws", slug: "ws", name: "Ws", folderPath: repoRoot }]);
+
+  const resolved = await resolveAntigravityProject({ cwd });
+  assert.equal(resolved.antigravityProjectName, "narrow", "the deeper folder is the specific workspace");
+  assert.equal(resolved.antigravityProjectId, "ws-narrow");
+  assert.equal(resolved.hermesProjectId, "p_ws");
+  assert.equal(normalizeForCompare(resolved.repoRoot), normalizeForCompare(repoRoot));
+});
+
+test("two projects claiming the same folder bind deterministically to the lower id", async (t) => {
+  const repoRoot = await makeTempRepo(t);
+  makeTempHome(t, [
+    { id: "p_zzz", slug: "zzz", name: "Zzz", folderPath: repoRoot },
+    { id: "p_aaa", slug: "aaa", name: "Aaa", folderPath: repoRoot },
+  ]);
+
+  const resolved = await resolveAntigravityProject({ cwd: repoRoot });
+  assert.equal(resolved.hermesProjectId, "p_aaa");
+});
+
+test("a slug truncated at 60 characters never ends in a separator", async (t) => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "hermes-bind-slug-")));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  // 59 characters then "-b": the cap lands exactly on the separator that replaces the hyphen.
+  const repoRoot = await makeTempRepo(t, path.join(root, `${"slug".padEnd(59, "a")}-b`));
+  makeTempHome(t, []);
+  installStub(t, repoRoot);
+
+  const resolved = await resolveAntigravityProject({ cwd: repoRoot, allowProvision: true });
+  assert.equal(resolved.provisioned, true);
+  assert.equal(resolved.hermesProjectSlug?.endsWith("-"), false);
+  assert.ok((resolved.hermesProjectSlug ?? "").length <= 60);
+});
+
+/** Same stand-in, reached as a script: node puts the bridge's argv at index 2. */
+const JS_STUB = [
+  'const fs = require("node:fs");',
+  'const path = require("node:path");',
+  'const { DatabaseSync } = require("node:sqlite");',
+  "const [command, sub, name, target, flag, slug] = process.argv.slice(2);",
+  'const record = { command, sub, name, target, flag, slug, cwd: process.cwd(), home: process.env.HERMES_HOME };',
+  'fs.writeFileSync(path.join(__dirname, "js-stub-ran.json"), JSON.stringify(record));',
+  'if (command !== "project" || sub !== "create" || flag !== "--slug" || !name || !slug) process.exit(5);',
+  'if (path.resolve(process.cwd()) !== path.resolve(target)) process.exit(3);',
+  'if (!record.home) process.exit(4);',
+  'const db = new DatabaseSync(path.join(record.home, "projects.db"));',
+  'db.prepare("INSERT INTO projects (id, slug, name, primary_path, archived) VALUES (?, ?, ?, ?, 0)").run("p_js", slug, name, target);',
+  'db.prepare("INSERT INTO project_folders (project_id, path) VALUES (?, ?)").run("p_js", target);',
+  "db.close();",
+].join("\n");
+
+test("provisioning runs a script-shaped HERMES_BIN through node", async (t) => {
+  const repoRoot = await makeTempRepo(t);
+  makeTempHome(t, []);
+  const bin = path.join(repoRoot, "hermes-entry.js");
+  fs.writeFileSync(bin, JS_STUB, "utf8");
+  const previousBin = process.env.HERMES_BIN;
+  t.after(() => {
+    if (previousBin === undefined) delete process.env.HERMES_BIN;
+    else process.env.HERMES_BIN = previousBin;
+  });
+  process.env.HERMES_BIN = bin;
+
+  const resolved = await resolveAntigravityProject({ cwd: repoRoot, allowProvision: true });
+  assert.equal(resolved.provisioned, true);
+  assert.equal(resolved.hermesProjectId, "p_js");
+
+  const record = JSON.parse(fs.readFileSync(path.join(repoRoot, "js-stub-ran.json"), "utf8")) as {
+    name: string;
+    target: string;
+    cwd: string;
+  };
+  assert.equal(record.name, path.basename(repoRoot));
+  assert.equal(normalizeForCompare(record.target), normalizeForCompare(repoRoot));
+  assert.equal(normalizeForCompare(record.cwd), normalizeForCompare(repoRoot), "create runs at the repo");
 });

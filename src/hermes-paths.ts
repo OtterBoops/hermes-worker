@@ -33,7 +33,8 @@ export const readHermesEnv = (name: string): string | null => {
     const eq = trimmed.indexOf("=");
     if (eq <= 0) continue;
     if (trimmed.slice(0, eq).trim() !== name) continue;
-    const value = trimmed.slice(eq + 1).trim().replace(/^["']|["']$/g, "");
+    // Only a matched pair is quoting: a stray quote is part of the value, not something to strip.
+    const value = trimmed.slice(eq + 1).trim().replace(/^(["'])(.*)\1$/, "$2");
     return value.length > 0 ? value : null;
   }
   return null;
@@ -46,13 +47,18 @@ export const hermesExe = (): string => {
 };
 
 /**
- * Windows cannot exec a `.js` entrypoint, and the shipped `hermes.cmd` wrapper is refused by
- * spawn without a shell, so a script-shaped HERMES_BIN (source checkout, test double) is handed to
- * the running node instead. An `.exe` bin is spawned as itself.
+ * Windows cannot exec a `.js` entrypoint, and a `.cmd`/`.bat` wrapper is refused by spawn without a
+ * shell, so a script-shaped HERMES_BIN goes through node or the command interpreter instead.
  */
 export const hermesCommand = (): { file: string; prefixArgs: string[] } => {
   const bin = hermesExe();
-  return /\.[cm]?js$/i.test(bin) ? { file: process.execPath, prefixArgs: [bin] } : { file: bin, prefixArgs: [] };
+  if (/\.[cm]?js$/i.test(bin)) return { file: process.execPath, prefixArgs: [bin] };
+  // spawn() refuses a batch file, so cmd.exe runs it; /c without /s keeps the quotes node adds
+  // around a path with spaces, which cmd /s would strip and split on.
+  if (isWindows && /\.(cmd|bat)$/i.test(bin)) {
+    return { file: process.env.ComSpec || "cmd.exe", prefixArgs: ["/d", "/c", bin] };
+  }
+  return { file: bin, prefixArgs: [] };
 };
 
 export const projectsDbPath = (): string => path.join(hermesHome(), "projects.db");

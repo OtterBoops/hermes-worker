@@ -29,6 +29,8 @@ export interface PendingOperation {
   action: string;
   old_text?: string | null;
   content?: string | null;
+  /** Legacy patch records carry the replacement text here instead of `content`. */
+  new_text?: string | null;
   matched_entry?: string | null;
   name?: string | null;
   file_path?: string | null;
@@ -107,13 +109,33 @@ export const snapshotPendingIds = (): { memory: Set<string>; skills: Set<string>
   skills: new Set(listPendingFiles("skills").map((file) => path.basename(file, ".json"))),
 });
 
+const textField = (record: Record<string, unknown>, key: string): string | null => {
+  const value = record[key];
+  return typeof value === "string" && value ? value : null;
+};
+
+/** One staged operation, or null for a malformed entry that must not take its whole record down. */
+const toOperation = (value: unknown): PendingOperation | null => {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const op = value as Record<string, unknown>;
+  return {
+    action: typeof op.action === "string" ? op.action : "",
+    old_text: textField(op, "old_text"),
+    // MemoryStore writes 'new_text' on legacy patch records; both fields mean the same text.
+    content: textField(op, "content") ?? textField(op, "new_text"),
+    matched_entry: textField(op, "matched_entry"),
+    name: textField(op, "name"),
+    file_path: textField(op, "file_path"),
+  };
+};
+
 const readRecord = (file: string): PendingRecord | null => {
   try {
     const raw = JSON.parse(fs.readFileSync(file, "utf8").replace(/^\uFEFF/, "")) as Record<string, unknown>;
     const payload = (raw.payload ?? {}) as Record<string, unknown>;
-    const operations = Array.isArray(payload.operations)
-      ? (payload.operations as PendingOperation[])
-      : [payload as unknown as PendingOperation];
+    const operations = (Array.isArray(payload.operations) ? payload.operations : [payload])
+      .map(toOperation)
+      .filter((op): op is PendingOperation => op !== null);
     return {
       id: String(raw.id ?? path.basename(file, ".json")),
       subsystem: String(raw.subsystem ?? path.basename(path.dirname(file))),
@@ -122,14 +144,7 @@ const readRecord = (file: string): PendingRecord | null => {
       summary: String(raw.summary ?? ""),
       created_at: Number(raw.created_at ?? 0),
       target: String(payload.target ?? "memory"),
-      ops: operations.map((op) => ({
-        action: String(op.action ?? ""),
-        old_text: (op.old_text as string | undefined) ?? null,
-        content: (op.content as string | undefined) ?? null,
-        matched_entry: (op.matched_entry as string | undefined) ?? null,
-        name: (op.name as string | undefined) ?? null,
-        file_path: (op.file_path as string | undefined) ?? null,
-      })),
+      ops: operations,
     };
   } catch {
     return null;

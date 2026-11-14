@@ -10,6 +10,7 @@ import {
   isRunAbandoned,
   readRunState,
   runLogPath,
+  runStatePath,
   type RunState,
 } from "./run-registry.js";
 
@@ -22,6 +23,8 @@ const DOT = "\u00b7";
 const PROBE_TIMEOUT_MS = 600;
 /** Hard ceiling on the quota wait: the report is the product, the pool is decoration. */
 const PROBE_BUDGET_MS = 700;
+/** The dispatcher publishes the record before it hands out waitCommand, so an absent one is a dead run. */
+const MISSING_RECORD_GRACE_MS = 3_000;
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -79,7 +82,8 @@ class LogTail {
 export interface Telemetry {
   runId: string;
   status: "SUCCESS" | "FAILED";
-  durationSeconds: string;
+  /** Null when nothing recorded a start: an absent duration omits the row rather than inventing one. */
+  durationSeconds: string | null;
   toolsCalled: number;
   subagentsSpawned: number;
   tokens: {
@@ -194,16 +198,30 @@ const readCost = (result: ResultShape | null): number | null => {
   );
 };
 
-const formatCost = (cost: number): string => cost.toFixed(6).replace(/0+$/, "").replace(/\.$/, "");
+const formatCost = (cost: number): string => {
+  const fixed = cost.toFixed(6).replace(/0+$/, "").replace(/\.$/, "");
+  // A real price under the sixth decimal must not round into a fabricated free run.
+  return fixed === "0" && cost > 0 ? cost.toExponential() : fixed;
+};
+
+/**
+ * An absent timing is no measurement: Date.now() - 0 would report 1.7 billion seconds as fact.
+ */
+const readDurationMs = (result: ResultShape | null, state: RunState | null): number | null => {
+  const reported = result?.durationMs;
+  if (typeof reported === "number" && Number.isFinite(reported) && reported >= 0) return reported;
+  const startedAt = asNumber(state?.startedAt);
+  return startedAt > 0 ? Math.max(0, Date.now() - startedAt) : null;
+};
 
 const buildTelemetry = (runId: string, state: RunState | null): Telemetry => {
   const result = (state?.result ?? null) as ResultShape | null;
   const success = result?.success === true && result?.timedOut !== true;
-  const durationMs = asNumber(result?.durationMs) || Math.max(0, Date.now() - asNumber(state?.startedAt));
+  const durationMs = readDurationMs(result, state);
   return {
     runId,
     status: success ? "SUCCESS" : "FAILED",
-    durationSeconds: (durationMs / 1000).toFixed(1),
+    durationSeconds: durationMs === null ? null : (durationMs / 1000).toFixed(1),
     toolsCalled: countToolCalls(result?.toolEvents, null),
     subagentsSpawned: countToolCalls(result?.toolEvents, "delegate_task"),
     tokens: readTokens(result?.tokens),
@@ -228,10 +246,16 @@ export const renderTelemetryTable = (telemetry: Telemetry): string[] => {
     "| field | value |",
     "| --- | --- |",
     row("run", telemetry.runId),
-    row("duration", `${telemetry.durationSeconds}s`),
+  ];
+
+  if (telemetry.durationSeconds !== null) {
+    lines.push(row("duration", `${telemetry.durationSeconds}s`));
+  }
+
+  lines.push(
     row("tools", String(telemetry.toolsCalled)),
     row("subagents", String(telemetry.subagentsSpawned)),
-  ];
+  );
 
   const model = asText(telemetry.model);
   const provider = asText(telemetry.provider);
@@ -405,7 +429,8 @@ const finish = async (runId: string, state: RunState): Promise<void> => {
   // Awaited, not fire-and-forget: the process exits as soon as this returns, and a pending rm
   // would leave the log and the state file behind.
   await clearRunState(runId).catch(() => undefined);
-  process.exitCode = result?.success === true ? 0 : 1;
+  // Derived from the same verdict the sentinel carries: two derivations let the exit code contradict it.
+  process.exitCode = telemetry.status === "SUCCESS" ? 0 : 1;
 };
 
 /** Callback half of a dispatch: tail the run live, then report it behind a sentinel. */
@@ -422,6 +447,7 @@ const main = async (): Promise<void> => {
 
   const tail = new LogTail(runLogPath(runId));
   const deadline = Date.now() + MAX_WAIT_MS;
+  let missingSince: number | null = null;
 
   for (;;) {
     const state = readRunState(runId);
@@ -432,6 +458,23 @@ const main = async (): Promise<void> => {
       tail.close();
       await finish(runId, state);
       return;
+    }
+
+    if (!state) {
+      missingSince ??= Date.now();
+      // A record is published before waitCommand exists, so a missing one is a dead run, not a slow one.
+      if (Date.now() - missingSince > MISSING_RECORD_GRACE_MS) {
+        tail.close();
+        await emitTelemetry(buildTelemetry(runId, null));
+        process.stdout.write(`${formatFailedSentinel(runId)}\n`);
+        process.stderr.write(
+          `wait: no run record for '${runId}' (${runStatePath(runId)}). The dispatcher writes it before the wait command is handed out, so the run id is wrong or the run never started.\n`,
+        );
+        process.exitCode = 1;
+        return;
+      }
+    } else {
+      missingSince = null;
     }
 
     // A dead worker is an immediate verdict: waiting out the deadline for a process that can never
