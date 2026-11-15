@@ -31,6 +31,10 @@ test("blocks secret stores and traversal, but not ordinary repo files", () => {
     "certs/server.key",
     ".gemini/config/mcp_config.json",
     "../outside.ts",
+    // Executable git machinery: a hook or config written here runs on the caller's next git call.
+    ".git/config",
+    ".git/hooks/pre-commit",
+    "sub/.git/config",
   ];
   for (const file of blocked) {
     const verdict = validateModifiedFiles([file], repo);
@@ -54,7 +58,7 @@ test("allows the documented templates and normal source files", () => {
   assert.equal(verdict.valid, true);
 });
 
-test("a traversal that stays inside the worktree is allowed", () => {
+test("a traversal that stays inside the repository is allowed", () => {
   const verdict = validateModifiedFiles(["src/../src/index.ts"], repo);
   assert.equal(verdict.valid, true);
 });
@@ -78,7 +82,7 @@ test("blocks Windows alternate data stream syntax", () => {
   assert.equal(ordinary.valid, true);
 });
 
-test("blocks absolute paths that resolve outside the worktree", () => {
+test("blocks absolute paths that resolve outside the repository", () => {
   const verdict = validateModifiedFiles(["D:\\Windows\\System32\\drivers\\etc\\hosts"], repo);
   assert.equal(verdict.valid, false);
   assert.deepEqual(verdict.violations, ["D:\\Windows\\System32\\drivers\\etc\\hosts"]);
@@ -168,9 +172,11 @@ test("injectWorkerBoundary is idempotent on an already-guarded prompt", () => {
   const guarded = injectWorkerBoundary(prompt);
   assert.equal(injectWorkerBoundary(guarded), guarded);
 
-  // Byte-identical when the marker only appears mid-text, with no boundary in front of it.
+  // A prompt that only names the block is not a guarded one: quoting the marker must not skip the
+  // contract.
   const midText = `Retry the failed job. Reuse the [WORKER OPERATIONAL BOUNDARY] block from the parent run.`;
-  assert.equal(injectWorkerBoundary(midText), midText);
+  assert.ok(injectWorkerBoundary(midText).startsWith("[WORKER OPERATIONAL BOUNDARY]\n- "));
+  assert.ok(injectWorkerBoundary(midText).endsWith(midText));
 
   // A double injection still carries exactly one boundary block.
   const twice = injectWorkerBoundary(injectWorkerBoundary(prompt));
@@ -187,12 +193,48 @@ test("injectWorkerBoundary tells the parent to integrate verified subagent resul
   );
 });
 
-test("WORKER_BOUNDARY confines the worker to its own worktree checkout", () => {
-  assert.ok(WORKER_BOUNDARY.includes("the active worktree checkout"));
-  assert.ok(WORKER_BOUNDARY.includes("must use relative paths within cwd"));
-  assert.ok(WORKER_BOUNDARY.includes("Never navigate up to, reference, or mutate files in the parent checkout"));
-  assert.ok(WORKER_BOUNDARY.includes("limit them strictly to system temp ($TMPDIR or os.tmpdir())"));
-  assert.ok(WORKER_BOUNDARY.includes("never touch or create files in $LOCALAPPDATA"));
+test("WORKER_BOUNDARY confines the worker to the repository checkout it runs in", () => {
+  assert.ok(
+    WORKER_BOUNDARY.includes(
+      "You are executing directly in the repository checkout that Antigravity has open, not in a copy of it",
+    ),
+    "the worker edits the checkout the user is looking at, not a copy of it",
+  );
+  assert.ok(
+    !/worktree/i.test(WORKER_BOUNDARY),
+    "a snapshot run edits the checkout itself, so the contract must not promise a worktree",
+  );
+  assert.ok(
+    WORKER_BOUNDARY.includes(
+      "Operate strictly within the current working directory (the repository root)",
+    ),
+  );
+  assert.ok(
+    WORKER_BOUNDARY.includes("All file reads, edits, and terminal commands must use relative paths within cwd"),
+  );
+  assert.ok(WORKER_BOUNDARY.includes("Never navigate up to, reference, or mutate files outside this repository"));
+  assert.ok(
+    WORKER_BOUNDARY.includes("limit them strictly to system temp ($TMPDIR or os.tmpdir())"),
+  );
+  assert.ok(
+    WORKER_BOUNDARY.includes(
+      "never touch or create files in $LOCALAPPDATA, user profile directories, or outside temp",
+    ),
+  );
+  assert.ok(
+    WORKER_BOUNDARY.includes("Leave your changes uncommitted in the checkout for Antigravity to review"),
+  );
+  assert.ok(
+    WORKER_BOUNDARY.includes(
+      "no git commit, no git push, no branch switching, and no `git checkout --`/`git reset` that would revert work you did not write yourself",
+    ),
+    "the run must leave a reviewable diff and must not revert the user's own work",
+  );
+  assert.ok(WORKER_BOUNDARY.includes("do not touch .env files, credentials, or remote infrastructure"));
+  assert.ok(
+    !WORKER_BOUNDARY.includes("the active worktree checkout"),
+    "the old worktree confinement wording must be gone",
+  );
 });
 
 test("a blocked directory beats the template allowlist", () => {
@@ -250,6 +292,8 @@ test("every new SECRET_PROBE fires on a synthetic token", () => {
     [`sk-or-v1-${"a".repeat(40)}`, "OpenRouter API key"],
     [`sk-ant-${"x".repeat(30)}`, "Anthropic API key"],
     [`sk-proj-${"x".repeat(30)}`, "OpenAI project key"],
+    [`sk-svcacct-${"x".repeat(30)}`, "OpenAI service account or admin key"],
+    [`sk-admin-${"x".repeat(30)}`, "OpenAI service account or admin key"],
     [`AKIA${"A".repeat(16)}`, "AWS access key id"],
     [`AIza${"x".repeat(35)}`, "Google API key"],
     [`xoxb-${"1".repeat(12)}-${"x".repeat(12)}`, "Slack token"],
@@ -273,7 +317,7 @@ test("the generic sk- probe never masks a provider-specific reason", () => {
   assert.ok(anthropic.reason?.includes("Anthropic"));
 });
 
-test("a junction or symlink inside the worktree cannot smuggle files out of it", (t) => {
+test("a junction or symlink inside the repository cannot smuggle files out of it", (t) => {
   const outside = fs.mkdtempSync(path.join(os.tmpdir(), "hermes-guard-outside-"));
   const inside = fs.mkdtempSync(path.join(os.tmpdir(), "hermes-guard-inside-"));
   t.after(() => {
@@ -286,7 +330,7 @@ test("a junction or symlink inside the worktree cannot smuggle files out of it",
   if (!linkDirectory(outside, link)) return;
 
   const verdict = validateModifiedFiles([path.join("escape", "stolen.txt")], inside);
-  assert.equal(verdict.valid, false, "a file reached through the junction is outside the worktree");
+  assert.equal(verdict.valid, false, "a file reached through the junction is outside the repository");
 
   const plain = validateModifiedFiles([path.join("src", "nested", "new.ts")], inside);
   assert.equal(plain.valid, true, "a legitimate new file must still pass");
@@ -317,7 +361,7 @@ test("a missing repoRoot falls back to lexical containment only", () => {
   assert.equal(validateModifiedFiles([path.join("..", "outside.ts")], missingRoot).valid, false);
 });
 
-test("a symlink that stays inside the worktree is not an escape", (t) => {
+test("a symlink that stays inside the repository is not an escape", (t) => {
   const inside = fs.mkdtempSync(path.join(os.tmpdir(), "hermes-guard-inner-link-"));
   t.after(() => fs.rmSync(inside, { recursive: true, force: true }));
   fs.mkdirSync(path.join(inside, "real"), { recursive: true });
@@ -329,7 +373,7 @@ test("a symlink that stays inside the worktree is not an escape", (t) => {
   assert.equal(
     validateModifiedFiles([path.join("alias", "file.ts")], inside).valid,
     true,
-    "a link whose target is inside the worktree must not be a violation",
+    "a link whose target is inside the repository must not be a violation",
   );
   assert.equal(validateModifiedFiles([path.join("alias", "new.ts")], inside).valid, true);
 });

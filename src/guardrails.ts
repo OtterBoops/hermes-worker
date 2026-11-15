@@ -7,6 +7,9 @@ import { isWindows } from "./exec.js";
  * `.ssh/.env.example` is a violation even though its basename is a reviewable template.
  */
 export const BLOCKED_DIRECTORY_SEGMENTS: RegExp[] = [
+  // `.git` is the checkout's own machinery: a config or hook written there executes on the caller's
+  // next git command and a tree-object revert cannot undo it.
+  /^\.git$/i,
   /^\.ssh$/i,
   /^\.gemini$/i,
   /^\.aws$/i,
@@ -21,6 +24,7 @@ export const BLOCKED_DIRECTORY_SEGMENTS: RegExp[] = [
  * so a pattern only has to describe a filename or a directory segment.
  */
 export const BLOCKED_PATH_PATTERNS: RegExp[] = [
+  /(^|\/)\.git(\/|$)/i,
   /(^|\/)\.env($|\.)/i,
   /\.(pem|key|pfx|p12|kdbx)$/i,
   /(^|\/)id_(rsa|dsa|ed25519|ecdsa)/i,
@@ -171,6 +175,7 @@ const SECRET_PROBES: Array<{ pattern: RegExp; reason: string }> = [
   { pattern: /\bsk-or-v1-[a-f0-9]{40,}/, reason: "OpenRouter API key" },
   { pattern: /\bsk-ant-[A-Za-z0-9_-]{20,}/, reason: "Anthropic API key" },
   { pattern: /\bsk-proj-[A-Za-z0-9_-]{20,}/, reason: "OpenAI project key" },
+  { pattern: /\bsk-(svcacct|admin)-[A-Za-z0-9_-]{20,}/, reason: "OpenAI service account or admin key" },
   { pattern: /\bgh[pousr]_[A-Za-z0-9]{36,}/, reason: "GitHub app, user, refresh or server token" },
   { pattern: /\bglpat-[A-Za-z0-9_-]{20,}/, reason: "GitLab personal access token" },
   { pattern: /\bAKIA[0-9A-Z]{16}/, reason: "AWS access key id" },
@@ -202,9 +207,9 @@ const BOUNDARY_MARKER = "[WORKER OPERATIONAL BOUNDARY]";
 
 export const WORKER_BOUNDARY = [
   BOUNDARY_MARKER,
-  "- You are executing inside an isolated Git worktree managed by Antigravity.",
+  "- You are executing directly in the repository checkout that Antigravity has open, not in a copy of it: your edits land where the user will see them the moment the run finishes.",
   "- Stay focused within this repository root; do not touch .env files, credentials, or remote infrastructure.",
-  "- Operate strictly within the current working directory (the active worktree checkout). All file reads, edits, and terminal commands must use relative paths within cwd. Never navigate up to, reference, or mutate files in the parent checkout outside this worktree. If temporary probe fixtures are required for testing, limit them strictly to system temp ($TMPDIR or os.tmpdir()); never touch or create files in $LOCALAPPDATA, user profile directories, or outside temp.",
+  "- Operate strictly within the current working directory (the repository root). All file reads, edits, and terminal commands must use relative paths within cwd. Never navigate up to, reference, or mutate files outside this repository. If temporary probe fixtures are required for testing, limit them strictly to system temp ($TMPDIR or os.tmpdir()); never touch or create files in $LOCALAPPDATA, user profile directories, or outside temp.",
   "- Local workstation testing (local containers, node/pnpm/cargo/pytest runners) is encouraged. "
     + "Iterate using targeted test filters (e.g. --test-name-pattern or single test file) during development; "
     + "run the full test suite strictly once before declaring completion.",
@@ -212,14 +217,15 @@ export const WORKER_BOUNDARY = [
   "- Assign each subagent strictly disjoint file paths so concurrent children never write the same file; perform shared entrypoint and integration work in the parent agent.",
   "- When delegate_task subagents return verified results, synthesize and integrate them directly without re-running their scratch experiments in the parent session.",
   "- Do not invoke the `hermes` skill or `hermes-worker` MCP tools from inside this worker session (prevents recursive delegation).",
-  "- Keep your changes unpushed in the current worktree for Antigravity to review.",
+  "- Leave your changes uncommitted in the checkout for Antigravity to review: no git commit, no git push, no branch switching, and no `git checkout --`/`git reset` that would revert work you did not write yourself.",
   "[TASK SPECIFICATION]",
 ].join("\n");
 
 /**
  * Idempotent because a guarded prompt can be forwarded into another worker: re-prepending would
- * stack a second contract whose subagent rules disagree with the first. The operational marker
- * is the signal, since a prompt may carry a boundary with no [TASK SPECIFICATION] line after it.
+ * stack a second contract whose subagent rules disagree with the first. Only a boundary at the head
+ * of the prompt is one this function added; a prompt that merely names the block must still be
+ * guarded, or quoting the marker would be a way to run without a contract.
  */
 export const injectWorkerBoundary = (prompt: string): string =>
-  prompt.includes(BOUNDARY_MARKER) ? prompt : `${WORKER_BOUNDARY}\n\n${prompt}`;
+  prompt.trimStart().startsWith(BOUNDARY_MARKER) ? prompt : `${WORKER_BOUNDARY}\n\n${prompt}`;

@@ -14,8 +14,6 @@ export interface RunState {
   status: RunStatus;
   runId: string;
   sessionName: string;
-  worktreePath: string;
-  branch: string;
   startedAt: number;
   result?: unknown;
   /** The dispatcher's own pid: the only field that can tell a crashed run from a slow one. */
@@ -23,6 +21,15 @@ export interface RunState {
   /** The runner child's pid, for diagnostics only: the worker outlives it by design. */
   childPid?: number;
   sessionId?: string | null;
+  /** The checkout the run executed in; every snapshot run has one and no worktree. */
+  repoRoot?: string;
+  /** The working tree the run started from, and the root of the conversation it belongs to. */
+  baselineTreeSha?: string;
+  initialTreeSha?: string;
+  conversationId?: string;
+  /** Legacy only: records written while dispatches ran in `.worktrees/agy-*` checkouts. */
+  worktreePath?: string;
+  branch?: string;
 }
 
 export const runStatePath = (runId: string): string => path.join(RUN_STATE_DIR, `${runId}.json`);
@@ -47,6 +54,9 @@ export const formatFailedSentinel = (runId: string): string =>
 /** A crashed dispatch never reaches clearRunState, so its files would otherwise stay in tmpdir forever. */
 const STALE_RUN_ENTRY = /\.(json|tmp|log)$/;
 
+/** The conversation map is a shared record, not a run: pruning it would forget every live thread. */
+export const CONVERSATION_SESSIONS_FILE = "conversation-sessions.json";
+
 /** Age is not evidence of death: a record whose worker pid still answers must survive every prune. */
 const holdsLiveWorker = (entry: string): boolean => {
   if (!entry.endsWith(".json")) return false;
@@ -66,6 +76,8 @@ export const pruneStaleRuns = async (maxAgeMs: number = 24 * 60 * 60 * 1000): Pr
   let removed = 0;
   for (const entry of entries) {
     if (!STALE_RUN_ENTRY.test(entry)) continue;
+    // The conversation map outlives every run it describes: it is state, not litter.
+    if (entry === CONVERSATION_SESSIONS_FILE) continue;
     const target = path.join(RUN_STATE_DIR, entry);
     try {
       const stat = await fsp.stat(target);
@@ -96,7 +108,6 @@ const renameIntoPlace = async (temp: string, target: string): Promise<void> => {
 
 /** A rename is atomic on NTFS and POSIX alike, so a poller never reads a half-written record. */
 export const writeRunState = async (state: RunState): Promise<void> => {
-  void pruneStaleRuns().catch(() => undefined);
   await fsp.mkdir(RUN_STATE_DIR, { recursive: true });
   const target = runStatePath(state.runId);
   // A shared temp name lets two writers interleave their bytes into one unparseable record.
@@ -118,7 +129,15 @@ export const readRunState = (runId: string): RunState | null => {
     // Only the shape this module writes is a record: anything else crashes or misleads its readers.
     if (parsed.status !== "running" && parsed.status !== "completed") return null;
     if (parsed.runId !== runId) return null;
-    for (const field of ["sessionName", "worktreePath", "branch"] as const) {
+    for (const field of [
+      "sessionName",
+      "worktreePath",
+      "branch",
+      "repoRoot",
+      "baselineTreeSha",
+      "initialTreeSha",
+      "conversationId",
+    ] as const) {
       if (parsed[field] !== undefined && typeof parsed[field] !== "string") return null;
     }
     return parsed as RunState;
@@ -165,6 +184,9 @@ export const listActiveRuns = (): RunState[] => {
   const active: RunState[] = [];
   for (const entry of entries) {
     if (!entry.endsWith(".json")) continue;
+    // The conversation map is not a run record: readRunState would reject it anyway, but naming it
+    // here keeps a map of every thread out of the per-run loop.
+    if (entry === CONVERSATION_SESSIONS_FILE) continue;
     const state = readRunState(entry.slice(0, -".json".length));
     // An abandoned record is still `running` on disk but no process will ever complete it, so it
     // must not keep a worktree alive in the status listing.
@@ -197,4 +219,109 @@ export const clearRunState = async (runId: string): Promise<void> => {
   } catch {
     // No state directory left to sweep.
   }
+};
+
+/**
+ * The thread <-> repository <-> session binding a second dispatch on the same conversation
+ * resumes from. It is a cache of what the last turn left behind, so losing it costs context and
+ * never correctness: every field is re-derived from the checkout when it is missing.
+ */
+export interface ConversationSessionRecord {
+  conversationId: string;
+  repoRoot: string;
+  sessionId: string;
+  /** The tree the conversation started from: the origin for its cumulative file list. */
+  initialTreeSha: string;
+  /** The tree the last turn ended on: the baseline for the next turn's delta. */
+  lastAfterTreeSha: string;
+  updatedAt: number;
+}
+
+/** Case- and separator-insensitive, so one repository is one record on every platform. */
+const windowsPaths = process.platform === "win32";
+
+const conversationPathKey = (value: string): string => {
+  const normal = (windowsPaths ? value.replace(/\//g, "\\").toLowerCase() : value).replace(/[\\/]+$/, "");
+  return normal || value;
+};
+
+const conversationSessionsPath = (): string => path.join(RUN_STATE_DIR, CONVERSATION_SESSIONS_FILE);
+
+const isConversationRecord = (value: unknown): value is ConversationSessionRecord => {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const record = value as Record<string, unknown>;
+  for (const field of ["conversationId", "repoRoot", "sessionId", "initialTreeSha", "lastAfterTreeSha"] as const) {
+    if (typeof record[field] !== "string" || !record[field]) return false;
+  }
+  return true;
+};
+
+/** An unreadable map is an empty one: a corrupted cache must not fail the dispatch that reads it. */
+const readConversationRecords = async (): Promise<ConversationSessionRecord[]> => {
+  let raw: string;
+  try {
+    raw = await fsp.readFile(conversationSessionsPath(), "utf8");
+  } catch {
+    return [];
+  }
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    const records = Array.isArray(parsed)
+      ? parsed
+      : (parsed as { records?: unknown } | null)?.records;
+    return Array.isArray(records) ? records.filter(isConversationRecord) : [];
+  } catch {
+    return [];
+  }
+};
+
+const writeConversationRecords = async (records: ConversationSessionRecord[]): Promise<void> => {
+  await fsp.mkdir(RUN_STATE_DIR, { recursive: true });
+  const target = conversationSessionsPath();
+  // A shared temp name lets two dispatches interleave their bytes into one unparseable map.
+  const temp = `${target}.${process.pid}.${Math.random().toString(36).slice(2, 10)}.tmp`;
+  await fsp.writeFile(temp, JSON.stringify({ version: 1, records }, null, 2), "utf8");
+  try {
+    await renameIntoPlace(temp, target);
+  } catch (error) {
+    await fsp.rm(temp, { force: true }).catch(() => undefined);
+    throw error;
+  }
+};
+
+/** Without a repoRoot the lookup is conversation-wide: callers that know the checkout pass it. */
+export const readConversationSession = async (
+  conversationId: string,
+  repoRoot?: string,
+): Promise<ConversationSessionRecord | null> => {
+  if (!conversationId) return null;
+  const key = repoRoot ? conversationPathKey(repoRoot) : null;
+  const records = await readConversationRecords();
+  const matches = records.filter((record) => record.conversationId === conversationId);
+  if (key === null) return matches[0] ?? null;
+  return matches.find((record) => conversationPathKey(record.repoRoot) === key) ?? null;
+};
+
+export const writeConversationSession = async (record: ConversationSessionRecord): Promise<void> => {
+  const key = conversationPathKey(record.repoRoot);
+  const records = await readConversationRecords();
+  const kept = records.filter(
+    (candidate) =>
+      candidate.conversationId !== record.conversationId || conversationPathKey(candidate.repoRoot) !== key,
+  );
+  await writeConversationRecords([...kept, record]);
+};
+
+/** A discarded or cancelled run leaves the checkout at its start tree: the binding no longer holds. */
+export const clearConversationSession = async (conversationId: string, repoRoot?: string): Promise<void> => {
+  if (!conversationId) return;
+  const key = repoRoot ? conversationPathKey(repoRoot) : null;
+  const records = await readConversationRecords();
+  const kept = records.filter(
+    (candidate) =>
+      candidate.conversationId !== conversationId ||
+      (key !== null && conversationPathKey(candidate.repoRoot) !== key),
+  );
+  if (kept.length === records.length) return;
+  await writeConversationRecords(kept).catch(() => undefined);
 };

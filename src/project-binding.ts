@@ -10,6 +10,7 @@ import {
   hermesHome,
   projectsDbPath,
 } from "./hermes-paths.js";
+import { runBridge } from "./python-bridge.js";
 
 export interface AntigravityProject {
   id: string;
@@ -148,25 +149,23 @@ interface HermesProjectRow {
   path: string;
 }
 
+interface BridgeProjectEntry {
+  id: string;
+  slug: string;
+  name: string;
+  primary_path?: string | null;
+  folders?: string[];
+}
+
 /** A present-but-unreadable store fails the dispatch closed: guessing would provision a duplicate. */
-const loadHermesProjects = (): HermesProjectRow[] => {
+const loadHermesProjects = async (): Promise<HermesProjectRow[]> => {
   const dbPath = projectsDbPath();
   if (!fs.existsSync(dbPath)) return [];
-  let db: DatabaseSync | null = null;
   try {
-    db = new DatabaseSync(dbPath, { readOnly: true });
-    const rows = db
-      .prepare(
-        `SELECT p.id, p.slug, p.name, f.path
-           FROM projects p
-           LEFT JOIN project_folders f ON f.project_id = p.id
-          WHERE p.archived = 0`,
-      )
-      .all() as Array<{ id: string; slug: string; name: string; path: string | null }>;
-
+    const response = await runBridge<{ projects: BridgeProjectEntry[] }>({ op: "projects_list" });
     const seen = new Set<string>();
     const projects: HermesProjectRow[] = [];
-    const add = (row: { id: string; slug: string; name: string }, rawPath: string | null): void => {
+    const add = (row: { id: string; slug: string; name: string }, rawPath: string | null | undefined): void => {
       if (!rawPath) return;
       const normal = normalizeForCompare(rawPath);
       const key = `${row.id}\u0000${normal}`;
@@ -175,20 +174,15 @@ const loadHermesProjects = (): HermesProjectRow[] => {
       projects.push({ id: row.id, slug: row.slug, name: row.name, path: normal });
     };
 
-    for (const row of rows) add(row, row.path);
-
-    // A project with no project_folders row still has a primary_path worth matching on.
-    const primaries = db
-      .prepare("SELECT id, slug, name, primary_path FROM projects WHERE archived = 0")
-      .all() as Array<{ id: string; slug: string; name: string; primary_path: string | null }>;
-    for (const row of primaries) add(row, row.primary_path);
+    for (const row of response.projects ?? []) {
+      for (const folderPath of row.folders ?? []) add(row, folderPath);
+      add(row, row.primary_path);
+    }
 
     return projects;
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
     throw new Error(`Could not read Hermes projects from ${dbPath}: ${detail}`);
-  } finally {
-    db?.close();
   }
 };
 
@@ -309,7 +303,7 @@ export const resolveAntigravityProject = async (options: ResolveOptions = {}): P
 
   const repoRoot = await gitToplevel(candidate);
   const target = normalizeForCompare(repoRoot);
-  const hermesProjects = loadHermesProjects();
+  const hermesProjects = await loadHermesProjects();
 
   // Path only: the same basename or slug in an unrelated directory is a different project.
   const byPath = bestPathMatch(hermesProjects, target);
@@ -343,7 +337,7 @@ export const resolveAntigravityProject = async (options: ResolveOptions = {}): P
   const slug = slugify(projectName) || slugify(path.basename(repoRoot)) || "project";
   await provisionHermesProject(projectName, repoRoot, slug);
 
-  const created = bestPathMatch(loadHermesProjects(), target);
+  const created = bestPathMatch(await loadHermesProjects(), target);
   if (!created) {
     throw new Error(`Provisioned Hermes project "${slug}" but could not find it in ${projectsDbPath()}.`);
   }

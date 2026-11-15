@@ -5,8 +5,7 @@ import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { DatabaseSync } from "node:sqlite";
-import { EXIT_GRACE_MS, isWindows, killProcessTree, runGit } from "./exec.js";
+import { EXIT_GRACE_MS, isWindows, killProcessTree, run, runGit } from "./exec.js";
 import {
   BLOCKED_DIRECTORY_SEGMENTS,
   BLOCKED_PATH_PATTERNS,
@@ -20,16 +19,27 @@ import {
   snapshotPendingIds,
   type PendingRecord,
 } from "./memory-manager.js";
-import { resolveAntigravityProject, type ResolvedProject } from "./project-binding.js";
+import {
+  normalizeForCompare,
+  resolveAntigravityProject,
+  type ResolvedProject,
+} from "./project-binding.js";
+import { runBridge } from "./python-bridge.js";
 import { createStreamFormatter, openRunLog, type RunLog } from "./run-log.js";
 import {
   RUN_ID_PATTERN,
+  clearConversationSession,
   clearRunState,
   isPidAlive,
+  isRunAbandoned,
   listActiveRuns,
+  pruneStaleRuns,
+  readConversationSession,
   readRunState,
   runLogPath,
+  writeConversationSession,
   writeRunState,
+  type ConversationSessionRecord,
   type RunState,
 } from "./run-registry.js";
 
@@ -45,11 +55,21 @@ export interface DispatchOptions {
   timeoutSeconds?: number;
   /** How long the tool call may block before it answers with a running descriptor. */
   fastWaitSeconds?: number;
-  /** Land a clean worktree diff on the caller's checkout instead of leaving it for review. */
-  autoApply?: boolean;
-  /** Return the diff body even when autoApply already wrote it to the checkout. */
+  /** Return the diff body; a caller that only wants the file list turns it off. */
   includeDiff?: boolean;
   runId?: string;
+  /** Continue this Hermes session instead of resolving or creating one. */
+  resumeSessionId?: string;
+  /** Ignore the session remembered for this conversation and start a fresh one. */
+  newSession?: boolean;
+  /** Compactions a session may accumulate before the dispatch rotates to a fresh one. */
+  maxCompacts?: number;
+  /** Shell command run in the checkout after every turn; a non-zero exit feeds the next turn. */
+  verifyCommand?: string;
+  /** Turn budget for the verify loop, clamped to 1..10. Ignored without verifyCommand. */
+  maxTurns?: number;
+  /** Compaction probe, replaced in tests so rotation is driven without a live session store. */
+  sessionProbe?: (sessionId: string, repoRoot: string) => Promise<SessionAfterRun>;
 }
 
 /** Pinned so a dispatch is reproducible regardless of what Hermes' config was last set to. */
@@ -72,13 +92,17 @@ export interface DispatchResult {
   sessionId: string | null;
   sessionName: string;
   project: ResolvedProject | null;
-  worktreePath: string | null;
-  branch: string | null;
-  baseSha: string | null;
+  /** The checkout the run executed in: there is no worktree, Hermes edits the real tree. */
+  repoRoot: string;
+  /** The run handle hermes_worktree_action takes: `agy-<runId>`. */
+  runHandle: string;
+  /** The tree the run started from and the tree it left behind: the review boundary. */
+  baselineTreeSha: string;
+  afterTreeSha: string | null;
   modifiedFiles: string[];
   diff: string;
   diffTruncated: boolean;
-  /** True when the diff body was withheld because autoApply already landed it on the checkout. */
+  /** True when the diff body was withheld on request. */
   diffOmitted?: boolean;
   summary: string;
   reasoning: string | null;
@@ -100,9 +124,16 @@ export interface DispatchResult {
   securityViolation: boolean;
   violations: string[];
   pendingWrites: PendingRecord[];
-  worktreeKept: boolean;
-  /** True only when autoApply landed the diff on the caller's checkout. */
-  applied?: boolean;
+  /** True when the run's changes are still in the checkout for review or for the next turn. */
+  changesKept: boolean;
+  /** Turns this dispatch ran: more than one only when a verifyCommand drove another turn. */
+  turns: number;
+  /** Exit status of the last verifyCommand run; null when no command was configured. */
+  verifyExitCode: number | null;
+  /** True when the last verifyCommand was killed at its timeout instead of finishing. */
+  verifyTimedOut: boolean;
+  /** True when the session hit maxCompacts and the dispatch continued in a fresh one. */
+  sessionRotated: boolean;
   /** True when the fallback model answered turn 1 and the child was killed before it could finish. */
   abortedFallback: boolean;
   /** True when hermes_worktree_action cancelled the run while it was executing. */
@@ -118,9 +149,9 @@ export interface RunningDispatchResult {
   sessionId: string | null;
   sessionName: string;
   project: ResolvedProject | null;
-  worktreePath: string;
-  branch: string;
-  baseSha: string;
+  repoRoot: string;
+  runHandle: string;
+  baselineTreeSha: string;
   waitCommand: string;
   message: string;
 }
@@ -214,33 +245,6 @@ export const raceFastWait = async <T>(
   } finally {
     if (timer !== null) clearTimeout(timer);
   }
-};
-
-/**
- * `.worktrees/` goes into .git/info/exclude, never the tracked .gitignore: a dirty .gitignore
- * would show up in every diff the bridge captures.
- */
-const ensureWorktreesExcluded = async (repoRoot: string): Promise<void> => {
-  const result = await runGit(repoRoot, ["rev-parse", "--git-path", "info/exclude"]);
-  if (!result.ok) throw new Error(`Not a git repository: ${repoRoot}`);
-  const raw = result.stdout.trim();
-  const excludePath = path.isAbsolute(raw) ? raw : path.resolve(repoRoot, raw);
-  await fsp.mkdir(path.dirname(excludePath), { recursive: true });
-
-  let current = "";
-  try {
-    current = await fsp.readFile(excludePath, "utf8");
-  } catch {
-    current = "";
-  }
-  const present = current
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .some((line) => line === ".worktrees" || line === ".worktrees/" || line === "/.worktrees/");
-  if (present) return;
-
-  const separator = current.length > 0 && !current.endsWith("\n") ? "\n" : "";
-  await fsp.appendFile(excludePath, `${separator}/.worktrees/\n`, "utf8");
 };
 
 const normalisePath = (value: string): string => {
@@ -413,7 +417,9 @@ export const pruneOrphanWorktrees = async (repoRoot: string): Promise<number> =>
 
   const active = listActiveRuns();
   const activeIds = new Set(active.map((run) => run.runId));
-  const activePaths = active.map((run) => run.worktreePath).filter((value) => Boolean(value));
+  const activePaths = active
+    .map((run) => run.worktreePath)
+    .filter((value): value is string => typeof value === "string" && value.length > 0);
 
   let removed = 0;
   for (const entry of entries) {
@@ -534,35 +540,50 @@ interface HermesRun {
 
 export interface ChatArgsOptions {
   promptFile: string;
-  worktreePath: string;
+  /** The checkout Hermes works in: `--in` places the session, so it only travels on create. */
+  repoRoot: string;
   sessionName: string;
   model?: string;
   reasoning?: string;
   skills?: string[];
   /** The per-run usage ledger. A top-level flag, so it cannot travel with the chat arguments. */
   usageFile?: string;
+  /** Resume this session instead of creating one. */
+  resumeSessionId?: string;
 }
 
 export const buildChatArgs = (options: ChatArgsOptions): string[] => {
+  // Before `chat`: argparse rejects --usage-file as an unknown chat argument after the subcommand.
+  const usage = options.usageFile ? ["--usage-file", options.usageFile] : [];
+  const stream = ["--query-file", options.promptFile, "--format", "stream-json"];
+  // The gateway only admits its own SURFACES labels (cli, tui, gui, acp, tool, oneshot): an invented
+  // label is refused. `oneshot` would hide the session from Desktop pickers, so the explicit `cli`
+  // label is what keeps a dispatch visible and resumable.
+  const surface = ["--yolo", "--source", "cli"];
+
+  if (options.resumeSessionId) {
+    // A resumed session already owns its model, provider, skills and cwd. Repeating them asks the
+    // gateway to re-pin a session whose model it cannot change, and `--in` would re-anchor its cwd.
+    return [
+      ...usage,
+      "chat",
+      ...stream,
+      "--resume",
+      options.resumeSessionId,
+      ...surface,
+    ];
+  }
+
   const args = [
-    // Before `chat`: argparse rejects --usage-file as an unknown chat argument after the subcommand.
-    ...(options.usageFile ? ["--usage-file", options.usageFile] : []),
+    ...usage,
     "chat",
-    "--query-file",
-    options.promptFile,
-    "--format",
-    "stream-json",
+    ...stream,
     "--in",
-    options.worktreePath,
+    options.repoRoot,
     "-c",
     options.sessionName,
     "--create-if-missing",
-    "--yolo",
-    // The gateway only admits its own SURFACES labels (cli, tui, gui, acp, tool, oneshot):
-    // an invented label is refused. `oneshot` would hide the session from Desktop pickers,
-    // so the explicit `cli` label is what keeps a dispatch visible and resumable.
-    "--source",
-    "cli",
+    ...surface,
     "--provider",
     "opencode-go",
     "--model",
@@ -652,6 +673,7 @@ const execHermes = (options: ExecHermesOptions): Promise<HermesRun> =>
     // The gateway writes gateway_runtime as turn 1 gets under way, so a single probe can land
     // before the row exists. A few bounded probes cover that window without polling forever.
     let fallbackProbes = 0;
+    let probeInFlight = false;
     let turnOneSeen = false;
     let abortedFallback = false;
 
@@ -668,13 +690,25 @@ const execHermes = (options: ExecHermesOptions): Promise<HermesRun> =>
      * The pinned model is a contract, not a preference: a turn already answered by the fallback
      * means the diff cannot be reviewed, so continuing spends quota on output that will be thrown
      * away. Probed only until turn 1 produces something, then never again.
+     *
+     * The probe reads the session store through the bridge, so it is asynchronous: the authoritative
+     * check is the post-run attribution, and this only ever ends a run early when it wins the race.
      */
     const abortOnFallback = (): void => {
-      if (abortedFallback || turnOneSeen || !state.sessionId || fallbackProbes >= 3) return;
+      if (abortedFallback || turnOneSeen || probeInFlight || !state.sessionId || fallbackProbes >= 3) return;
       fallbackProbes += 1;
-      if (!readSessionAfterRun(state.sessionId, repoRoot).fallbackActive) return;
-      abortedFallback = true;
-      killProcessTree(child.pid);
+      probeInFlight = true;
+      const sessionId = state.sessionId;
+      void readSessionAfterRun(sessionId, repoRoot)
+        .then((session) => {
+          if (abortedFallback || !session.fallbackActive) return;
+          abortedFallback = true;
+          killProcessTree(child.pid);
+        })
+        .catch(() => undefined)
+        .finally(() => {
+          probeInFlight = false;
+        });
     };
 
     const readSessionLine = (line: string): void => {
@@ -784,79 +818,64 @@ interface SessionAfterRun {
   fallbackActive: boolean;
   /** False when the row is missing or model_config carries no gateway_runtime record. */
   known: boolean;
+  /** The session a reader must continue from: a compaction advances it past the requested id. */
+  tipSessionId: string;
+  /** How many times the session has been compacted; the rollover budget counts these. */
+  compactionCount: number;
+  /** The summary the last compaction wrote, which is the only memory of the pre-compaction turns. */
+  compactionSummary: string | null;
+  /** The last assistant message, used as the handoff when no compaction summary exists. */
+  lastAssistantSummary: string | null;
 }
 
-export const readSessionAfterRun = (sessionId: string, repoRoot: string): SessionAfterRun => {
+const sessionText = (value: unknown): string | null =>
+  typeof value === "string" && value.trim() ? value.trim() : null;
+
+const normaliseSessionInfo = (sessionId: string, info: unknown): SessionAfterRun => {
+  const record = (info && typeof info === "object" ? info : {}) as Record<string, unknown>;
+  const compactions = record.compactionCount;
+  return {
+    reasoning: sessionText(record.reasoning),
+    model: sessionText(record.model),
+    provider: sessionText(record.provider),
+    fallbackActive: record.fallbackActive === true,
+    known: record.known === true,
+    tipSessionId: sessionText(record.tipSessionId) ?? sessionId,
+    compactionCount:
+      typeof compactions === "number" && Number.isFinite(compactions) && compactions > 0
+        ? Math.floor(compactions)
+        : 0,
+    compactionSummary: sessionText(record.compactionSummary),
+    lastAssistantSummary: sessionText(record.lastAssistantSummary),
+  };
+};
+
+/**
+ * The session row, read through Hermes' own Python: `state.db` belongs to the gateway and a second
+ * sqlite reader in this process is a schema coupling that breaks on every migration. An absent or
+ * unreadable store degrades to an unknown attribution rather than failing the run.
+ */
+export const readSessionAfterRun = async (sessionId: string, repoRoot: string): Promise<SessionAfterRun> => {
   const unknown: SessionAfterRun = {
     reasoning: null,
     model: null,
     provider: null,
     fallbackActive: false,
     known: false,
+    tipSessionId: sessionId,
+    compactionCount: 0,
+    compactionSummary: null,
+    lastAssistantSummary: null,
   };
-  // Opening the store read-write creates it when it is absent, which hands the user an empty
-  // `state.db` that every later reader has to treat as present.
-  if (!fs.existsSync(stateDbPath())) return unknown;
-  let db: DatabaseSync | null = null;
+  // Never ask the bridge for a store that does not exist: its own fallback would open the gateway,
+  // and a read-write sqlite handle would leave an empty `state.db` behind that every reader after
+  // it has to treat as present.
+  if (!sessionId || !fs.existsSync(stateDbPath())) return unknown;
   try {
-    db = new DatabaseSync(stateDbPath());
-    db.exec("PRAGMA busy_timeout = 3000");
-  } catch {
-    db?.close();
-    return unknown;
-  }
-
-  try {
-    // Re-anchoring is a convenience for Desktop: a read-only or locked DB must not cost us the
-    // model attribution below, so the write gets its own failure domain.
-    try {
-      db.prepare("UPDATE sessions SET cwd = ?, git_repo_root = ? WHERE id = ?").run(
-        repoRoot,
-        repoRoot,
-        sessionId,
-      );
-    } catch {
-      // Attribution is still readable without it.
-    }
-
-    let session: { model?: string | null; model_config?: string | null } | undefined;
-    try {
-      session = db
-        .prepare("SELECT model, model_config FROM sessions WHERE id = ?")
-        .get(sessionId) as { model?: string | null; model_config?: string | null } | undefined;
-    } catch {
-      return unknown;
-    }
-    if (!session) return unknown;
-
-    let reasoning: string | null = null;
-    try {
-      const message = db
-        .prepare(
-          `SELECT reasoning, reasoning_content FROM messages
-            WHERE session_id = ? AND role = 'assistant'
-            ORDER BY id DESC LIMIT 1`,
-        )
-        .get(sessionId) as { reasoning?: string | null; reasoning_content?: string | null } | undefined;
-      reasoning = message?.reasoning_content ?? message?.reasoning ?? null;
-    } catch {
-      reasoning = null;
-    }
-
-    const runtime = parseGatewayRuntimeDetail(session.model_config);
-    return {
-      reasoning,
-      model: session.model ?? null,
-      provider: runtime.provider,
-      fallbackActive: runtime.fallbackActive,
-      // A row that names its model is an attribution, whether or not Hermes also wrote a routing
-      // record: only a minority of sessions carry gateway_runtime at all.
-      known: typeof session.model === "string" && session.model.trim().length > 0,
-    };
+    const info = await runBridge<unknown>({ op: "session_info", sessionId, repoRoot }, { timeoutMs: 30_000 });
+    return normaliseSessionInfo(sessionId, info);
   } catch {
     return unknown;
-  } finally {
-    db?.close();
   }
 };
 
@@ -1043,7 +1062,8 @@ const secretViolations = (porcelain: string, alreadyBlocked: Set<string>): strin
       directories.some((directory) => pattern.test(directory)),
     );
     if (!blockedDirectory) {
-      if (ENV_TEMPLATE.test(file)) continue;
+      // Basename, like validateModifiedFiles: a nested `docs/.env.example` is the same template.
+      if (ENV_TEMPLATE.test(path.posix.basename(posix))) continue;
       if (!BLOCKED_PATH_PATTERNS.some((pattern) => pattern.test(posix))) continue;
     }
     // `!!` is ignored: an excluded .env never reaches the diff, so it has to be named here.
@@ -1070,148 +1090,201 @@ const isBlockedBaselinePath = (relative: string): boolean => {
   return BLOCKED_PATH_PATTERNS.some((pattern) => pattern.test(posix));
 };
 
+/** A throwaway index keeps every snapshot off the caller's own `.git/index`. */
+const tempIndexPath = (kind: string): string =>
+  path.join(
+    os.tmpdir(),
+    `hermes-worker-${kind}-${process.pid}-${Math.random().toString(36).slice(2, 10)}.index`,
+  );
+
+const tempIndexEnv = (indexFile: string): NodeJS.ProcessEnv => ({ ...process.env, GIT_INDEX_FILE: indexFile });
+
+/** git takes pathspecs on argv, and Windows caps a command line: a big revert travels in batches. */
+const MAX_PATHSPEC_ARGS = 100;
+
+const chunked = <T>(items: T[], size: number): T[][] => {
+  const batches: T[][] = [];
+  for (let index = 0; index < items.length; index += size) batches.push(items.slice(index, index + size));
+  return batches;
+};
+
+/** `:(literal)` so a path holding `*`, `?` or `[` is a name and never a pattern. */
+const literalPaths = (files: string[]): string[] => files.map((file) => `:(literal)${file}`);
+
+export interface TreeSnapshot {
+  treeSha: string;
+  /** Paths the snapshot refused to carry. They are blocked, not absent. */
+  skipped: string[];
+}
+
 /**
- * Ports the caller's uncommitted work into a fresh worktree so Hermes can see in-progress files
- * (a half-written component, an untracked test) without ever committing them to the caller's
- * checkout. Tracked changes travel as a binary diff; untracked files are copied because no diff
- * can express a file git has never seen. Returns the baseline commit SHA, or the original HEAD
- * SHA when there was nothing to port.
+ * The checkout's working tree as a git tree object, built in a throwaway index: the caller's own
+ * `.git/index` is never touched, and a staged addition, an unstaged edit, a deletion and an
+ * untracked file all appear in the tree. That is what makes `<baseline> <after>` the review
+ * boundary — no worktree, no commit, nothing written to the repository.
  */
-export const snapshotCallerWorkingTree = async (
+export const captureWorkingTreeSnapshot = async (repoRoot: string): Promise<TreeSnapshot> => {
+  const indexFile = tempIndexPath("snapshot");
+  const env = tempIndexEnv(indexFile);
+  try {
+    // Over an absent index this stages the whole working tree, not a delta against HEAD.
+    const staged = await runGit(repoRoot, ["-c", "core.quotePath=false", "add", "-A", "--", "."], { env });
+    if (!staged.ok) {
+      throw new Error(`git add -A failed in ${repoRoot}: ${(staged.stderr || staged.stdout).trim()}`);
+    }
+
+    const listed = await runGit(repoRoot, ["-c", "core.quotePath=false", "ls-files", "-z", "--cached"], { env });
+    if (!listed.ok) {
+      throw new Error(`git ls-files failed in ${repoRoot}: ${(listed.stderr || listed.stdout).trim()}`);
+    }
+    const skipped = splitNul(listed.stdout).filter(isBlockedBaselinePath);
+    for (const batch of chunked(skipped, MAX_PATHSPEC_ARGS)) {
+      // Dropped from the snapshot's index, never from disk: the run still sees the file, the tree
+      // that travels back to Antigravity never does.
+      const excluded = await runGit(
+        repoRoot,
+        ["rm", "--cached", "-q", "--ignore-unmatch", "--", ...literalPaths(batch)],
+        { env },
+      );
+      if (!excluded.ok) {
+        throw new Error(`excluding blocked paths failed: ${(excluded.stderr || excluded.stdout).trim()}`);
+      }
+    }
+
+    const tree = await runGit(repoRoot, ["write-tree"], { env });
+    if (!tree.ok) {
+      throw new Error(`git write-tree failed in ${repoRoot}: ${(tree.stderr || tree.stdout).trim()}`);
+    }
+    return { treeSha: tree.stdout.trim(), skipped };
+  } finally {
+    await fsp.rm(indexFile, { force: true }).catch(() => undefined);
+  }
+};
+
+/** Names only, NUL-separated: a path may hold any byte git does not quote away. */
+const gitDiffNames = async (
   repoRoot: string,
-  worktreePath: string,
-  headSha: string,
-): Promise<{ baseSha: string; ported: number; skipped: string[] }> => {
-  const status = await runGit(repoRoot, [
+  filter: string[],
+  from: string,
+  to: string,
+): Promise<string[]> => {
+  if (!from || !to || from === to) return [];
+  const result = await runGit(repoRoot, [
+    "-c",
+    "core.quotePath=false",
+    "diff",
+    ...filter,
+    "--name-only",
+    "--no-renames",
+    "-z",
+    from,
+    to,
+  ]);
+  if (!result.ok) {
+    throw new Error(`git diff --name-only ${from} ${to} failed: ${(result.stderr || result.stdout).trim()}`);
+  }
+  return splitNul(result.stdout);
+};
+
+/** The binary patch between two trees: the review artifact, and the only thing `git apply` can read. */
+export const diffTreeSnapshots = async (
+  repoRoot: string,
+  baselineTreeSha: string,
+  afterTreeSha: string,
+): Promise<string> => {
+  if (!baselineTreeSha || !afterTreeSha || baselineTreeSha === afterTreeSha) return "";
+  const result = await runGit(repoRoot, [
+    "-c",
+    "core.quotePath=false",
+    "diff",
+    "--binary",
+    "--no-renames",
+    baselineTreeSha,
+    afterTreeSha,
+  ]);
+  if (!result.ok) {
+    throw new Error(`git diff ${baselineTreeSha} ${afterTreeSha} failed: ${(result.stderr || result.stdout).trim()}`);
+  }
+  return result.stdout;
+};
+
+/**
+ * Puts the checkout back to `baselineTreeSha` for everything `afterTreeSha` changed: files the run
+ * added are deleted, files it modified or deleted are restored from the baseline tree. Scoped to
+ * the run's own change set, so an edit the user makes while the run is going survives a rollback.
+ * Writing the restore through a throwaway index also means the caller's staged work is untouched.
+ */
+export const restoreWorkingTreeSnapshot = async (
+  repoRoot: string,
+  baselineTreeSha: string,
+  afterTreeSha: string,
+): Promise<{ restored: string[]; deleted: string[] }> => {
+  if (!baselineTreeSha || !afterTreeSha || baselineTreeSha === afterTreeSha) {
+    return { restored: [], deleted: [] };
+  }
+  const added = await gitDiffNames(repoRoot, ["--diff-filter=A"], baselineTreeSha, afterTreeSha);
+  const changed = await gitDiffNames(repoRoot, ["--diff-filter=MD"], baselineTreeSha, afterTreeSha);
+
+  const deleted: string[] = [];
+  // Deepest first: a file created inside a directory the baseline holds as a file would otherwise
+  // leave a non-empty directory where git expects to write a blob.
+  for (const relative of added.sort((left, right) => right.length - left.length)) {
+    const target = path.resolve(repoRoot, relative);
+    // A tree entry cannot escape the repository; a delete driven by one must not try.
+    if (!isInsidePath(repoRoot, target)) continue;
+    await fsp.rm(target, { force: true }).catch(() => undefined);
+    deleted.push(relative);
+    // A directory the run created is part of its work too: rmdir refuses the moment it is not empty.
+    let parent = path.dirname(target);
+    while (isInsidePath(repoRoot, parent) && !samePath(parent, repoRoot)) {
+      try {
+        await fsp.rmdir(parent);
+      } catch {
+        break;
+      }
+      parent = path.dirname(parent);
+    }
+  }
+
+  if (changed.length === 0) return { restored: [], deleted };
+
+  const indexFile = tempIndexPath("restore");
+  const env = tempIndexEnv(indexFile);
+  try {
+    for (const batch of chunked(changed, MAX_PATHSPEC_ARGS)) {
+      const restored = await runGit(repoRoot, ["checkout", baselineTreeSha, "--", ...literalPaths(batch)], { env });
+      if (!restored.ok) {
+        throw new Error(
+          `restoring ${batch.length} path(s) from ${baselineTreeSha} failed: ${(restored.stderr || restored.stdout).trim()}`,
+        );
+      }
+    }
+  } finally {
+    await fsp.rm(indexFile, { force: true }).catch(() => undefined);
+  }
+  return { restored: changed, deleted };
+};
+
+/**
+ * The porcelain listing, ignored entries included: a diff cannot see an excluded file at all, so
+ * this is the only place a `.env` Hermes wrote can be caught. Callers compare two listings and keep
+ * what appeared during the run, because the checkout's own ignored files are not the run's work.
+ */
+const statusEntries = async (repoRoot: string): Promise<string[]> => {
+  const result = await runGit(repoRoot, [
     "-c",
     "core.quotePath=false",
     "status",
     "--porcelain=v1",
     "--untracked-files=all",
     "-z",
+    "--ignored",
     "--no-renames",
   ]);
-  if (!status.ok) {
-    throw new Error(`git status failed in ${repoRoot}: ${(status.stderr || status.stdout).trim()}`);
+  if (!result.ok) {
+    throw new Error(`git status failed in ${repoRoot}: ${(result.stderr || result.stdout).trim()}`);
   }
-
-  const entries = splitNul(status.stdout);
-  const tracked: string[] = [];
-  const untracked: string[] = [];
-  for (const entry of entries) {
-    if (entry.length < 4) continue;
-    const code = entry.slice(0, 2);
-    const file = entry.slice(3);
-    if (!file) continue;
-    if (code === "??") untracked.push(file);
-    else if (code !== "!!") tracked.push(file);
-  }
-
-  if (tracked.length === 0 && untracked.length === 0) {
-    return { baseSha: headSha, ported: 0, skipped: [] };
-  }
-
-  const skipped: string[] = [];
-  // A blocked path is blocked as a tracked edit too: porting it would commit the caller's real
-  // .env into the worktree, where no diff (and so no guardrail) can see it again.
-  const trackedAllowed: string[] = [];
-  for (const file of tracked) {
-    if (isBlockedBaselinePath(file)) skipped.push(file);
-    else trackedAllowed.push(file);
-  }
-
-  if (trackedAllowed.length > 0) {
-    const diff = await runGit(repoRoot, [
-      "-c",
-      "core.quotePath=false",
-      "diff",
-      "HEAD",
-      "--binary",
-      "--no-renames",
-      // Excluded by literal pathspec rather than filtered afterwards: the excluded hunk must never
-      // be written to a patch file, even transiently.
-      ...tracked
-        .filter((file) => isBlockedBaselinePath(file))
-        .map((file) => `:(exclude,literal)${file}`),
-    ]);
-    if (!diff.ok) {
-      throw new Error(`git diff HEAD failed in ${repoRoot}: ${(diff.stderr || diff.stdout).trim()}`);
-    }
-    if (diff.stdout.trim()) {
-      const patchFile = path.join(os.tmpdir(), `hermes-baseline-${path.basename(worktreePath)}.patch`);
-      try {
-        await fsp.writeFile(patchFile, diff.stdout, "utf8");
-        // `--3way` is wrong here: the worktree is branched from HEAD, so the patch is exact.
-        const applied = await runGit(worktreePath, ["apply", "--binary", "--whitespace=nowarn", patchFile]);
-        if (!applied.ok || SKIPPED_PATCH.test(`${applied.stdout}${applied.stderr}`)) {
-          throw new Error(
-            `git apply of the caller's tracked changes failed: ${(applied.stderr || applied.stdout).trim()}`,
-          );
-        }
-      } finally {
-        await fsp.rm(patchFile, { force: true }).catch(() => undefined);
-      }
-    }
-  }
-
-  const skippedUntracked: string[] = [];
-  for (const file of untracked) {
-    if (isBlockedBaselinePath(file)) {
-      skippedUntracked.push(file);
-      continue;
-    }
-    const source = path.join(repoRoot, file);
-    const target = path.join(worktreePath, file);
-    try {
-      const stat = await fsp.lstat(source);
-      // A container worktree may hold a junction that resolves outside the repo: never follow it.
-      if (!stat.isFile()) {
-        skippedUntracked.push(file);
-        continue;
-      }
-      await fsp.mkdir(path.dirname(target), { recursive: true });
-      await fsp.copyFile(source, target);
-    } catch {
-      skippedUntracked.push(file);
-    }
-  }
-  skipped.push(...skippedUntracked);
-
-  const staged = await runGit(worktreePath, ["add", "-A"]);
-  if (!staged.ok) {
-    throw new Error(`git add -A failed in the worktree: ${(staged.stderr || staged.stdout).trim()}`);
-  }
-  // Counted from the index, not the status list: an edit that lives only in the caller's index
-  // writes no bytes here, and counting it also committed an empty baseline.
-  const portedNames = await runGit(worktreePath, [
-    "-c",
-    "core.quotePath=false",
-    "diff",
-    "--cached",
-    "--name-only",
-    "-z",
-    "HEAD",
-  ]);
-  if (!portedNames.ok) {
-    throw new Error(`git diff --cached failed in the worktree: ${(portedNames.stderr || portedNames.stdout).trim()}`);
-  }
-  const ported = splitNul(portedNames.stdout).length;
-  if (ported === 0) return { baseSha: headSha, ported: 0, skipped };
-
-  const committed = await runGit(worktreePath, [
-    "commit",
-    "-m",
-    BASELINE_COMMIT_SUBJECT,
-    "--allow-empty",
-  ]);
-  if (!committed.ok) {
-    throw new Error(`baseline commit failed: ${(committed.stderr || committed.stdout).trim()}`);
-  }
-  const head = await runGit(worktreePath, ["rev-parse", "HEAD"]);
-  if (!head.ok) {
-    throw new Error(`could not read the baseline commit: ${(head.stderr || head.stdout).trim()}`);
-  }
-  return { baseSha: head.stdout.trim(), ported, skipped };
+  return splitNul(result.stdout);
 };
 
 /** The subject identifies the review boundary; apply reads it back to find where the run started. */
@@ -1239,11 +1312,146 @@ const resolveBaselineSha = async (
   return first ?? null;
 };
 
+/** A compacted session is still resumable, so the rollover budget bounds context, not failures. */
+export const DEFAULT_MAX_COMPACTS = 2;
+
+/** One turn unless a verifyCommand needs help; the ceiling stops a broken command looping forever. */
+const DEFAULT_VERIFY_TURNS = 3;
+const MAX_VERIFY_TURNS = 10;
+
+/** Long enough for a real build and test pass, short enough that a hung command is not the run. */
+const VERIFY_TIMEOUT_MS = 15 * 60 * 1000;
+
+/** The environment's value, then the built-in: a malformed or absent setting is never a refusal. */
+const resolveMaxCompacts = (requested: number | undefined): number => {
+  const raw = requested ?? process.env.HERMES_MAX_COMPACTS?.trim();
+  if (raw === undefined || raw === "") return DEFAULT_MAX_COMPACTS;
+  const candidate = Number(raw);
+  if (!Number.isFinite(candidate) || candidate < 0) return DEFAULT_MAX_COMPACTS;
+  return Math.floor(candidate);
+};
+
+const resolveMaxTurns = (options: DispatchOptions): number => {
+  if (!options.verifyCommand) return 1;
+  const requested = options.maxTurns ?? DEFAULT_VERIFY_TURNS;
+  if (!Number.isFinite(requested)) return DEFAULT_VERIFY_TURNS;
+  return Math.min(Math.max(Math.floor(requested), 1), MAX_VERIFY_TURNS);
+};
+
+const truncateText = (value: string, limit: number): string =>
+  value.length <= limit ? value : `${value.slice(0, limit)}\n…[truncated at ${limit} chars]`;
+
+/** A rotated session needs a name no earlier turn used, or `-c` would resume the one it replaces. */
+const rotatedSessionName = (base: string, turn: number): string => {
+  const suffix = ` (cont. ${turn})`;
+  const flat = base.replace(/\s+/g, " ").trim();
+  const room = Math.max(12, 60 - suffix.length);
+  return `${flat.length > room ? `${flat.slice(0, room - 1)}…` : flat}${suffix}`;
+};
+
+/** A delta prompt is a pointer, not a listing: past this many paths the shape of the change is lost. */
+const MAX_DELTA_FILES = 200;
+
 /**
- * One dispatch: guard the prompt, bind the project, run Hermes inside a fresh worktree branched
- * from local HEAD, then firewall whatever it produced before Antigravity ever sees it. The run
- * answers with a running descriptor when it outlives the fast-wait window; the pipeline keeps
- * going and publishes its result through the run registry.
+ * Turn 2+ of one conversation: the checkout already carries the previous turn's work, so the new
+ * prompt names what moved under the agent since it last looked. Without it a resumed session keeps
+ * reasoning about files as they were and re-reads or reverts them.
+ */
+export const workspaceDeltaPrompt = (
+  files: string[],
+  limit: number = MAX_DELTA_FILES,
+): string => {
+  if (files.length === 0) return "";
+  const listed = files.slice(0, limit).map((file) => `- ${file}`);
+  if (files.length > limit) listed.push(`- …and ${files.length - limit} more`);
+  return [
+    "[WORKSPACE DELTA SINCE LAST TURN]",
+    "Files that changed in the checkout since your previous turn:",
+    ...listed,
+  ].join("\n");
+};
+
+/** What a rotated session needs to pick the task back up: the summary and the files touched. */
+export const priorSessionHandoffPrompt = (input: {
+  previousSessionId: string;
+  compactionCount: number;
+  summary: string | null;
+  modifiedFiles: string[];
+}): string => {
+  const files = input.modifiedFiles.slice(0, 100);
+  return [
+    "[PRIOR SESSION HANDOFF]",
+    `- previous session: ${input.previousSessionId}`,
+    `- that session was compacted ${input.compactionCount} time(s); this is a fresh session continuing the same task, so its transcript is not available to you.`,
+    input.summary
+      ? `- where it left off: ${truncateText(input.summary, 1_500)}`
+      : "- no summary of the previous session was written, so recover context from the checkout.",
+    files.length > 0
+      ? `- files already changed in the checkout: ${files.join(", ")}${input.modifiedFiles.length > files.length ? " …" : ""}`
+      : "- no files have been changed in the checkout yet.",
+  ].join("\n");
+};
+
+/** A failed verification is the next turn's brief, verbatim: the output is the reproduction. */
+export const verificationRetryPrompt = (input: {
+  command: string;
+  exitCode: number | null;
+  output: string;
+  turn: number;
+  maxTurns: number;
+}): string =>
+  [
+    "[VERIFICATION FAILED]",
+    `\`${input.command}\` exited ${input.exitCode ?? "unknown"} after turn ${input.turn} of ${input.maxTurns}.`,
+    "The checkout is yours to fix: make the command pass, then stop.",
+    "Output:",
+    truncateText(input.output.trim() || "(no output)", 8_000),
+  ].join("\n");
+
+const runFailure = (execution: HermesRun): { exitCode: number | null; failed: boolean } => {
+  // A missing exit status is not success, and a stream code of 0 must not mask a non-zero process
+  // code (or the other way round). The reported code is the worst one either channel gave: a run
+  // called a failure may never hand back exit code 0.
+  const codes = [execution.state.exitCode, execution.code].filter(
+    (code): code is number => typeof code === "number",
+  );
+  return {
+    exitCode: codes.find((code) => code !== 0) ?? codes[0] ?? null,
+    failed: Boolean(execution.spawnError) || execution.timedOut || execution.state.isError ||
+      codes.length === 0 || codes.some((code) => code !== 0),
+  };
+};
+
+/**
+ * The verify command runs in the checkout, through the platform shell, with the same sandbox as the
+ * run: a verification that trips a hook must not run the caller's hooks either.
+ */
+export const runVerifyCommand = async (
+  command: string,
+  cwd: string,
+  env: NodeJS.ProcessEnv,
+): Promise<{ code: number | null; timedOut: boolean; output: string }> => {
+  const shell = isWindows
+    ? { file: process.env.ComSpec || "cmd.exe", args: ["/d", "/c", command] }
+    : { file: "/bin/sh", args: ["-c", command] };
+  const result = await run(shell.file, shell.args, { cwd, env, timeoutMs: VERIFY_TIMEOUT_MS });
+  const output = [result.stdout, result.stderr].filter((part) => part.trim()).join("\n");
+  return {
+    code: result.timedOut ? null : result.code,
+    timedOut: result.timedOut,
+    output: result.timedOut ? `${output}\n[verification timed out after ${VERIFY_TIMEOUT_MS}ms]`.trim() : output,
+  };
+};
+
+/**
+ * One dispatch: guard the prompt, bind the project, run Hermes in the checkout itself, then firewall
+ * whatever it produced before Antigravity ever sees it. The run answers with a running descriptor
+ * when it outlives the fast-wait window; the pipeline keeps going and publishes its result through
+ * the run registry.
+ *
+ * Nothing is copied and nothing is committed: the review boundary is the pair of tree objects
+ * (before the run, after the run), so a rejected run is reverted by restoring those paths rather
+ * than by throwing a worktree away.
  */
 export const dispatchHermesTask = async (options: DispatchOptions): Promise<DispatchOutcome> => {
   const scan = scanPromptForSecrets(options.prompt);
@@ -1256,26 +1464,33 @@ export const dispatchHermesTask = async (options: DispatchOptions): Promise<Disp
     conversationId: options.conversationId,
     project: options.project,
   });
-  const repoRoot = project.repoRoot;
 
-  const verified = await runGit(repoRoot, ["rev-parse", "--verify", "HEAD"]);
-  if (!verified.ok) {
-    throw new Error(`${repoRoot} has no commits: an isolated worktree needs a HEAD to branch from.`);
+  // A subdirectory is still one repository: the tree objects that define the review boundary are
+  // per checkout, so every git call below runs from the toplevel.
+  const topLevel = await runGit(project.repoRoot, ["rev-parse", "--show-toplevel"]);
+  if (!topLevel.ok) {
+    throw new Error(
+      `${project.repoRoot} is not a git repository: ${(topLevel.stderr || topLevel.stdout).trim()}`,
+    );
   }
-  const baseSha = verified.stdout.trim();
+  const repoRoot = path.resolve(topLevel.stdout.trim());
 
   const runId = options.runId ?? makeRunId();
   if (!RUN_ID_PATTERN.test(runId)) {
     throw new Error(`Refused to dispatch: '${runId}' is not a valid run id ([A-Za-z0-9_-]).`);
   }
-  const branch = `hermes/agy-${runId}`;
-  const worktreePath = path.join(repoRoot, ".worktrees", `agy-${runId}`);
+  // A crashed dispatch never reaches clearRunState, so every dispatch is what reaps the ones before
+  // it: reaping from the record writer instead would delete files under a caller that never asked.
+  await pruneStaleRuns().catch(() => undefined);
   const sessionName = options.sessionName ?? `[AGY] ${truncateTitle(options.prompt, 48)}`;
   const timeoutSeconds = options.timeoutSeconds ?? DEFAULT_TIMEOUT_SECONDS;
   const fastWaitSeconds = options.fastWaitSeconds ?? DEFAULT_FAST_WAIT_SECONDS;
   const startedAt = Date.now();
-
-  await ensureWorktreesExcluded(repoRoot);
+  const conversationId = options.conversationId?.trim() || null;
+  const maxCompacts = resolveMaxCompacts(options.maxCompacts);
+  const maxTurns = resolveMaxTurns(options);
+  const sessionProbe = options.sessionProbe ?? readSessionAfterRun;
+  const runHandle = `agy-${runId}`;
 
   // Hooks are executable code inside the review boundary: a hook left behind by the worker would
   // run on the caller's next git call. The sandbox travels in the child's environment and diffing
@@ -1284,63 +1499,42 @@ export const dispatchHermesTask = async (options: DispatchOptions): Promise<Disp
   const hooksBefore = hooksDir ? snapshotHooks(hooksDir) : null;
   const emptyHooksDir = path.join(os.tmpdir(), "hermes-worker-empty-hooks", runId);
   const usageFile = path.join(os.tmpdir(), `hermes-usage-${runId}.json`);
-
-  // A run id that already owns a branch or a directory is a collision, not something to clean up:
-  // `branch -D` on it would destroy an earlier run this dispatch never created.
-  const collision = await runGit(repoRoot, ["branch", "--list", branch]);
-  if (collision.ok && collision.stdout.trim()) {
-    throw new Error(`Refused to dispatch: branch '${branch}' already exists. Pass a different runId.`);
-  }
-  if (fs.existsSync(worktreePath)) {
-    throw new Error(`Refused to dispatch: ${worktreePath} already exists. Pass a different runId.`);
-  }
-
+  const promptFile = path.join(os.tmpdir(), `hermes-prompt-${runId}.txt`);
+  const runEnv = sandboxedGitEnv(process.env, emptyHooksDir, repoRoot);
   await fsp.mkdir(emptyHooksDir, { recursive: true }).catch(() => undefined);
 
-  const created = await runGit(repoRoot, ["worktree", "add", "-b", branch, worktreePath, "HEAD"], {
-    // No hook -- sandboxed one -- may run against the caller's repository during setup, so the
-    // worktree's own creation carries the same environment as the run itself.
-    env: sandboxedGitEnv(process.env, emptyHooksDir, repoRoot),
-  });
-  if (!created.ok) {
-    // M11: a failed `worktree add` can still have registered the directory before refusing.
-    await destroyWorktree(repoRoot, worktreePath, branch);
-    throw new Error(`git worktree add failed: ${(created.stderr || created.stdout).trim()}`);
-  }
+  // The baseline is the checkout as it stands now, as a tree object: the run edits these very files,
+  // so this is the only record of what Antigravity's tree looked like before Hermes touched it.
+  const baseline = await captureWorkingTreeSnapshot(repoRoot);
+  const baselineTreeSha = baseline.treeSha;
+  // Ignored entries are invisible to a diff, so the guard compares listings instead of trees.
+  const statusBefore = new Set(await statusEntries(repoRoot));
 
-  // The baseline commit is made before Hermes runs, so a caller's pre-commit hook is ordinary git
-  // behaviour rather than a hole in the review boundary; the hook diff below still guards the
-  // caller against anything Hermes does afterwards.
-  let baselineSha = baseSha;
-  let baselinePorted = 0;
-  let baselineSkipped: string[] = [];
-  try {
-    const snapshot = await snapshotCallerWorkingTree(repoRoot, worktreePath, baseSha);
-    baselineSha = snapshot.baseSha;
-    baselinePorted = snapshot.ported;
-    baselineSkipped = snapshot.skipped;
-  } catch (error) {
-    await destroyWorktree(repoRoot, worktreePath, branch);
-    throw error;
-  }
+  // Turn 2+ of one conversation continues the session the last turn left behind, and the delta
+  // prompt is built from the tree that turn ended on.
+  const remembered =
+    conversationId && options.newSession !== true
+      ? await readConversationSession(conversationId, repoRoot)
+      : null;
+  const resumeTarget = options.resumeSessionId?.trim() || remembered?.sessionId || null;
+  const initialTreeSha = remembered?.initialTreeSha ?? baselineTreeSha;
+  const previousAfterTreeSha = remembered?.lastAfterTreeSha ?? null;
 
-  const guarded = injectWorkerBoundary(options.prompt);
-  const promptFile = path.join(os.tmpdir(), `hermes-prompt-${runId}.txt`);
-  const before = snapshotPendingIds();
   const live: { sessionId: string | null; childPid: number | null } = {
-    sessionId: null,
+    sessionId: resumeTarget,
     childPid: null,
   };
 
   const result: DispatchResult = {
     runId,
     success: false,
-    sessionId: null,
+    sessionId: resumeTarget,
     sessionName,
     project,
-    worktreePath,
-    branch,
-    baseSha: baselineSha,
+    repoRoot,
+    runHandle,
+    baselineTreeSha,
+    afterTreeSha: null,
     modifiedFiles: [],
     diff: "",
     diffTruncated: false,
@@ -1359,7 +1553,11 @@ export const dispatchHermesTask = async (options: DispatchOptions): Promise<Disp
     securityViolation: false,
     violations: [],
     pendingWrites: [],
-    worktreeKept: false,
+    changesKept: false,
+    turns: 0,
+    verifyExitCode: null,
+    verifyTimedOut: false,
+    sessionRotated: false,
     abortedFallback: false,
     cancelled: false,
     message: "",
@@ -1367,76 +1565,143 @@ export const dispatchHermesTask = async (options: DispatchOptions): Promise<Disp
 
   let runLog: RunLog | null = null;
   const runPipeline = async (): Promise<DispatchResult> => {
-    try {
-      await fsp.writeFile(promptFile, guarded, "utf8");
+    const before = snapshotPendingIds();
+    // Turn 1's prompt: the caller's task plus the boundary, and the workspace delta when a previous
+    // turn of the same conversation left changes behind.
+    let promptText = injectWorkerBoundary(options.prompt);
+    let turnSessionName = sessionName;
+    let sessionId = resumeTarget;
+    let afterTreeSha = baselineTreeSha;
 
-      const args = buildChatArgs({
-        promptFile,
-        worktreePath,
-        sessionName,
-        model: options.model,
-        reasoning: options.reasoning,
-        skills: options.skills,
-        usageFile,
-      });
+    try {
+      if (sessionId && previousAfterTreeSha && previousAfterTreeSha !== baselineTreeSha) {
+        const delta = workspaceDeltaPrompt(
+          await gitDiffNames(repoRoot, [], previousAfterTreeSha, baselineTreeSha),
+        );
+        if (delta) promptText = `${delta}\n\n${promptText}`;
+      }
 
       runLog = openRunLog(runLogPath(runId));
-      const execution = await execHermes({
-        args,
-        cwd: worktreePath,
-        timeoutSeconds,
-        repoRoot,
-        env: sandboxedGitEnv(process.env, emptyHooksDir, repoRoot),
-        onSessionId: (sessionId) => {
-          live.sessionId = sessionId;
-          result.sessionId = sessionId;
-          // Published mid-run so a waiter can name the session while it is still going.
-          void publish({ ...runningState(), sessionId });
-        },
-        onChildPid: (pid) => {
-          live.childPid = pid;
-          void publish({ ...runningState(), childPid: pid });
-        },
-        log: runLog,
-      });
-      result.abortedFallback = execution.abortedFallback;
-      if (isRunCancelled(runId)) {
-        result.cancelled = true;
-        result.success = false;
-        result.worktreeKept = false;
-        result.message = "Cancelled while executing: the child was killed and the worktree removed.";
-        return result;
-      }
-      result.timedOut = execution.timedOut;
-      result.exitCode = execution.state.exitCode ?? execution.code;
-      result.sessionId = execution.state.sessionId;
-      result.summary = execution.state.text;
-      result.toolEvents = execution.state.toolEvents;
-      result.tokens = execution.state.tokens;
-      result.durationMs = execution.state.durationMs;
 
-      result.error = execution.state.error;
-      if (execution.abortedFallback) {
-        result.modelFallback = true;
-        result.warning =
-          `Aborted after turn 1: the fallback model answered instead of ${options.model || DEFAULT_MODEL}.`;
-        result.message = `Dispatch refused: Go allowance exhausted, the fallback model answered turn 1. No changes are reviewable.`;
-      }
-      // A missing exit status is not success, and a stream code of 0 must not mask a non-zero
-      // process code (or the other way round).
-      const codes = [execution.state.exitCode, execution.code].filter(
-        (code): code is number => typeof code === "number",
-      );
-      const exitFailed = codes.length === 0 || codes.some((code) => code !== 0);
-      const failed =
-        Boolean(execution.spawnError) || execution.timedOut || execution.state.isError || exitFailed;
+      // The last turn's verdict: a verification retry only helps when the turn itself ran.
+      let turnFailed = false;
+      for (;;) {
+        result.turns += 1;
+        if (sessionId) {
+          const info = await sessionProbe(sessionId, repoRoot).catch(() => null);
+          if (info && info.compactionCount >= maxCompacts) {
+            // The session's own context is the budget: rotate before it is spent entirely, and hand
+            // the fresh session what the old one cannot carry across.
+            const handoff = priorSessionHandoffPrompt({
+              previousSessionId: sessionId,
+              compactionCount: info.compactionCount,
+              summary: info.compactionSummary ?? info.lastAssistantSummary,
+              modifiedFiles: await gitDiffNames(repoRoot, [], initialTreeSha, afterTreeSha).catch(() => []),
+            });
+            promptText = `${handoff}\n\n${promptText}`;
+            turnSessionName = rotatedSessionName(sessionName, result.turns);
+            sessionId = null;
+            result.sessionRotated = true;
+          } else if (info?.tipSessionId) {
+            // A compaction advances the session the next turn must continue from.
+            sessionId = info.tipSessionId;
+          }
+        }
 
-      if (execution.spawnError) {
-        result.message = `Could not start ${hermesExe()}: ${execution.spawnError}`;
-      } else if (execution.timedOut) {
-        result.message = `Hermes exceeded ${timeoutSeconds}s and was killed.`;
-      } else if (failed) {
-        result.message = `Hermes exited ${result.exitCode}${execution.state.error ? `: ${execution.state.error}` : ""}.`;
+        await fsp.writeFile(promptFile, promptText, "utf8");
+        const args = buildChatArgs({
+          promptFile,
+          repoRoot,
+          sessionName: turnSessionName,
+          model: options.model,
+          reasoning: options.reasoning,
+          skills: options.skills,
+          usageFile,
+          resumeSessionId: sessionId ?? undefined,
+        });
+
+        const execution = await execHermes({
+          args,
+          cwd: repoRoot,
+          timeoutSeconds,
+          repoRoot,
+          env: runEnv,
+          onSessionId: (reported) => {
+            live.sessionId = reported;
+            result.sessionId = reported;
+            // Published mid-run so a waiter can name the session while it is still going.
+            void publish({ ...runningState(), sessionId: reported });
+          },
+          onChildPid: (pid) => {
+            live.childPid = pid;
+            void publish({ ...runningState(), childPid: pid });
+          },
+          log: runLog,
+        });
+
+        // Turn 1 is the only turn whose fallback verdict is a hard failure, so it is never lost.
+        result.abortedFallback = result.abortedFallback || execution.abortedFallback;
+        sessionId = execution.state.sessionId ?? sessionId;
+        if (isRunCancelled(runId)) {
+          result.cancelled = true;
+          result.success = false;
+          result.changesKept = false;
+          result.message =
+            "Cancelled while executing: the child was killed and the checkout was reverted.";
+          return result;
+        }
+
+        turnFailed = runFailure(execution).failed;
+        result.timedOut = execution.timedOut;
+        result.exitCode = runFailure(execution).exitCode;
+        result.summary = execution.state.text;
+        result.toolEvents = execution.state.toolEvents;
+        result.tokens = execution.state.tokens;
+        result.durationMs = execution.state.durationMs;
+        result.error = execution.state.error;
+
+        // Captured for every turn: a rollback after a failed verification must undo that turn too.
+        afterTreeSha = (await captureWorkingTreeSnapshot(repoRoot)).treeSha;
+        result.afterTreeSha = afterTreeSha;
+
+        // A turn that was killed has nothing to verify, and a 15-minute build after a 30-minute
+        // timeout is not the caller's time to spend.
+        if (!options.verifyCommand || result.timedOut) break;
+        const verification = await runVerifyCommand(options.verifyCommand, repoRoot, runEnv);
+        result.verifyExitCode = verification.code;
+        result.verifyTimedOut = verification.timedOut;
+        if (verification.code === 0) break;
+        // A verification the clock killed is terminal: another turn would spend the same timeout
+        // again, and its output is the timeout notice rather than a reproduction.
+        if (verification.timedOut) {
+          result.message = `Verification \`${options.verifyCommand}\` timed out after ${result.turns} turn(s).`;
+          break;
+        }
+        // Resuming a session that just failed to produce anything would only repeat the failure.
+        if (result.turns >= maxTurns || !sessionId || turnFailed) {
+          result.message = `Verification \`${options.verifyCommand}\` exited ${verification.code ?? "unknown"} after ${result.turns} turn(s).`;
+          break;
+        }
+        promptText = verificationRetryPrompt({
+          command: options.verifyCommand,
+          exitCode: verification.code,
+          output: verification.output,
+          turn: result.turns,
+          maxTurns,
+        });
+      }
+
+      // A verification that never passed is a failed dispatch even when every turn exited 0: the
+      // caller asked for the command to hold, not for the attempt to be reported as success. A
+      // timed-out verification reports no exit code, so it has to fail this verdict on its own.
+      const verificationFailed =
+        result.verifyTimedOut || (result.verifyExitCode !== null && result.verifyExitCode !== 0);
+      const failed = turnFailed || verificationFailed;
+
+      result.sessionId = sessionId;
+      if (!result.message) {
+        if (result.timedOut) result.message = `Hermes exceeded ${timeoutSeconds}s and was killed.`;
+        else if (failed) result.message = `Hermes exited ${result.exitCode ?? "unknown"}${result.error ? `: ${result.error}` : ""}.`;
       }
 
       if (hooksDir && hooksBefore) {
@@ -1445,78 +1710,41 @@ export const dispatchHermesTask = async (options: DispatchOptions): Promise<Disp
           result.securityViolation = true;
           result.success = false;
           result.violations = touched.map((hook) => `git hook changed: ${hook}`);
-          await destroyWorktree(repoRoot, worktreePath, branch);
-          result.message = `Security violation: git hooks changed during the run (${touched.join(", ")}) — worktree destroyed.`;
+          const reverted = await revertRun();
+          result.message =
+            `Security violation: git hooks changed during the run (${touched.join(", ")}) — changes reverted${reverted}.`;
           return result;
         }
       }
 
-      const staged = await runGit(worktreePath, ["-c", "core.quotePath=false", "add", "-N", "."]);
-      if (!staged.ok) {
-        throw new Error(`git add -N failed: ${(staged.stderr || staged.stdout).trim()}`);
-      }
-
-      const nameOnly = await runGit(worktreePath, [
-        "-c",
-        "core.quotePath=false",
-        "diff",
-        "--name-only",
-        "--no-renames",
-        "-z",
-        baselineSha,
-      ]);
-      if (!nameOnly.ok) {
-        throw new Error(`git diff --name-only failed: ${(nameOnly.stderr || nameOnly.stdout).trim()}`);
-      }
-      result.modifiedFiles = splitNul(nameOnly.stdout);
-
-      const porcelain = await runGit(worktreePath, [
-        "-c",
-        "core.quotePath=false",
-        "status",
-        "--porcelain=v1",
-        "-z",
-        "--ignored",
-        "--no-renames",
-      ]);
-      if (!porcelain.ok) {
-        throw new Error(`git status failed: ${(porcelain.stderr || porcelain.stdout).trim()}`);
-      }
+      result.modifiedFiles = await gitDiffNames(repoRoot, [], baselineTreeSha, afterTreeSha);
+      const statusAfter = await statusEntries(repoRoot);
+      const writtenDuringRun = statusAfter.filter((entry) => !statusBefore.has(entry));
       const violations = secretViolations(
-        porcelain.stdout,
-        new Set(validateModifiedFiles(result.modifiedFiles, worktreePath).violations),
+        writtenDuringRun.join("\0"),
+        new Set(validateModifiedFiles(result.modifiedFiles, repoRoot).violations),
       );
 
-      const diff = await runGit(worktreePath, [
-        "-c",
-        "core.quotePath=false",
-        "diff",
-        "--binary",
-        "--no-renames",
-        baselineSha,
-      ]);
-      if (!diff.ok) {
-        throw new Error(`git diff failed: ${(diff.stderr || diff.stdout).trim()}`);
-      }
-      result.diff = diff.stdout;
+      result.diff = await diffTreeSnapshots(repoRoot, baselineTreeSha, afterTreeSha);
       if (result.diff.length > MAX_DIFF_CHARS) {
         result.diff = `${result.diff.slice(0, MAX_DIFF_CHARS)}\n\n[diff truncated at ${MAX_DIFF_CHARS} chars]`;
         result.diffTruncated = true;
       }
       result.violations = violations;
 
-      // The native usage ledger is authoritative for the turn that was billed; state.db is only a
-      // fallback because the gateway writes it asynchronously and a settling run can be missing.
+      // The native usage ledger is authoritative for the turn that was billed; the session row is
+      // only a fallback because the gateway writes it asynchronously and a settling run can be
+      // missing. Both travel through Hermes' own code, never through a second sqlite reader.
       const usage = readUsageReport(usageFile);
-      const session = result.sessionId ? readSessionAfterRun(result.sessionId, repoRoot) : null;
-      if (session) result.reasoning = session.reasoning;
+      const sessionRow = result.sessionId ? await readSessionAfterRun(result.sessionId, repoRoot) : null;
+      if (sessionRow) result.reasoning = sessionRow.reasoning;
       if (usage?.tokens) result.tokens = { ...(result.tokens ?? {}), ...usage.tokens };
       // A present ledger carries a verdict on cost even when that verdict is "unknown" (null).
       if (usage) result.costUsd = usage.costUsd;
 
       let attributionUnknown = false;
-      const attributedModel = usage?.model ?? session?.model ?? null;
-      const attributedProvider = usage?.provider ?? session?.provider ?? null;
+      const attributedModel = usage?.model ?? sessionRow?.model ?? null;
+      const attributedProvider = usage?.provider ?? sessionRow?.provider ?? null;
       result.model = attributedModel;
       result.provider = attributedProvider;
 
@@ -1524,7 +1752,7 @@ export const dispatchHermesTask = async (options: DispatchOptions): Promise<Disp
       // A fallback is either explicit in the session's routing record, or proven by the ledger
       // naming a model nobody asked for. An absent ledger proves nothing in either direction.
       const fallbackProven =
-        session?.fallbackActive === true ||
+        sessionRow?.fallbackActive === true ||
         (usage !== null && usage.model !== null && !sameModelId(usage.model, requestedModel));
       if (!result.abortedFallback) result.modelFallback = fallbackProven;
 
@@ -1534,19 +1762,17 @@ export const dispatchHermesTask = async (options: DispatchOptions): Promise<Disp
           `Ran on ${attributedModel ?? "unknown"} (${attributedProvider ?? "unknown"}) instead of ${requestedModel}: ` +
             "the requested model was refused by its provider.";
         result.message = `Dispatch refused: Go allowance exhausted, ran on fallback ${attributedModel ?? "unknown"}. No changes are reviewable.`;
-      } else if (usage === null && !session?.known) {
+      } else if (usage === null && !sessionRow?.known) {
         attributionUnknown = true;
       }
 
       if (usage?.failed && usage.failure) result.error = result.error ?? usage.failure;
 
       if (result.modelFallback) {
-        result.diff = "";
-        result.diffTruncated = false;
-        result.modifiedFiles = [];
-        result.worktreeKept = false;
+        const reverted = await revertRun();
         result.success = false;
-        await destroyWorktree(repoRoot, worktreePath, branch);
+        await forgetConversation();
+        result.message = `${result.message} The checkout was reverted${reverted}.`;
         return result;
       }
 
@@ -1563,38 +1789,34 @@ export const dispatchHermesTask = async (options: DispatchOptions): Promise<Disp
       if (violations.length > 0) {
         result.securityViolation = true;
         result.success = false;
-        await destroyWorktree(repoRoot, worktreePath, branch);
-        result.message = `Security violation: ${violations.join(", ")} — worktree destroyed.`;
+        const reverted = await revertRun();
+        await forgetConversation();
+        result.message = `Security violation: ${violations.join(", ")} — changes reverted${reverted}.`;
         return result;
       }
+
+      // The checkout is the only copy of the work: it stays where it is, whatever the verification
+      // said, and the caller decides what to do with it.
+      await rememberSession(sessionId, afterTreeSha);
 
       if (result.modifiedFiles.length === 0) {
-        await destroyWorktree(repoRoot, worktreePath, branch);
         result.success = !failed && !attributionFailed;
-        result.message =
-          result.message || "No files were modified; the worktree and branch were cleaned up.";
+        result.message = result.message || "No files were modified; the checkout was left as it was.";
         return result;
       }
 
-      result.worktreeKept = true;
+      result.changesKept = true;
       result.success = !failed && !attributionFailed;
       const metadata = runMetadata(result);
       result.message =
         result.message ||
-        `${result.modifiedFiles.length} file(s) changed on ${branch}${metadata.duration}. Apply with hermes_worktree_action.` +
-          (baselinePorted > 0
-            ? ` ${baselinePorted} uncommitted caller file(s) were ported into the baseline commit.`
-            : "") +
-          (baselineSkipped.length > 0
-            ? ` Skipped from the baseline: ${baselineSkipped.join(", ")}.`
-            : "") +
+        `${result.modifiedFiles.length} file(s) changed in ${repoRoot}${metadata.duration}. Revert with ` +
+          `hermes_worktree_action action=discard runHandle=${runHandle}.` +
+          (baseline.skipped.length > 0 ? ` Skipped from the snapshot: ${baseline.skipped.join(", ")}.` : "") +
           metadata.brackets;
       return result;
     } catch (error) {
-      // M12: a throw anywhere after the worktree exists must not leave a branch or a directory.
-      await destroyWorktree(repoRoot, worktreePath, branch);
       result.success = false;
-      result.worktreeKept = false;
       result.error = errorMessage(error);
       result.message = `Dispatch failed: ${result.error}`;
       return result;
@@ -1613,13 +1835,54 @@ export const dispatchHermesTask = async (options: DispatchOptions): Promise<Disp
     }
   };
 
+  /** Nothing is deleted until the run is refused: the checkout is the only copy of its work. */
+  const revertRun = async (): Promise<string> => {
+    const after = result.afterTreeSha;
+    if (!after) return "";
+    try {
+      await restoreWorkingTreeSnapshot(repoRoot, baselineTreeSha, after);
+    } catch (error) {
+      return ` (and reverting it failed: ${errorMessage(error)})`;
+    }
+    result.modifiedFiles = [];
+    result.diff = "";
+    result.diffTruncated = false;
+    result.changesKept = false;
+    // The checkout is back at the baseline: a later discard must not try to revert an after-tree
+    // that no longer describes anything.
+    result.afterTreeSha = baselineTreeSha;
+    return "";
+  };
+
+  /**
+   * The binding is what a second dispatch on the same conversation resumes from, so it is written
+   * only when the run left its changes in place: a reverted run has no session worth continuing.
+   */
+  const rememberSession = async (sessionId: string | null, afterTreeSha: string): Promise<void> => {
+    if (!conversationId || !sessionId) return;
+    const record: ConversationSessionRecord = {
+      conversationId,
+      repoRoot,
+      sessionId,
+      initialTreeSha,
+      lastAfterTreeSha: afterTreeSha,
+      updatedAt: Date.now(),
+    };
+    await writeConversationSession(record).catch(() => undefined);
+  };
+
+  const forgetConversation = async (): Promise<void> => {
+    if (!conversationId) return;
+    await clearConversationSession(conversationId, repoRoot).catch(() => undefined);
+  };
+
   // State writes go through one queue: the `running` record can never land after the completion
   // record and resurrect a finished run.
   let stateQueue: Promise<void> = Promise.resolve();
   const publish = (state: RunState): Promise<void> => {
     stateQueue = stateQueue.then(async () => {
       // One-way: a cancel settles the record from another process, and a queued `running` write
-      // landing afterwards would restore a run whose worktree that cancel already deleted.
+      // landing afterwards would restore a run a cancel has already reverted.
       if (state.status === "running" && readRunState(runId)?.status === "completed") return;
       await writeRunState(state).catch(() => undefined);
     });
@@ -1635,8 +1898,10 @@ export const dispatchHermesTask = async (options: DispatchOptions): Promise<Disp
     status: "running",
     runId,
     sessionName,
-    worktreePath,
-    branch,
+    repoRoot,
+    baselineTreeSha,
+    initialTreeSha,
+    conversationId: conversationId ?? undefined,
     startedAt,
     workerPid: process.pid,
     childPid: live.childPid ?? undefined,
@@ -1654,31 +1919,9 @@ export const dispatchHermesTask = async (options: DispatchOptions): Promise<Disp
         message: `Dispatch failed: ${errorMessage(error)}`,
       }),
     );
-    if (
-      options.autoApply === true &&
-      settled.success &&
-      settled.worktreeKept &&
-      !settled.securityViolation &&
-      !settled.cancelled &&
-      settled.branch
-    ) {
-      const applied = await manageWorktree({
-        action: "apply",
-        cwd: repoRoot,
-        worktreeBranch: settled.branch,
-        activeRunId: runId,
-      });
-      if (applied.success) {
-        settled.applied = true;
-        settled.worktreeKept = false;
-        settled.message = `Applied ${settled.modifiedFiles.length} file(s) to ${repoRoot} and removed worktree branch.`;
-      } else {
-        settled.message = `${settled.message} (Auto-apply failed: ${applied.message})`;
-      }
-    }
-    // Read after the apply attempt: an applied diff is billed twice if it is also sent back.
-    const keepDiff = options.includeDiff ?? !settled.applied;
-    if (!keepDiff) {
+    // The run's changes are already in the checkout, so `includeDiff` is the only choice left: the
+    // diff body is a review aid, not a delivery mechanism.
+    if (options.includeDiff === false) {
       settled.diff = "";
       settled.diffTruncated = false;
       settled.diffOmitted = true;
@@ -1714,9 +1957,9 @@ export const dispatchHermesTask = async (options: DispatchOptions): Promise<Disp
     sessionId: live.sessionId,
     sessionName,
     project,
-    worktreePath,
-    branch,
-    baseSha: baselineSha,
+    repoRoot,
+    runHandle,
+    baselineTreeSha,
     waitCommand: `node "${waitJs}" "${runId}"`,
     message:
       `Hermes is still running after ${fastWaitSeconds}s. Execute waitCommand as a background ` +
@@ -1724,33 +1967,51 @@ export const dispatchHermesTask = async (options: DispatchOptions): Promise<Disp
   };
 };
 
+/** The tree a run left behind, when it recorded one: the scope of everything a discard reverts. */
+const recordedAfterTree = (state: RunState | null): string | null => {
+  const result = state?.result;
+  if (!result || typeof result !== "object") return null;
+  const after = (result as { afterTreeSha?: unknown }).afterTreeSha;
+  return typeof after === "string" && after ? after : null;
+};
+
 /**
- * Apply lands the worktree's diff on the caller's checkout; discard throws it away. Both leave
- * the repository with no bridge worktree and no temporary branch behind.
+ * Discard reverts the checkout to the tree the run started from; cancel stops a live run and does
+ * the same. `apply` is a legacy action: a snapshot run is already in the caller's checkout, so there
+ * is nothing to land, and refusing says so instead of pretending to have copied something.
+ *
+ * A run recorded before snapshots existed still resolves to its `.worktrees/agy-*` branch, so an
+ * in-flight worktree from an older worker can still be applied or thrown away.
  */
 export const manageWorktree = async (options: {
   action: "apply" | "discard" | "cancel";
   cwd: string;
-  worktreeBranch: string;
+  /** The run handle hermes_dispatch reported (`agy-<runId>`), or a legacy branch name. */
+  runHandle?: string;
+  legacyBranch?: string;
+  worktreeBranch?: string;
   /** The run that is itself calling this after finishing; its state file still says `running`. */
   activeRunId?: string;
-}): Promise<{ success: boolean; message: string; patchPath?: string; violations?: string[] }> => {
-  // Anything else is a user branch: `branch -D` on it would destroy work this bridge never made.
-  const branchMatch = options.worktreeBranch.match(/^hermes\/agy-([A-Za-z0-9_-]+)$/);
-  if (!branchMatch) {
+}): Promise<{ success: boolean; message: string; patchPath?: string; violations?: string[]; reverted?: string[] }> => {
+  const handle = (options.runHandle ?? options.worktreeBranch ?? options.legacyBranch ?? "").trim();
+  // Anything that is not a run handle is a user branch: reverting the checkout for it would destroy
+  // work this bridge never made.
+  const match = handle.match(/^(?:hermes\/)?(?:agy-)?([A-Za-z0-9_-]+)$/);
+  if (!match) {
     return {
       success: false,
       message:
-        `Refusing to touch branch '${options.worktreeBranch}': only hermes/agy-<runId> branches ` +
-        "created by hermes_dispatch are managed here.",
+        `Refusing to touch '${handle}': expected the run handle hermes_dispatch reported ` +
+        "(agy-<runId>) or a legacy hermes/agy-<runId> branch.",
     };
   }
 
-  const runId = branchMatch[1];
+  const runId = match[1];
+  const legacyBranch = `hermes/agy-${runId}`;
   const activeRun = readRunState(runId);
 
-  // Cancel is the only action allowed to interrupt a live run: it kills the tree, settles the run
-  // record, then removes the worktree through the same path discard uses.
+  // Cancel is the only action allowed to interrupt a live run: it kills the tree and settles the run
+  // record, and the revert below is what puts the checkout back.
   if (options.action === "cancel") {
     // Only the child is killed. `workerPid` is this very bridge process, whose own liveness the
     // record reports: signalling it would take the MCP server down with the run.
@@ -1759,7 +2020,7 @@ export const manageWorktree = async (options: {
 
     // Published before the kill, never after: the pipeline notices its own cancellation by reading
     // this record when the child's close event lands, and a record written afterwards would arrive
-    // too late to stop it from diffing a worktree this call is about to delete.
+    // too late to stop it from diffing a checkout this call is about to revert.
     if (activeRun) {
       await writeRunState({
         ...activeRun,
@@ -1778,23 +2039,25 @@ export const manageWorktree = async (options: {
     if (hadChild) await stopChildProcess(childPid);
   }
 
-  // Refuse to touch a worktree whose Hermes process/session is actively executing. A run that is
-  // applying its own result names itself here: it cannot be mid-execution by definition.
+  // Refuse to touch a checkout a run is actively editing. A run that is applying its own result
+  // names itself here: it cannot be mid-execution by definition. A record whose worker pid no longer
+  // answers is not editing anything either, and refusing it would strand the run's work forever.
   if (
     options.action !== "cancel" &&
     activeRun &&
     activeRun.status === "running" &&
+    !isRunAbandoned(activeRun) &&
     options.activeRunId !== runId
   ) {
     return {
       success: false,
       message:
-        `Refusing to ${options.action} '${options.worktreeBranch}': Hermes run '${runId}' ` +
-        "is still actively executing. Wait for the run to finish, or cancel it.",
+        `Refusing to ${options.action} '${handle}': Hermes run '${runId}' is still actively ` +
+        "executing. Wait for the run to finish, or cancel it.",
     };
   }
 
-  // A call from a subdirectory must still act on the repository root the worktree hangs off.
+  // A call from a subdirectory must still act on the repository root the run executed in.
   const topLevel = await runGit(options.cwd, ["rev-parse", "--show-toplevel"]);
   if (!topLevel.ok) {
     return {
@@ -1803,10 +2066,56 @@ export const manageWorktree = async (options: {
     };
   }
   const repoRoot = path.resolve(topLevel.stdout.trim());
-  const worktreesRoot = path.join(repoRoot, ".worktrees");
 
+  const baselineTreeSha = activeRun?.baselineTreeSha ?? null;
+  if (baselineTreeSha) {
+    if (options.action === "apply") {
+      return {
+        success: false,
+        message:
+          `Nothing to apply for run '${runId}': it executed directly in ${repoRoot}, so its changes ` +
+          `are already in the checkout. Use action=discard to revert them.`,
+      };
+    }
+
+    // A completed run recorded the tree it ended on; a cancelled or crashed one has only what is on
+    // disk now, and that is exactly what the revert has to remove. The child is reaped before the
+    // snapshot: a process still writing would land its last edits after the tree was captured.
+    if (typeof activeRun?.childPid === "number") await stopChildProcess(activeRun.childPid);
+    const afterTreeSha = recordedAfterTree(activeRun) ?? (await captureWorkingTreeSnapshot(repoRoot)).treeSha;
+
+    let reverted: string[];
+    try {
+      const restored = await restoreWorkingTreeSnapshot(repoRoot, baselineTreeSha, afterTreeSha);
+      reverted = [...restored.deleted, ...restored.restored];
+    } catch (error) {
+      return {
+        success: false,
+        message: `Could not revert run '${runId}' in ${repoRoot}: ${errorMessage(error)}`,
+      };
+    }
+
+    // The remembered session describes a checkout that no longer holds its work: drop the binding so
+    // the next dispatch starts from what is actually there.
+    if (activeRun?.conversationId) {
+      await clearConversationSession(activeRun.conversationId, repoRoot).catch(() => undefined);
+    }
+
+    const verb = options.action === "cancel" ? "Cancelled" : "Discarded";
+    return {
+      success: true,
+      reverted,
+      message:
+        reverted.length === 0
+          ? `${verb} run '${runId}'; ${repoRoot} already matched the tree the run started from.`
+          : `${verb} run '${runId}': reverted ${reverted.length} file(s) in ${repoRoot}.`,
+    };
+  }
+
+  // Legacy: a run recorded by a worker that still created `.worktrees/agy-*` checkouts.
+  const worktreesRoot = path.join(repoRoot, ".worktrees");
   const entries = await listWorktrees(repoRoot);
-  const target = entries.find((entry) => entry.branch === options.worktreeBranch);
+  const target = entries.find((entry) => entry.branch === legacyBranch);
   if (!target) {
     return {
       // A cancel that killed a live run has already achieved its purpose; a missing worktree is only
@@ -1814,8 +2123,8 @@ export const manageWorktree = async (options: {
       success: options.action === "cancel",
       message:
         options.action === "cancel"
-          ? `Cancelled run '${runId}'; no worktree for '${options.worktreeBranch}' was left under ${repoRoot}.`
-          : `No worktree for branch '${options.worktreeBranch}' under ${repoRoot}.`,
+          ? `Cancelled run '${runId}'; it had no checkout under ${repoRoot} to revert.`
+          : `No worktree for branch '${legacyBranch}' under ${repoRoot}, and run '${runId}' recorded no snapshot to revert.`,
     };
   }
   if (!isInsidePath(worktreesRoot, target.path)) {
@@ -1838,7 +2147,7 @@ export const manageWorktree = async (options: {
   }
 
   const cleanup = async (): Promise<string | null> => {
-    const removed = await removeWorktree(repoRoot, target.path, options.worktreeBranch);
+    const removed = await removeWorktree(repoRoot, target.path, legacyBranch);
     return removed.ok ? null : (removed.error ?? "worktree cleanup failed");
   };
 
@@ -1847,20 +2156,20 @@ export const manageWorktree = async (options: {
     const verb = options.action === "cancel" ? "Cancelled and discarded" : "Discarded";
     return cleanupError
       ? { success: false, message: `${verb} the worktree but ${cleanupError}.` }
-      : { success: true, message: `${verb} worktree and branch '${options.worktreeBranch}'.` };
+      : { success: true, message: `${verb} worktree and branch '${legacyBranch}'.` };
   }
 
   // `merge-base` is the branch point, which is caller HEAD — it sits BELOW the baseline commit,
   // so diffing from it re-emits the caller's uncommitted work and the patch collides with their
   // dirty tree. The baseline commit is the review boundary: everything the caller already had.
-  const mergeBase = await runGit(repoRoot, ["merge-base", options.worktreeBranch, "HEAD"]);
+  const mergeBase = await runGit(repoRoot, ["merge-base", legacyBranch, "HEAD"]);
   if (!mergeBase.ok) {
     return {
       success: false,
-      message: `Could not find a merge base for '${options.worktreeBranch}': ${mergeBase.stderr.trim()}`,
+      message: `Could not find a merge base for '${legacyBranch}': ${mergeBase.stderr.trim()}`,
     };
   }
-  const baseSha = (await resolveBaselineSha(repoRoot, mergeBase.stdout.trim(), options.worktreeBranch)) ?? mergeBase.stdout.trim();
+  const baseSha = (await resolveBaselineSha(repoRoot, mergeBase.stdout.trim(), legacyBranch)) ?? mergeBase.stdout.trim();
 
   const staged = await runGit(target.path, ["-c", "core.quotePath=false", "add", "-N", "."]);
   if (!staged.ok) {
@@ -1906,7 +2215,7 @@ export const manageWorktree = async (options: {
       // The paths travel as a list: a caller re-splitting the message breaks on a name with ', '.
       violations,
       message:
-        `Refused to apply '${options.worktreeBranch}': ${violations.join(", ")}. ` +
+        `Refused to apply '${legacyBranch}': ${violations.join(", ")}. ` +
         (cleanupError
           ? `The worktree was not fully removed: ${cleanupError}.`
           : "The worktree and branch were destroyed."),
@@ -1929,14 +2238,14 @@ export const manageWorktree = async (options: {
     return {
       success: true,
       message:
-        `No changes to apply on '${options.worktreeBranch}'; worktree removed.` +
+        `No changes to apply on '${legacyBranch}'; worktree removed.` +
         (cleanupError ? ` (${cleanupError})` : ""),
     };
   }
 
   const patchDir = path.join(repoRoot, ".worktrees");
   await fsp.mkdir(patchDir, { recursive: true });
-  const patchPath = path.join(patchDir, `${options.worktreeBranch.replace(/[\\/]/g, "-")}.patch`);
+  const patchPath = path.join(patchDir, `${legacyBranch.replace(/[\\/]/g, "-")}.patch`);
   await fsp.writeFile(patchPath, diff.stdout, "utf8");
 
   // `git apply --3way` implies `--index`, which fails with "does not match index" when the caller
@@ -1960,7 +2269,7 @@ export const manageWorktree = async (options: {
   // `--index` staged what the plain path leaves alone, so the same apply would sometimes hand the
   // caller a staged index. The run lands in the working tree either way.
   if (threeWay && modifiedFiles.length > 0) {
-    await runGit(repoRoot, ["reset", "-q", "--", ...modifiedFiles.map((file) => `:(literal)${file}`)]);
+    await runGit(repoRoot, ["reset", "-q", "--", ...literalPaths(modifiedFiles)]);
   }
 
   const cleanupError = await cleanup();
@@ -1968,7 +2277,7 @@ export const manageWorktree = async (options: {
   return {
     success: true,
     message:
-      `Applied '${options.worktreeBranch}' to ${repoRoot}; worktree removed.` +
+      `Applied '${legacyBranch}' to ${repoRoot}; worktree removed.` +
       (cleanupError ? ` (${cleanupError})` : ""),
     patchPath,
   };
@@ -1984,39 +2293,27 @@ export interface SessionSummaryRow {
   cwd: string | null;
 }
 
-/** A path prefix is data, not a pattern: `%`, `_` and `\` in a Windows path must match literally. */
-const escapeLike = (value: string): string => value.replace(/[\\%_]/g, (match) => `\\${match}`);
-
-export const listHermesSessions = (options: { cwd?: string; limit?: number } = {}): SessionSummaryRow[] => {
+/**
+ * The session listing, read through Hermes' own Python: the schema, the LIKE escaping and the
+ * case-insensitivity of a path are all Hermes' business, and a second sqlite reader here would
+ * silently break on the next migration. An absent store is an empty listing, never a created one.
+ */
+export const listHermesSessions = async (
+  options: { cwd?: string; limit?: number } = {},
+): Promise<SessionSummaryRow[]> => {
   const dbPath = stateDbPath();
+  // Asking the bridge would let its gateway fallback answer for a store that does not exist, and any
+  // read-write handle would leave an empty `state.db` behind for every later reader.
   if (!fs.existsSync(dbPath)) return [];
   const limit = Math.min(Math.max(options.limit ?? 25, 1), 200);
-  let db: DatabaseSync | null = null;
   try {
-    db = new DatabaseSync(dbPath, { readOnly: true });
-    const columns = "id, title, model, started_at, message_count, tool_call_count, cwd";
-    if (options.cwd) {
-      const root = path.resolve(options.cwd).replace(/[\\/]+$/, "");
-      const prefix = `${escapeLike(root + path.sep)}%`;
-      // A path is case-insensitive where the filesystem is, so `= ?` alone hides a session
-      // anchored at the same repository in another case.
-      const equality = (column: string): string => (isWindows ? `lower(${column}) = lower(?)` : `${column} = ?`);
-      const rows = db
-        .prepare(
-          `SELECT ${columns} FROM sessions
-            WHERE ${equality("cwd")} OR cwd LIKE ? ESCAPE '\\' OR ${equality("git_repo_root")} OR git_repo_root LIKE ? ESCAPE '\\'
-            ORDER BY started_at DESC LIMIT ?`,
-        )
-        .all(root, prefix, root, prefix, limit) as unknown as SessionSummaryRow[];
-      return rows;
-    }
-    return db
-      .prepare(`SELECT ${columns} FROM sessions ORDER BY started_at DESC LIMIT ?`)
-      .all(limit) as unknown as SessionSummaryRow[];
+    const result = await runBridge<{ sessions?: unknown }>(
+      { op: "sessions_list", cwd: options.cwd, limit },
+      { timeoutMs: 60_000 },
+    );
+    return Array.isArray(result?.sessions) ? (result.sessions as SessionSummaryRow[]) : [];
   } catch (error) {
     // A locked or corrupt store is the caller's to act on, and a bare sqlite error is not: name it.
     throw new Error(`Could not read Hermes sessions from ${dbPath}: ${errorMessage(error)}`);
-  } finally {
-    db?.close();
   }
 };

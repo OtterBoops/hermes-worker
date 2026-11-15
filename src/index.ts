@@ -26,19 +26,26 @@ server.registerTool(
   {
     title: "Dispatch a task to Hermes Agent",
     description:
-      "Run an implementation, refactor, test-generation or audit task on Hermes inside an isolated " +
-      "git worktree branched from local HEAD. Returns the session id, tool summary, memory/skill " +
-      "writes Hermes staged and the diff (omitted when autoApply already landed it). Nothing is " +
-      "committed to your checkout; land it with hermes_worktree_action. A status of 'running' is a " +
-      "normal answer, not an error: the run outlived fastWaitSeconds, nothing was killed, and " +
-      "running waitCommand as a background command streams the run's log live, then prints a " +
-      "telemetry table (duration, tools, subagents, model, tokens, cost), one sentinel line " +
-      "('<<<HERMES_DISPATCH_COMPLETE:<runId>>>', or '<<<HERMES_DISPATCH_FAILED:<runId>>>' when " +
-      "the run did not succeed) and the result message. Uncommitted caller changes are ported into " +
-      "the worktree as a baseline commit, so the diff covers only Hermes' work. The run is pinned " +
-      "to deepseek-v4.1-flash via the " +
-      "opencode-go provider; if the Go allowance is exhausted, the dispatch fails closed " +
-      "(success: false, modelFallback: true) instead of silently landing on a fallback model.",
+      "Run an implementation, refactor, test-generation or audit task on Hermes directly in the " +
+      "repository checkout Antigravity has open. Hermes edits the real working tree, so its changes " +
+      "are visible immediately: the bridge records the tree before and after the run, returns the " +
+      "session id, tool summary, memory/skill writes and the diff of exactly what the run changed, " +
+      "and reverts them with hermes_worktree_action action=discard. Uncommitted work in the checkout " +
+      "is part of the baseline, so the diff covers only Hermes' work. " +
+      "Multi-turn: pass the same conversationId to continue the previous turn's Hermes session, " +
+      "which is resumed rather than restarted and is told what changed under it since that turn; " +
+      "pass resumeSessionId to continue a specific session, or newSession to start a fresh one. A " +
+      "session that has been compacted maxCompacts times is rotated into a fresh session carrying a " +
+      "handoff note instead of being resumed forever. With verifyCommand set, the command runs in " +
+      "the checkout after every turn and a failing exit is fed back as the next turn's task. " +
+      "A status of 'running' is a normal answer, not an error: the run outlived fastWaitSeconds, " +
+      "nothing was killed, and running waitCommand as a background command streams the run's log " +
+      "live, then prints a telemetry table (duration, tools, subagents, model, tokens, cost), one " +
+      "sentinel line ('<<<HERMES_DISPATCH_COMPLETE:<runId>>>', or " +
+      "'<<<HERMES_DISPATCH_FAILED:<runId>>>' when the run did not succeed) and the result message. " +
+      "The run is pinned to deepseek-v4.1-flash via the opencode-go provider; if the Go allowance is " +
+      "exhausted, the dispatch fails closed (success: false, modelFallback: true) and the checkout is " +
+      "reverted instead of silently landing on a fallback model.",
     inputSchema: {
       prompt: z
         .string()
@@ -51,25 +58,66 @@ server.registerTool(
             "giving each subagent strictly disjoint file paths.",
         ),
       cwd: z.string().optional().describe("Repository path the task belongs to (defaults to the bound project)."),
-      conversationId: z.string().optional().describe("Antigravity conversation id, used to resolve the project."),
+      conversationId: z
+        .string()
+        .optional()
+        .describe(
+          "Antigravity conversation id: resolves the project, and continues the Hermes session the " +
+            "previous turn of this conversation left behind.",
+        ),
       project: z.string().optional().describe("Antigravity project name or id."),
       sessionName: z.string().optional().describe("Thread title in Hermes; auto-generated when omitted."),
+      resumeSessionId: z
+        .string()
+        .optional()
+        .describe(
+          "Continue this Hermes session instead of resolving one from the conversation. Ignored " +
+            "when it has to be rotated for compactions.",
+        ),
+      newSession: z
+        .boolean()
+        .optional()
+        .describe("Start a fresh session even when this conversation already has one remembered."),
+      maxCompacts: z
+        .number()
+        .int()
+        .min(0)
+        .max(20)
+        .optional()
+        .describe(
+          "Compactions a session may accumulate before the dispatch rotates into a fresh one " +
+            "(default 2, or HERMES_MAX_COMPACTS).",
+        ),
+      verifyCommand: z
+        .string()
+        .optional()
+        .describe(
+          "Command run in the checkout after every turn (e.g. 'pnpm run build && pnpm test'). A " +
+            "non-zero exit is fed back to the same session as the next turn's task.",
+        ),
+      maxTurns: z
+        .number()
+        .int()
+        .min(1)
+        .max(10)
+        .optional()
+        .describe("Turn budget for the verifyCommand loop (default 3, clamped to 1..10)."),
       model: z
         .string()
         .optional()
-        .describe("Model override. Defaults to deepseek-v4.1-flash."),
+        .describe("Model override for a new session. Defaults to deepseek-v4.1-flash."),
       reasoning: z
         .string()
         .optional()
         .describe("Reasoning effort (none|minimal|low|medium|high). Defaults to high."),
-      skills: z.array(z.string()).optional().describe("Skills to preload for the run."),
+      skills: z.array(z.string()).optional().describe("Skills to preload when the session is created."),
       timeoutSeconds: z
         .number()
         .int()
         .min(30)
         .max(7200)
         .optional()
-        .describe("Wall-clock budget for the Hermes run (default 1800s)."),
+        .describe("Wall-clock budget for each Hermes turn (default 1800s)."),
       fastWaitSeconds: z
         .number()
         .min(1)
@@ -79,20 +127,12 @@ server.registerTool(
           "How long this call blocks before returning a running descriptor with a waitCommand " +
             "(default 1s). The run keeps going either way.",
         ),
-      autoApply: z
-        .boolean()
-        .optional()
-        .describe(
-          "When true, automatically apply a clean worktree diff to cwd and remove the worktree " +
-            "branch on successful completion.",
-        ),
       includeDiff: z
         .boolean()
         .optional()
         .describe(
-          "Return the diff body even when autoApply landed it. An auto-applied run omits the " +
-            "diff by default because the changes are already on the checkout; a run left for " +
-            "review returns it by default.",
+          "Return the diff body (default true). The changes are in the checkout either way; turn " +
+            "this off when only the file list is needed.",
         ),
     },
   },
@@ -133,17 +173,28 @@ server.registerTool(
 server.registerTool(
   "hermes_worktree_action",
   {
-    title: "Apply or discard a bridge worktree",
+    title: "Revert or cancel a bridge run",
     description:
-      "Land a Hermes run on your working checkout (apply), throw it away (discard), or stop a live " +
-      "run and throw its work away (cancel). Apply patches with git apply --3way and then removes " +
-      "the temporary worktree and branch. Cancel is the only action that interrupts a running " +
+      "Work with a run hermes_dispatch reported, identified by its run handle (runHandle, " +
+      "`agy-<runId>`). discard reverts the checkout to the tree the run started from: files the run " +
+      "added are deleted and files it modified or deleted are restored, scoped to that run's own " +
+      "changes so unrelated edits survive. cancel is the only action that interrupts a running " +
       "dispatch: it kills the run's process tree, settles the run state so no waiter hangs, then " +
-      "removes the worktree and branch.",
+      "reverts the checkout the same way. apply is legacy only — a snapshot run is already in the " +
+      "caller's checkout, so it refuses with that explanation. A run recorded by an older worker " +
+      "that still created a .worktrees/agy-* branch can be applied or discarded through the same " +
+      "handle.",
     inputSchema: {
       action: z.enum(["apply", "discard", "cancel"]),
       cwd: z.string().describe("Repository root."),
-      worktreeBranch: z.string().describe("Branch name reported by hermes_dispatch."),
+      runHandle: z
+        .string()
+        .optional()
+        .describe("Run handle reported by hermes_dispatch (runHandle / `agy-<runId>`)."),
+      worktreeBranch: z
+        .string()
+        .optional()
+        .describe("Legacy alias for runHandle: `hermes/agy-<runId>` from an older worker."),
     },
   },
   guard(async (args) => manageWorktree(args)),
@@ -155,8 +206,9 @@ server.registerTool(
     title: "Sweep orphaned bridge worktrees",
     description:
       "Remove every .worktrees/agy-* directory that no running run owns, then prune git's worktree " +
-      "admin records. A crashed or interrupted dispatch leaves one behind; a running run's worktree " +
-      "and its branch are never touched. Returns the number of directories removed.",
+      "admin records. Dispatches no longer create worktrees, so this only sweeps what an older " +
+      "worker left behind: a running run's worktree and its branch are never touched. Returns the " +
+      "number of directories removed.",
     inputSchema: {
       cwd: z.string().describe("Repository root to sweep."),
     },
@@ -177,7 +229,7 @@ server.registerTool(
       limit: z.number().int().min(1).max(200).optional(),
     },
   },
-  guard(async (args) => ({ sessions: listHermesSessions(args) })),
+  guard(async (args) => ({ sessions: await listHermesSessions(args) })),
 );
 
 const main = async (): Promise<void> => {

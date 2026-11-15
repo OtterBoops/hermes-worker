@@ -12,6 +12,7 @@ import {
   resolveAntigravityProject,
 } from "../src/project-binding.js";
 import { projectsDbPath } from "../src/hermes-paths.js";
+import { makeBridgeHome } from "./bridge-home.js";
 
 test("decodes Antigravity workspace URIs into filesystem paths", () => {
   assert.equal(fileUriToPath("file:///d%3A/Code/OtterBoops/agylity"), "D:\\Code\\OtterBoops\\agylity");
@@ -149,16 +150,25 @@ interface SeedRow {
   primaryPath?: string;
 }
 
-const previousHome = process.env.HERMES_HOME;
+interface TempHome {
+  /** The throwaway HERMES_HOME: `projects.db` lives here and is the only thing seeded. */
+  home: string;
+  /** False when this machine has no Hermes install the bridge could import. */
+  available: boolean;
+}
 
-/** Minimal projects.db: only the columns the resolver reads. */
-const makeTempHome = (t: TestContext, rows: SeedRow[]): string => {
-  const home = fs.mkdtempSync(path.join(os.tmpdir(), "hermes-bind-home-"));
-  t.after(() => {
-    if (previousHome === undefined) delete process.env.HERMES_HOME;
-    else process.env.HERMES_HOME = previousHome;
-    fs.rmSync(home, { recursive: true, force: true });
-  });
+/**
+ * A HERMES_HOME the bridge can actually run in. `makeBridgeHome` owns HERMES_HOME and HERMES_PYTHON
+ * — it links the real agent root in and pins the real interpreter, then restores both on teardown —
+ * so this only seeds the fixture database the resolver reads through `runBridge`.
+ *
+ * node:sqlite stays the fixture writer on purpose: the source stopped reading projects.db itself,
+ * the tests still need a minimal store to read through Hermes' own `projects_list` op.
+ */
+const makeTempHome = async (t: TestContext, rows: SeedRow[]): Promise<TempHome> => {
+  const { home, available } = await makeBridgeHome(t);
+  // Without an interpreter nothing can read the rows, so seeding would only look like coverage.
+  if (!available) return { home, available };
 
   let db: DatabaseSync | null = null;
   try {
@@ -182,16 +192,19 @@ const makeTempHome = (t: TestContext, rows: SeedRow[]): string => {
     db?.close();
   }
 
-  process.env.HERMES_HOME = home;
-  return home;
+  return { home, available };
 };
+
+/** The fixture is absent, not broken: a bridge-dependent case must say so and never pass silently. */
+const NO_BRIDGE = "skipped: this machine has no Hermes install the bridge could import";
 
 test("a temp repo binds to the Hermes project that owns its folder", async (t) => {
   const repo = await makeTempRepo(t);
-  makeTempHome(t, [
+  const { available } = await makeTempHome(t, [
     { id: "p_temp_root", slug: "temp-root", name: "Temp Root", folderPath: repo, primaryPath: repo },
     { id: "p_other", slug: "other", name: "Other", folderPath: path.join(os.tmpdir(), "nowhere-else") },
   ]);
+  if (!available) return t.diagnostic(NO_BRIDGE);
 
   const resolved = await resolveAntigravityProject({ cwd: repo });
   assert.equal(resolved.hermesProjectId, "p_temp_root");
@@ -203,7 +216,10 @@ test("a temp repo binds to the Hermes project that owns its folder", async (t) =
 
 test("primary_path binds when the project has no folder row", async (t) => {
   const repo = await makeTempRepo(t);
-  makeTempHome(t, [{ id: "p_primary", slug: "primary-only", name: "Primary", primaryPath: repo }]);
+  const { available } = await makeTempHome(t, [
+    { id: "p_primary", slug: "primary-only", name: "Primary", primaryPath: repo },
+  ]);
+  if (!available) return t.diagnostic(NO_BRIDGE);
 
   const resolved = await resolveAntigravityProject({ cwd: repo });
   assert.equal(resolved.hermesProjectId, "p_primary");
@@ -212,7 +228,10 @@ test("primary_path binds when the project has no folder row", async (t) => {
 
 test("a subdirectory cwd resolves to the git toplevel", async (t) => {
   const repo = await makeTempRepo(t);
-  makeTempHome(t, [{ id: "p_temp_root", slug: "temp-root", name: "Temp Root", folderPath: repo }]);
+  const { available } = await makeTempHome(t, [
+    { id: "p_temp_root", slug: "temp-root", name: "Temp Root", folderPath: repo },
+  ]);
+  if (!available) return t.diagnostic(NO_BRIDGE);
   const nested = path.join(repo, "src", "deep", "nest");
   fs.mkdirSync(nested, { recursive: true });
 
@@ -224,7 +243,7 @@ test("a subdirectory cwd resolves to the git toplevel", async (t) => {
 test("a matching slug or name never binds an unrelated directory", async (t) => {
   const repo = await makeTempRepo(t);
   const basename = path.basename(repo);
-  makeTempHome(t, [
+  const { available } = await makeTempHome(t, [
     {
       id: "p_unrelated",
       slug: basename.toLowerCase(),
@@ -233,6 +252,7 @@ test("a matching slug or name never binds an unrelated directory", async (t) => 
       primaryPath: path.join(os.tmpdir(), "some-other-checkout"),
     },
   ]);
+  if (!available) return t.diagnostic(NO_BRIDGE);
 
   const resolved = await resolveAntigravityProject({ cwd: repo });
   assert.equal(resolved.hermesProjectId, null, "a same-named project elsewhere must not bind");
@@ -244,11 +264,12 @@ test("a matching slug or name never binds an unrelated directory", async (t) => 
 test("a non-git directory is rejected instead of provisioned", async (t) => {
   const plain = fs.mkdtempSync(path.join(os.tmpdir(), "hermes-bind-plain-"));
   t.after(() => fs.rmSync(plain, { recursive: true, force: true }));
-  makeTempHome(t, []);
+  // The git toplevel probe fails before any project store is read, so no bridge is needed here.
+  await makeTempHome(t, []);
 
   // Guard the fixture: on a machine whose temp dir sits inside a repository this case is moot.
   const probe = await run("git", ["rev-parse", "--show-toplevel"], { cwd: plain, timeoutMs: 30_000 });
-  if (probe.code === 0) return;
+  if (probe.code === 0) return t.diagnostic("skipped: the temp dir is itself inside a git repository");
 
   await assert.rejects(
     resolveAntigravityProject({ cwd: plain }),
@@ -258,7 +279,8 @@ test("a non-git directory is rejected instead of provisioned", async (t) => {
 
 test("a corrupt projects.db fails the resolution closed", async (t) => {
   const repo = await makeTempRepo(t);
-  const home = makeTempHome(t, []);
+  const { home, available } = await makeTempHome(t, []);
+  if (!available) return t.diagnostic(NO_BRIDGE);
   fs.writeFileSync(path.join(home, "projects.db"), "this is not a sqlite database\n", "utf8");
 
   await assert.rejects(resolveAntigravityProject({ cwd: repo }), /Could not read Hermes projects/);
@@ -266,7 +288,8 @@ test("a corrupt projects.db fails the resolution closed", async (t) => {
 
 test("an absent projects.db is an empty project list, not a failure", async (t) => {
   const repo = await makeTempRepo(t);
-  makeTempHome(t, []);
+  // No store on disk means the bridge is never spawned, so this holds without an interpreter too.
+  await makeTempHome(t, []);
 
   const resolved = await resolveAntigravityProject({ cwd: repo });
   assert.equal(resolved.hermesProjectId, null);
@@ -308,7 +331,8 @@ const installStub = (t: TestContext, repo: string): void => {
 
 test("provisioning is explicit, anchored at the repo and reads back by path", async (t) => {
   const repo = await makeTempRepo(t);
-  const home = makeTempHome(t, []);
+  const { home, available } = await makeTempHome(t, []);
+  if (!available) return t.diagnostic(NO_BRIDGE);
   installStub(t, repo);
 
   const resolved = await resolveAntigravityProject({ cwd: repo, allowProvision: true });
@@ -332,7 +356,8 @@ test("provisioning is explicit, anchored at the repo and reads back by path", as
 
 test("without Antigravity evidence and without allowProvision nothing is created", async (t) => {
   const repo = await makeTempRepo(t);
-  const home = makeTempHome(t, []);
+  const { home, available } = await makeTempHome(t, []);
+  if (!available) return t.diagnostic(NO_BRIDGE);
   installStub(t, repo);
 
   const resolved = await resolveAntigravityProject({ cwd: repo });
@@ -394,7 +419,10 @@ test("the deepest matching workspace folder wins over a workspace with a longer 
   // `wide` only reaches the cwd through the shallow folder; its second folder is just longer.
   writeWorkspace(configDir, "wide", [shallow, path.join(root, "z".repeat(80))]);
   writeWorkspace(configDir, "narrow", [deep]);
-  makeTempHome(t, [{ id: "p_ws", slug: "ws", name: "Ws", folderPath: repoRoot }]);
+  const { available } = await makeTempHome(t, [
+    { id: "p_ws", slug: "ws", name: "Ws", folderPath: repoRoot },
+  ]);
+  if (!available) return t.diagnostic(NO_BRIDGE);
 
   const resolved = await resolveAntigravityProject({ cwd });
   assert.equal(resolved.antigravityProjectName, "narrow", "the deeper folder is the specific workspace");
@@ -405,10 +433,11 @@ test("the deepest matching workspace folder wins over a workspace with a longer 
 
 test("two projects claiming the same folder bind deterministically to the lower id", async (t) => {
   const repoRoot = await makeTempRepo(t);
-  makeTempHome(t, [
+  const { available } = await makeTempHome(t, [
     { id: "p_zzz", slug: "zzz", name: "Zzz", folderPath: repoRoot },
     { id: "p_aaa", slug: "aaa", name: "Aaa", folderPath: repoRoot },
   ]);
+  if (!available) return t.diagnostic(NO_BRIDGE);
 
   const resolved = await resolveAntigravityProject({ cwd: repoRoot });
   assert.equal(resolved.hermesProjectId, "p_aaa");
@@ -419,7 +448,8 @@ test("a slug truncated at 60 characters never ends in a separator", async (t) =>
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   // 59 characters then "-b": the cap lands exactly on the separator that replaces the hyphen.
   const repoRoot = await makeTempRepo(t, path.join(root, `${"slug".padEnd(59, "a")}-b`));
-  makeTempHome(t, []);
+  const { available } = await makeTempHome(t, []);
+  if (!available) return t.diagnostic(NO_BRIDGE);
   installStub(t, repoRoot);
 
   const resolved = await resolveAntigravityProject({ cwd: repoRoot, allowProvision: true });
@@ -447,7 +477,8 @@ const JS_STUB = [
 
 test("provisioning runs a script-shaped HERMES_BIN through node", async (t) => {
   const repoRoot = await makeTempRepo(t);
-  makeTempHome(t, []);
+  const { available } = await makeTempHome(t, []);
+  if (!available) return t.diagnostic(NO_BRIDGE);
   const bin = path.join(repoRoot, "hermes-entry.js");
   fs.writeFileSync(bin, JS_STUB, "utf8");
   const previousBin = process.env.HERMES_BIN;

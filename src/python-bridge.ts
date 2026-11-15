@@ -13,6 +13,7 @@ const BRIDGE_SCRIPT = String.raw`
 import json
 import os
 import re
+import sqlite3
 import sys
 import time
 import traceback
@@ -490,6 +491,291 @@ def op_reject(request):
     return _after(subsystem, text or "")
 
 
+def op_projects_list(_request):
+    from hermes_cli import projects_db as pdb
+
+    db_path = pdb.projects_db_path()
+    if not db_path.exists():
+        return {"projects": []}
+
+    rows_out = []
+    with pdb.connect_closing(db_path) as conn:
+        try:
+            projects = pdb.list_projects(conn)
+            for raw_proj in projects:
+                proj = raw_proj.to_dict() if hasattr(raw_proj, "to_dict") else raw_proj
+                if proj.get("archived"):
+                    continue
+                folders = [f.get("path") for f in (proj.get("folders") or []) if f.get("path")]
+                rows_out.append({
+                    "id": proj["id"],
+                    "slug": proj["slug"],
+                    "name": proj["name"],
+                    "primary_path": proj.get("primary_path"),
+                    "folders": folders,
+                })
+        except sqlite3.OperationalError as exc:
+            if "no such column" not in str(exc).lower() and "no such table" not in str(exc).lower():
+                raise
+            # The fallback covers the schema that lacks the column: selecting it again would raise
+            # the very error this branch exists for.
+            cur = conn.execute(
+                "SELECT id, slug, name, primary_path FROM projects"
+            )
+            by_id = {}
+            for row in cur.fetchall():
+                pid = row["id"] if isinstance(row, sqlite3.Row) else row[0]
+                slug = row["slug"] if isinstance(row, sqlite3.Row) else row[1]
+                name = row["name"] if isinstance(row, sqlite3.Row) else row[2]
+                primary_path = row["primary_path"] if isinstance(row, sqlite3.Row) else row[3]
+                by_id[pid] = {
+                    "id": pid,
+                    "slug": slug,
+                    "name": name,
+                    "primary_path": primary_path,
+                    "folders": [],
+                }
+            try:
+                fcur = conn.execute("SELECT project_id, path FROM project_folders")
+                for frow in fcur.fetchall():
+                    pid = frow["project_id"] if isinstance(frow, sqlite3.Row) else frow[0]
+                    fpath = frow["path"] if isinstance(frow, sqlite3.Row) else frow[1]
+                    if pid in by_id and fpath:
+                        by_id[pid]["folders"].append(fpath)
+            except sqlite3.OperationalError:
+                pass
+            rows_out = list(by_id.values())
+    return {"projects": rows_out}
+
+
+def _parse_gateway_runtime(model_config_raw):
+    if not model_config_raw:
+        return None, False
+    try:
+        parsed = json.loads(model_config_raw) if isinstance(model_config_raw, str) else model_config_raw
+    except Exception:
+        return None, False
+    if not isinstance(parsed, dict):
+        return None, False
+    runtime = parsed.get("gateway_runtime")
+    if not isinstance(runtime, dict):
+        return None, False
+    provider = runtime.get("provider")
+    return (provider if isinstance(provider, str) else None), (runtime.get("fallback_active") is True)
+
+
+def _try_gateway_session_info(session_id):
+    try:
+        import asyncio
+        from hermes_cli.gateway_runtime import attachable, discover_gateway_endpoint
+        from hermes_cli.gateway_client import connect_gateway
+
+        discovery = discover_gateway_endpoint(get_hermes_home(), timeout=0.6)
+        if not attachable(discovery) or discovery.endpoint is None:
+            return None, None
+
+        async def _query():
+            async with connect_gateway(discovery.endpoint) as client:
+                info = await client.rpc("session.info", session_id=session_id)
+                transcript = None
+                try:
+                    transcript = await client.rpc("session.transcript", session_id=session_id, order="latest", limit=20)
+                except Exception:
+                    pass
+                return info, transcript
+
+        return asyncio.run(asyncio.wait_for(_query(), timeout=4.0))
+    except Exception:
+        return None, None
+
+
+def op_session_info(request):
+    session_id = request.get("sessionId")
+    if not session_id or not isinstance(session_id, str):
+        raise ValueError("session_info requires sessionId")
+    repo_root = request.get("repoRoot")
+
+    out = {
+        "reasoning": None,
+        "model": None,
+        "provider": None,
+        "fallbackActive": False,
+        "known": False,
+        "tipSessionId": session_id,
+        "compactionCount": 0,
+        # A handoff has no carrier table a read-only probe can reach, so the caller falls back to
+        # lastAssistantSummary; this field stays null by design.
+        "compactionSummary": None,
+        "lastAssistantSummary": None,
+    }
+
+    gw_info, gw_transcript = _try_gateway_session_info(session_id)
+    if isinstance(gw_info, dict):
+        sess = gw_info.get("session") if isinstance(gw_info.get("session"), dict) else gw_info
+        model = sess.get("model")
+        if isinstance(model, str) and model.strip():
+            out["model"] = model
+            out["known"] = True
+        provider, fallback = _parse_gateway_runtime(sess.get("model_config"))
+        if provider:
+            out["provider"] = provider
+        if fallback:
+            out["fallbackActive"] = True
+        if isinstance(sess.get("tip_session_id"), str) and sess.get("tip_session_id"):
+            out["tipSessionId"] = sess["tip_session_id"]
+
+    if isinstance(gw_transcript, dict):
+        msgs = gw_transcript.get("messages") or []
+        for msg in reversed(msgs):
+            if isinstance(msg, dict) and msg.get("role") == "assistant":
+                r = msg.get("reasoning_content") or msg.get("reasoning")
+                if isinstance(r, str) and r:
+                    out["reasoning"] = r
+                content = msg.get("content")
+                if isinstance(content, str) and content.strip():
+                    out["lastAssistantSummary"] = content.strip()[:1500]
+                break
+
+    db_path = get_hermes_home() / "state.db"
+    if not db_path.exists():
+        return out
+
+    if repo_root and isinstance(repo_root, str):
+        try:
+            wconn = sqlite3.connect(str(db_path), timeout=3.0)
+            try:
+                wconn.execute("UPDATE sessions SET cwd = ?, git_repo_root = ? WHERE id = ?", (repo_root, repo_root, session_id))
+                wconn.commit()
+            finally:
+                wconn.close()
+        except Exception:
+            pass
+
+    try:
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=db_path, read_only=True)
+    except Exception:
+        return out
+
+    try:
+        conn = db._conn
+        try:
+            row = conn.execute("SELECT model, model_config FROM sessions WHERE id = ?", (session_id,)).fetchone()
+        except sqlite3.Error:
+            row = None
+
+        if row is not None:
+            model_val = row["model"] if isinstance(row, sqlite3.Row) else row[0]
+            mc_val = row["model_config"] if isinstance(row, sqlite3.Row) else row[1]
+            if isinstance(model_val, str) and model_val.strip():
+                out["model"] = out["model"] or model_val
+                out["known"] = True
+            provider, fallback = _parse_gateway_runtime(mc_val)
+            if provider and not out["provider"]:
+                out["provider"] = provider
+            if fallback:
+                out["fallbackActive"] = True
+
+        # Follow parent_session_id chain forward/backward to count compactions and find tip
+        try:
+            # The chain is a list of session ids, root first: the tail is the live tip.
+            chain = db.get_compression_chain(session_id)
+            if isinstance(chain, list) and len(chain) > 0:
+                out["compactionCount"] = max(0, len(chain) - 1)
+                tip = chain[-1]
+                if isinstance(tip, str) and tip:
+                    out["tipSessionId"] = tip
+        except Exception:
+            pass
+
+        tip_id = out["tipSessionId"] or session_id
+        try:
+            msg_row = conn.execute(
+                "SELECT reasoning, reasoning_content, content FROM messages "
+                "WHERE session_id = ? AND role = 'assistant' ORDER BY id DESC LIMIT 1",
+                (tip_id,),
+            ).fetchone()
+            if msg_row is not None:
+                r = (msg_row["reasoning_content"] if isinstance(msg_row, sqlite3.Row) else msg_row[1]) or (
+                    msg_row["reasoning"] if isinstance(msg_row, sqlite3.Row) else msg_row[0]
+                )
+                if r and not out["reasoning"]:
+                    out["reasoning"] = r
+                c = msg_row["content"] if isinstance(msg_row, sqlite3.Row) else msg_row[2]
+                if isinstance(c, str) and c.strip() and not out["lastAssistantSummary"]:
+                    out["lastAssistantSummary"] = c.strip()[:1500]
+        except sqlite3.Error:
+            pass
+    finally:
+        try:
+            db.close()
+        except Exception:
+            pass
+
+    return out
+
+
+def _escape_like(value):
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def op_sessions_list(request):
+    cwd = request.get("cwd")
+    raw_limit = request.get("limit")
+    try:
+        limit = 25 if raw_limit is None else int(raw_limit)
+    except (TypeError, ValueError):
+        limit = 25
+    limit = min(max(limit, 1), 200)
+
+    db_path = get_hermes_home() / "state.db"
+    if not db_path.exists():
+        # Try gateway if running, otherwise empty list without creating state.db
+        try:
+            import asyncio
+            from hermes_cli.gateway_runtime import attachable, discover_gateway_endpoint
+            from hermes_cli.gateway_client import connect_gateway
+
+            discovery = discover_gateway_endpoint(get_hermes_home(), timeout=0.6)
+            if attachable(discovery) and discovery.endpoint is not None:
+                async def _list():
+                    async with connect_gateway(discovery.endpoint) as client:
+                        return await client.rpc("session.list", scope="stored", workspace=cwd, limit=limit)
+
+                res = asyncio.run(asyncio.wait_for(_list(), timeout=4.0))
+                if isinstance(res, dict) and isinstance(res.get("sessions"), list):
+                    return {"sessions": res["sessions"]}
+        except Exception:
+            pass
+        return {"sessions": []}
+
+    uri = "file:{}?mode=ro".format(db_path.as_posix())
+    conn = sqlite3.connect(uri, uri=True, timeout=3.0)
+    conn.row_factory = sqlite3.Row
+    try:
+        columns = "id, title, model, started_at, message_count, tool_call_count, cwd"
+        if cwd:
+            root = os.path.abspath(cwd).rstrip("\\/")
+            prefix = _escape_like(root + os.sep) + "%"
+            is_win = os.name == "nt"
+            eq = (lambda col: "lower({}) = lower(?)".format(col)) if is_win else (lambda col: "{} = ?".format(col))
+            rows = conn.execute(
+                f"SELECT {columns} FROM sessions "
+                f"WHERE {eq('cwd')} OR cwd LIKE ? ESCAPE '\\' OR {eq('git_repo_root')} OR git_repo_root LIKE ? ESCAPE '\\' "
+                "ORDER BY started_at DESC LIMIT ?",
+                (root, prefix, root, prefix, limit),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                f"SELECT {columns} FROM sessions ORDER BY started_at DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return {"sessions": [dict(r) for r in rows]}
+    finally:
+        conn.close()
+
+
 HANDLERS = {
     "inspect": op_inspect,
     "pending": op_pending,
@@ -497,6 +783,9 @@ HANDLERS = {
     "salvage": op_salvage,
     "approve": op_approve,
     "reject": op_reject,
+    "projects_list": op_projects_list,
+    "session_info": op_session_info,
+    "sessions_list": op_sessions_list,
 }
 
 
@@ -525,9 +814,22 @@ main()
 `;
 
 export interface BridgeRequest {
-  op: "inspect" | "pending" | "diagnose" | "salvage" | "approve" | "reject";
+  op:
+    | "inspect"
+    | "pending"
+    | "diagnose"
+    | "salvage"
+    | "approve"
+    | "reject"
+    | "projects_list"
+    | "session_info"
+    | "sessions_list";
   subsystem?: "memory" | "skills" | "all";
   id?: string;
+  sessionId?: string;
+  repoRoot?: string;
+  cwd?: string;
+  limit?: number;
 }
 
 const SUBSYSTEMS = new Set(["memory", "skills", "all"]);
@@ -603,9 +905,13 @@ export const runBridge = async <T = unknown>(
       timeoutMs: options.timeoutMs ?? 120_000,
     });
 
-    const stderr = (result.stderr || result.stdout).trim();
+    // A spawn failure carries its reason only on `error`: dropping it reports "exited null".
+    const stderr = [result.stderr, result.stdout, result.error].filter((part) => part && part.trim()).join("\n").trim();
     if (result.timedOut) {
       throw new Error(`Hermes bridge timed out after ${options.timeoutMs ?? 120_000}ms: ${stderr}`);
+    }
+    if (result.code === null) {
+      throw new Error(`Hermes bridge could not run: ${result.error ?? (stderr || "no exit status")}`);
     }
     if (result.code !== 0) {
       throw new Error(`Hermes bridge exited ${result.code}: ${stderr}`);
