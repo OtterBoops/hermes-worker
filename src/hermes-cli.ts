@@ -314,6 +314,38 @@ const stopChildProcess = async (pid: number | null | undefined): Promise<boolean
   return !isPidAlive(pid);
 };
 
+const CANCEL_QUIESCE_MS = 5_000;
+const CANCEL_POLL_MS = 50;
+
+/**
+ * Kills every child the run names until the record names none. A cancel can land between a turn's
+ * exit and the verification spawn, so one kill is not proof the loop has stopped: a revert that
+ * starts while the next process is still coming deletes a checkout that process then writes into.
+ * Bounded, because a process that will not die has to be reported rather than waited on forever.
+ */
+const quiesceRunChildren = async (runId: string): Promise<{ quiet: boolean; killed: number }> => {
+  const deadline = Date.now() + CANCEL_QUIESCE_MS;
+  let quietReads = 0;
+  let killed = 0;
+
+  while (Date.now() < deadline) {
+    const pid = readRunState(runId)?.childPid;
+    if (typeof pid === "number" && Number.isFinite(pid) && pid > 0 && pid !== process.pid && isPidAlive(pid)) {
+      quietReads = 0;
+      killed += 1;
+      await stopChildProcess(pid);
+      // Re-read at once: the loop may already have published the next child's pid.
+      continue;
+    }
+    quietReads += 1;
+    // Two quiet reads one poll apart: nothing is about to name a process the revert would race.
+    if (quietReads >= 2) return { quiet: true, killed };
+    await sleep(CANCEL_POLL_MS);
+  }
+
+  return { quiet: false, killed };
+};
+
 /**
  * Windows keeps a directory handle open for a moment after the process that owned it exits, so a
  * single removal attempt fails EPERM/EBUSY and the directory leaks on disk. Retry with backoff.
@@ -981,19 +1013,33 @@ export const parseSessionIdLine = (line: string): string | null => {
   return match ? match[1] : null;
 };
 
-type HooksSnapshot = Map<string, string>;
+interface HookFile {
+  /** mtime, size and the content digest: a rewrite that puts the mtime back still changes the bytes. */
+  signature: string;
+  /** The bytes to put back. A hook is executable code, so a revert restores it rather than drops it. */
+  content: Buffer | null;
+  mode: number;
+}
+
+type HooksSnapshot = Map<string, HookFile>;
 
 /**
  * mtime alone misses a rewrite inside one tick and a rewrite that puts the mtime back, and this
  * guard has to fail closed: the bytes are part of the key alongside the stat a hook cannot fake.
+ * The same read keeps the bytes, because the revert has nothing else to restore from.
  */
-const hookSignature = (absolute: string): string => {
+const readHookFile = (absolute: string): HookFile => {
   try {
     const stat = fs.statSync(absolute);
-    const digest = createHash("sha1").update(fs.readFileSync(absolute)).digest("hex");
-    return `${stat.mtimeMs}:${stat.size}:${digest}`;
+    const content = fs.readFileSync(absolute);
+    return {
+      signature: `${stat.mtimeMs}:${stat.size}:${createHash("sha1").update(content).digest("hex")}`,
+      content,
+      mode: stat.mode & 0o777,
+    };
   } catch {
-    return "0";
+    // Unreadable is not unchanged, and there are no bytes to put back: it can only be compared.
+    return { signature: "0", content: null, mode: 0o644 };
   }
 };
 
@@ -1014,7 +1060,7 @@ const snapshotHooks = (hooksDir: string): HooksSnapshot => {
         walk(absolute, relative, depth + 1);
         continue;
       }
-      snapshot.set(relative, hookSignature(absolute));
+      snapshot.set(relative, readHookFile(absolute));
     }
   };
   walk(hooksDir, "", 0);
@@ -1023,13 +1069,49 @@ const snapshotHooks = (hooksDir: string): HooksSnapshot => {
 
 const changedHooks = (before: HooksSnapshot, after: HooksSnapshot): string[] => {
   const changes = new Set<string>();
-  for (const [name, mtime] of after) {
-    if (before.get(name) !== mtime) changes.add(name);
+  for (const [name, entry] of after) {
+    if (before.get(name)?.signature !== entry.signature) changes.add(name);
   }
   for (const name of before.keys()) {
     if (!after.has(name)) changes.add(name);
   }
   return [...changes];
+};
+
+/**
+ * `.git` is in neither snapshot, so a hook the run rewrote is a change no tree restore can reach:
+ * the baseline bytes are written back and a hook the run added is deleted. A rewrite left in place
+ * executes on the caller's next git command, which is why this is not best-effort.
+ */
+const restoreHooks = (hooksDir: string, before: HooksSnapshot, after: HooksSnapshot): string[] => {
+  const failures: string[] = [];
+
+  for (const relative of after.keys()) {
+    if (before.has(relative)) continue;
+    try {
+      fs.rmSync(path.join(hooksDir, relative), { force: true, recursive: true });
+    } catch (error) {
+      failures.push(`${relative} (${errorMessage(error)})`);
+    }
+  }
+
+  for (const [relative, entry] of before) {
+    if (after.get(relative)?.signature === entry.signature) continue;
+    if (entry.content === null) {
+      failures.push(`${relative} (no baseline bytes were readable)`);
+      continue;
+    }
+    const target = path.join(hooksDir, relative);
+    try {
+      fs.mkdirSync(path.dirname(target), { recursive: true });
+      fs.writeFileSync(target, entry.content);
+      fs.chmodSync(target, entry.mode);
+    } catch (error) {
+      failures.push(`${relative} (${errorMessage(error)})`);
+    }
+  }
+
+  return failures;
 };
 
 /** The hooks dir a linked worktree shares with its repository, before any sandbox overrides it. */
@@ -1039,6 +1121,20 @@ const resolveHooksDir = async (repoRoot: string): Promise<string | null> => {
   const raw = result.stdout.trim();
   if (!raw) return null;
   return path.isAbsolute(raw) ? raw : path.resolve(repoRoot, raw);
+};
+
+/** The one blocked-path rule: the violation scan and the revert that follows it must agree. */
+const isBlockedRelativePath = (posix: string): boolean => {
+  const segments = posix.split("/").filter(Boolean);
+  // An ignored directory is listed as the directory alone, so every segment of it is a directory.
+  const directories = posix.endsWith("/") ? segments : segments.slice(0, -1);
+  // The same precedence validateModifiedFiles uses: a blocked directory wins over the exemption.
+  if (BLOCKED_DIRECTORY_SEGMENTS.some((pattern) => directories.some((directory) => pattern.test(directory)))) {
+    return true;
+  }
+  // Basename, like validateModifiedFiles: a nested `docs/.env.example` is the same template.
+  if (ENV_TEMPLATE.test(path.posix.basename(posix))) return false;
+  return BLOCKED_PATH_PATTERNS.some((pattern) => pattern.test(posix));
 };
 
 /**
@@ -1053,23 +1149,44 @@ const secretViolations = (porcelain: string, alreadyBlocked: Set<string>): strin
     const code = entry.slice(0, 2);
     const file = entry.slice(3);
     if (!file) continue;
-    const posix = file.replace(/\\/g, "/");
-    const segments = posix.split("/").filter(Boolean);
-    // An ignored directory is listed as the directory alone, so every segment of it is a directory.
-    const directories = posix.endsWith("/") ? segments : segments.slice(0, -1);
-    // The same precedence validateModifiedFiles uses: a blocked directory wins over the exemption.
-    const blockedDirectory = BLOCKED_DIRECTORY_SEGMENTS.some((pattern) =>
-      directories.some((directory) => pattern.test(directory)),
-    );
-    if (!blockedDirectory) {
-      // Basename, like validateModifiedFiles: a nested `docs/.env.example` is the same template.
-      if (ENV_TEMPLATE.test(path.posix.basename(posix))) continue;
-      if (!BLOCKED_PATH_PATTERNS.some((pattern) => pattern.test(posix))) continue;
-    }
+    if (!isBlockedRelativePath(file.replace(/\\/g, "/"))) continue;
     // `!!` is ignored: an excluded .env never reaches the diff, so it has to be named here.
     violations.add(code === "!!" ? `ignored secret file: ${file}` : file);
   }
   return [...violations];
+};
+
+/** One spelling for every repo-relative path this file compares, whichever listing produced it. */
+const posixPaths = (paths: Iterable<string>): string[] => [...paths].map((path) => path.replace(/\\/g, "/"));
+
+/** The paths of a `-z` porcelain listing, which rows carry as `XY<space>path`. */
+const statusPaths = (entries: Iterable<string>): string[] =>
+  posixPaths([...entries].filter((entry) => entry.length > 3).map((entry) => entry.slice(3)));
+
+/**
+ * The blocked paths a run wrote, split by what a revert can still do about them. Both snapshots
+ * refuse these paths, so no tree diff names them and the revert works from the listings instead: one
+ * the run created is deleted, and one that was already in the checkout is named because its bytes
+ * are in neither tree and a revert cannot bring them back.
+ */
+const splitBlockedChanges = (
+  repoRoot: string,
+  entries: string[],
+  existing: Set<string>,
+): { created: string[]; unrestorable: string[] } => {
+  const created: string[] = [];
+  const unrestorable: string[] = [];
+  for (const posix of statusPaths(entries)) {
+    if (!isBlockedRelativePath(posix)) continue;
+    if (existing.has(posix)) {
+      unrestorable.push(posix);
+      continue;
+    }
+    const absolute = path.resolve(repoRoot, posix);
+    // A status entry is repository-relative, but a delete driven by one must still not escape it.
+    if (isInsidePath(repoRoot, absolute)) created.push(absolute);
+  }
+  return { created, unrestorable };
 };
 
 /**
@@ -1430,11 +1547,18 @@ export const runVerifyCommand = async (
   command: string,
   cwd: string,
   env: NodeJS.ProcessEnv,
+  /** The verify shell's pid: it holds the checkout for minutes, so a cancel has to be able to kill it. */
+  onChildPid?: (pid: number) => void,
 ): Promise<{ code: number | null; timedOut: boolean; output: string }> => {
   const shell = isWindows
     ? { file: process.env.ComSpec || "cmd.exe", args: ["/d", "/c", command] }
     : { file: "/bin/sh", args: ["-c", command] };
-  const result = await run(shell.file, shell.args, { cwd, env, timeoutMs: VERIFY_TIMEOUT_MS });
+  const result = await run(shell.file, shell.args, {
+    cwd,
+    env,
+    timeoutMs: VERIFY_TIMEOUT_MS,
+    onSpawn: onChildPid,
+  });
   const output = [result.stdout, result.stderr].filter((part) => part.trim()).join("\n");
   return {
     code: result.timedOut ? null : result.code,
@@ -1585,7 +1709,19 @@ export const dispatchHermesTask = async (options: DispatchOptions): Promise<Disp
 
       // The last turn's verdict: a verification retry only helps when the turn itself ran.
       let turnFailed = false;
+      /** One verdict at every point a cancel is noticed: the canceller owns the revert, not this loop. */
+      const cancelled = (): DispatchResult => {
+        result.cancelled = true;
+        result.success = false;
+        result.changesKept = false;
+        result.message = "Cancelled while executing: the child was killed and the checkout was reverted.";
+        return result;
+      };
+
       for (;;) {
+        // Checked before every spawn: a turn started after a cancel writes into a checkout the
+        // canceller is reverting, and its pid never reaches a record that is already terminal.
+        if (isRunCancelled(runId)) return cancelled();
         result.turns += 1;
         if (sessionId) {
           const info = await sessionProbe(sessionId, repoRoot).catch(() => null);
@@ -1632,24 +1768,17 @@ export const dispatchHermesTask = async (options: DispatchOptions): Promise<Disp
             // Published mid-run so a waiter can name the session while it is still going.
             void publish({ ...runningState(), sessionId: reported });
           },
-          onChildPid: (pid) => {
-            live.childPid = pid;
-            void publish({ ...runningState(), childPid: pid });
-          },
+          onChildPid: (pid) => void publishChildPid(pid),
           log: runLog,
         });
 
         // Turn 1 is the only turn whose fallback verdict is a hard failure, so it is never lost.
         result.abortedFallback = result.abortedFallback || execution.abortedFallback;
         sessionId = execution.state.sessionId ?? sessionId;
-        if (isRunCancelled(runId)) {
-          result.cancelled = true;
-          result.success = false;
-          result.changesKept = false;
-          result.message =
-            "Cancelled while executing: the child was killed and the checkout was reverted.";
-          return result;
-        }
+        // The child is gone, so the handle must not outlive it: a cancel reading a dead pid after the
+        // OS recycled it would kill a process this run never started.
+        await publishChildPid(null);
+        if (isRunCancelled(runId)) return cancelled();
 
         turnFailed = runFailure(execution).failed;
         result.timedOut = execution.timedOut;
@@ -1667,7 +1796,17 @@ export const dispatchHermesTask = async (options: DispatchOptions): Promise<Disp
         // A turn that was killed has nothing to verify, and a 15-minute build after a 30-minute
         // timeout is not the caller's time to spend.
         if (!options.verifyCommand || result.timedOut) break;
-        const verification = await runVerifyCommand(options.verifyCommand, repoRoot, runEnv);
+        if (isRunCancelled(runId)) return cancelled();
+        // The verification holds the checkout for minutes and is spawned here, so it is published
+        // like a turn: otherwise a cancel has no handle on the one process that is still writing.
+        const verification = await runVerifyCommand(
+          options.verifyCommand,
+          repoRoot,
+          runEnv,
+          (pid) => void publishChildPid(pid),
+        );
+        await publishChildPid(null);
+        if (isRunCancelled(runId)) return cancelled();
         result.verifyExitCode = verification.code;
         result.verifyTimedOut = verification.timedOut;
         if (verification.code === 0) break;
@@ -1704,22 +1843,41 @@ export const dispatchHermesTask = async (options: DispatchOptions): Promise<Disp
         else if (failed) result.message = `Hermes exited ${result.exitCode ?? "unknown"}${result.error ? `: ${result.error}` : ""}.`;
       }
 
+      // Read before the hook check: either violation ends the run, and the secrets the run created
+      // are part of what the revert has to undo whatever stopped it.
+      const statusAfter = await statusEntries(repoRoot);
+      const writtenDuringRun = statusAfter.filter((entry) => !statusBefore.has(entry));
+      // A blocked path is absent from both trees, so "was it there already" comes from the baseline
+      // snapshot's skipped list and the status listing taken before the run.
+      const existedBefore = new Set([...posixPaths(baseline.skipped), ...statusPaths(statusBefore)]);
+      const blocked = splitBlockedChanges(repoRoot, writtenDuringRun, existedBefore);
+      const unrestorable = blocked.unrestorable.length > 0
+        ? ` Blocked paths the revert cannot restore: ${blocked.unrestorable.join(", ")}.`
+        : "";
+
       if (hooksDir && hooksBefore) {
-        const touched = changedHooks(hooksBefore, snapshotHooks(hooksDir));
+        // One read of the directory: the same listing decides the violation and what to put back.
+        const hooksAfter = snapshotHooks(hooksDir);
+        const touched = changedHooks(hooksBefore, hooksAfter);
         if (touched.length > 0) {
           result.securityViolation = true;
           result.success = false;
           result.violations = touched.map((hook) => `git hook changed: ${hook}`);
-          const reverted = await revertRun();
+          // Restored by hand: `.git` is in neither snapshot, so the tree restore cannot reach it.
+          const unrestored = restoreHooks(hooksDir, hooksBefore, hooksAfter);
+          const reverted = await revertRun(blocked.created);
+          // The checkout no longer holds this session's work, so the binding must go with it.
+          await forgetConversation();
           result.message =
-            `Security violation: git hooks changed during the run (${touched.join(", ")}) — changes reverted${reverted}.`;
+            `Security violation: git hooks changed during the run (${touched.join(", ")}) — changes reverted` +
+            `${reverted}.` +
+            (unrestored.length > 0 ? ` Hooks that could not be restored: ${unrestored.join(", ")}.` : "") +
+            unrestorable;
           return result;
         }
       }
 
       result.modifiedFiles = await gitDiffNames(repoRoot, [], baselineTreeSha, afterTreeSha);
-      const statusAfter = await statusEntries(repoRoot);
-      const writtenDuringRun = statusAfter.filter((entry) => !statusBefore.has(entry));
       const violations = secretViolations(
         writtenDuringRun.join("\0"),
         new Set(validateModifiedFiles(result.modifiedFiles, repoRoot).violations),
@@ -1769,7 +1927,7 @@ export const dispatchHermesTask = async (options: DispatchOptions): Promise<Disp
       if (usage?.failed && usage.failure) result.error = result.error ?? usage.failure;
 
       if (result.modelFallback) {
-        const reverted = await revertRun();
+        const reverted = await revertRun(blocked.created);
         result.success = false;
         await forgetConversation();
         result.message = `${result.message} The checkout was reverted${reverted}.`;
@@ -1789,9 +1947,9 @@ export const dispatchHermesTask = async (options: DispatchOptions): Promise<Disp
       if (violations.length > 0) {
         result.securityViolation = true;
         result.success = false;
-        const reverted = await revertRun();
+        const reverted = await revertRun(blocked.created);
         await forgetConversation();
-        result.message = `Security violation: ${violations.join(", ")} — changes reverted${reverted}.`;
+        result.message = `Security violation: ${violations.join(", ")} — changes reverted${reverted}.${unrestorable}`;
         return result;
       }
 
@@ -1835,23 +1993,38 @@ export const dispatchHermesTask = async (options: DispatchOptions): Promise<Disp
     }
   };
 
-  /** Nothing is deleted until the run is refused: the checkout is the only copy of its work. */
-  const revertRun = async (): Promise<string> => {
-    const after = result.afterTreeSha;
-    if (!after) return "";
-    try {
-      await restoreWorkingTreeSnapshot(repoRoot, baselineTreeSha, after);
-    } catch (error) {
-      return ` (and reverting it failed: ${errorMessage(error)})`;
+  /**
+   * Nothing is deleted until the run is refused: the checkout is the only copy of its work. A blocked
+   * path is in neither snapshot, so the tree cannot take back the secret the run wrote: those paths
+   * are deleted by name here, or the "reverted" verdict is a claim the checkout does not support.
+   */
+  const revertRun = async (secretPaths: string[] = []): Promise<string> => {
+    const failures: string[] = [];
+    for (const target of secretPaths) {
+      try {
+        await fsp.rm(target, { recursive: true, force: true });
+      } catch (error) {
+        failures.push(`${target} could not be deleted (${errorMessage(error)})`);
+      }
     }
-    result.modifiedFiles = [];
-    result.diff = "";
-    result.diffTruncated = false;
-    result.changesKept = false;
-    // The checkout is back at the baseline: a later discard must not try to revert an after-tree
-    // that no longer describes anything.
-    result.afterTreeSha = baselineTreeSha;
-    return "";
+
+    const after = result.afterTreeSha;
+    if (after) {
+      try {
+        await restoreWorkingTreeSnapshot(repoRoot, baselineTreeSha, after);
+        result.modifiedFiles = [];
+        result.diff = "";
+        result.diffTruncated = false;
+        result.changesKept = false;
+        // The checkout is back at the baseline: a later discard must not try to revert an after-tree
+        // that no longer describes anything.
+        result.afterTreeSha = baselineTreeSha;
+      } catch (error) {
+        failures.push(`reverting the checkout failed (${errorMessage(error)})`);
+      }
+    }
+
+    return failures.length > 0 ? ` (and ${failures.join("; ")})` : "";
   };
 
   /**
@@ -1907,6 +2080,21 @@ export const dispatchHermesTask = async (options: DispatchOptions): Promise<Disp
     childPid: live.childPid ?? undefined,
     sessionId: live.sessionId,
   });
+
+  /**
+   * The live child handle: published at every spawn, cleared the moment that child exits. It is
+   * written even into a record another process has already settled, because a cancel can only kill a
+   * process it can find — the status and the result of that record are never touched here.
+   */
+  const publishChildPid = (pid: number | null): Promise<void> => {
+    live.childPid = pid;
+    stateQueue = stateQueue.then(async () => {
+      const current = readRunState(runId);
+      if (!current) return;
+      await writeRunState({ ...current, childPid: pid ?? undefined }).catch(() => undefined);
+    });
+    return stateQueue;
+  };
 
   const completion: Promise<DispatchResult> = (async () => {
     const settled = await runPipeline().catch(
@@ -2012,31 +2200,41 @@ export const manageWorktree = async (options: {
 
   // Cancel is the only action allowed to interrupt a live run: it kills the tree and settles the run
   // record, and the revert below is what puts the checkout back.
+  let killedChildren = 0;
   if (options.action === "cancel") {
-    // Only the child is killed. `workerPid` is this very bridge process, whose own liveness the
-    // record reports: signalling it would take the MCP server down with the run.
-    const childPid = activeRun?.childPid;
-    const hadChild = typeof childPid === "number" && Number.isFinite(childPid) && childPid > 0;
-
     // Published before the kill, never after: the pipeline notices its own cancellation by reading
     // this record when the child's close event lands, and a record written afterwards would arrive
-    // too late to stop it from diffing a checkout this call is about to revert.
+    // too late to stop it from spawning the next turn.
     if (activeRun) {
+      // Re-read for the child handle: the pipeline may have published a verification pid since this
+      // call started, and overwriting it would hide the process the kill below is aiming at.
+      const settled = readRunState(runId) ?? activeRun;
       await writeRunState({
-        ...activeRun,
+        ...settled,
         status: "completed",
         result: {
           success: false,
           cancelled: true,
-          message: hadChild
-            ? `Cancelled: killed the run's process tree (pid ${childPid}).`
-            : "Cancelled: the run had no live child process.",
+          message: "Cancelled: the run's process tree was stopped.",
           timedOut: false,
         },
       }).catch(() => undefined);
     }
 
-    if (hadChild) await stopChildProcess(childPid);
+    // Only the children are killed. `workerPid` is this very bridge process, whose own liveness the
+    // record reports: signalling it would take the MCP server down with the run.
+    const quiesced = await quiesceRunChildren(runId);
+    killedChildren = quiesced.killed;
+    if (!quiesced.quiet) {
+      // Reverting now would race the process that is still writing: the caller would be told the
+      // checkout was restored while the run kept editing it.
+      return {
+        success: false,
+        message:
+          `Cancelled run '${runId}' but its process tree did not stop within ${CANCEL_QUIESCE_MS}ms; ` +
+          "the checkout was left untouched. Retry the cancel once the run's child has exited.",
+      };
+    }
   }
 
   // Refuse to touch a checkout a run is actively editing. A run that is applying its own result
@@ -2102,13 +2300,17 @@ export const manageWorktree = async (options: {
     }
 
     const verb = options.action === "cancel" ? "Cancelled" : "Discarded";
+    // What was killed is part of the verdict: a cancel that found nothing is a different answer.
+    const killed = options.action === "cancel" && killedChildren > 0
+      ? ` Killed ${killedChildren} child process tree(s).`
+      : "";
     return {
       success: true,
       reverted,
       message:
-        reverted.length === 0
+        (reverted.length === 0
           ? `${verb} run '${runId}'; ${repoRoot} already matched the tree the run started from.`
-          : `${verb} run '${runId}': reverted ${reverted.length} file(s) in ${repoRoot}.`,
+          : `${verb} run '${runId}': reverted ${reverted.length} file(s) in ${repoRoot}.`) + killed,
     };
   }
 

@@ -302,26 +302,123 @@ export const readConversationSession = async (
   return matches.find((record) => conversationPathKey(record.repoRoot) === key) ?? null;
 };
 
+/** A lock left behind by a holder that died must not stop every later write. */
+export const CONVERSATION_LOCK_FILE = "conversation-sessions.lock";
+const LOCK_POLL_MS = 10;
+const LOCK_WAIT_MS = 2_000;
+/** A pid is the proof of a live holder; age only decides it when the file names none. */
+const LOCK_STALE_MS = 30_000;
+
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+const conversationLockPath = (): string => path.join(RUN_STATE_DIR, CONVERSATION_LOCK_FILE);
+
+const releaseConversationLock = async (): Promise<void> => {
+  await fsp.rm(conversationLockPath(), { force: true }).catch(() => undefined);
+};
+
+/**
+ * A holder that crashed leaves its lock behind. The pid it wrote is the proof: an id that no longer
+ * answers means the section it was protecting died with it, and waiting would stall every write.
+ */
+const lockIsAbandoned = async (): Promise<boolean> => {
+  let owner: string;
+  let mtimeMs: number;
+  try {
+    owner = await fsp.readFile(conversationLockPath(), "utf8");
+    mtimeMs = (await fsp.stat(conversationLockPath())).mtimeMs;
+  } catch {
+    // Gone between the failed create and this read: its holder released it, so try the create again.
+    return true;
+  }
+  const pid = Number.parseInt(owner.trim(), 10);
+  if (Number.isFinite(pid) && pid > 0) return !isPidAlive(pid);
+  // A lock whose owner has not written its pid yet is only old, never abandoned.
+  return Date.now() - mtimeMs > LOCK_STALE_MS;
+};
+
+/**
+ * The map is one shared file, so two writers that read the same base each write back a file without
+ * the other's record: the last rename wins and the peer record is silently gone. `wx` is an atomic
+ * create on NTFS and POSIX alike, which is what makes a bare lock file safe without a lock daemon.
+ */
+const withConversationLock = async <T>(work: () => Promise<T>): Promise<T> => {
+  await fsp.mkdir(RUN_STATE_DIR, { recursive: true });
+  const deadline = Date.now() + LOCK_WAIT_MS;
+  let owned = false;
+
+  for (;;) {
+    try {
+      const handle = await fsp.open(conversationLockPath(), "wx");
+      try {
+        await handle.writeFile(String(process.pid), "utf8");
+      } finally {
+        await handle.close();
+      }
+      owned = true;
+      break;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      if (await lockIsAbandoned()) {
+        await releaseConversationLock();
+        continue;
+      }
+      if (Date.now() > deadline) {
+        // Refusing the write would lose the caller's binding outright, and the section being waited
+        // on is a read plus one rename: a holder still inside it this long is stuck, not busy.
+        break;
+      }
+      await sleep(LOCK_POLL_MS);
+    }
+  }
+
+  try {
+    return await work();
+  } finally {
+    // Only the process that took the lock releases it: a timed-out waiter owns nothing here.
+    if (owned) await releaseConversationLock();
+  }
+};
+
+/**
+ * Every mutation is a read-modify-write of that one file, so they queue here as well as on disk: the
+ * two dispatches of a multi-turn conversation run in this process, and a queued write cannot read a
+ * base its predecessor is about to replace.
+ */
+let conversationQueue: Promise<unknown> = Promise.resolve();
+
+const mutateConversationMap = <T>(work: () => Promise<T>): Promise<T> => {
+  const next = conversationQueue.then(() => withConversationLock(work));
+  // A mutation that threw must not poison every write behind it.
+  conversationQueue = next.catch(() => undefined);
+  return next;
+};
+
 export const writeConversationSession = async (record: ConversationSessionRecord): Promise<void> => {
   const key = conversationPathKey(record.repoRoot);
-  const records = await readConversationRecords();
-  const kept = records.filter(
-    (candidate) =>
-      candidate.conversationId !== record.conversationId || conversationPathKey(candidate.repoRoot) !== key,
-  );
-  await writeConversationRecords([...kept, record]);
+  await mutateConversationMap(async () => {
+    const records = await readConversationRecords();
+    const kept = records.filter(
+      (candidate) =>
+        candidate.conversationId !== record.conversationId || conversationPathKey(candidate.repoRoot) !== key,
+    );
+    await writeConversationRecords([...kept, record]);
+  });
 };
 
 /** A discarded or cancelled run leaves the checkout at its start tree: the binding no longer holds. */
 export const clearConversationSession = async (conversationId: string, repoRoot?: string): Promise<void> => {
   if (!conversationId) return;
   const key = repoRoot ? conversationPathKey(repoRoot) : null;
-  const records = await readConversationRecords();
-  const kept = records.filter(
-    (candidate) =>
-      candidate.conversationId !== conversationId ||
-      (key !== null && conversationPathKey(candidate.repoRoot) !== key),
-  );
-  if (kept.length === records.length) return;
-  await writeConversationRecords(kept).catch(() => undefined);
+  await mutateConversationMap(async () => {
+    const records = await readConversationRecords();
+    const kept = records.filter(
+      (candidate) =>
+        candidate.conversationId !== conversationId ||
+        (key !== null && conversationPathKey(candidate.repoRoot) !== key),
+    );
+    // Nothing to drop is a no-op: a write here would rewrite a map that already says what it must.
+    if (kept.length === records.length) return;
+    await writeConversationRecords(kept).catch(() => undefined);
+  });
 };

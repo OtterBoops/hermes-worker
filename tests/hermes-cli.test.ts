@@ -50,6 +50,7 @@ import {
   readRunState,
   runLogPath,
   runStatePath,
+  writeConversationSession,
   writeRunState,
 } from "../src/run-registry.js";
 import { formatStreamLine, openRunLog } from "../src/run-log.js";
@@ -439,6 +440,10 @@ const chatStub = (options: StubOptions): string =>
     "  const before = fs.statSync(hookFile);",
     '  fs.writeFileSync(hookFile, "#!/bin/sh\\\\necho pwned\\\\n");',
     "  fs.utimesSync(hookFile, before.atime, before.mtime);",
+    "}",
+    // A hook that did not exist before the run: the revert has to delete it, not restore it.
+    "if (MUTATE_HOOK && process.env.HCLI_HOOK_ADD_FILE) {",
+    '  fs.writeFileSync(process.env.HCLI_HOOK_ADD_FILE, "#!/bin/sh\\\\necho added\\\\n");',
     "}",
     "if (SLEEP_MS > 0) await new Promise((resolve) => setTimeout(resolve, SLEEP_MS));",
     "if (usageFile && WRITE_USAGE) {",
@@ -2241,6 +2246,65 @@ test("cancel kills the run's child, settles the record and reverts the checkout"
   assert.equal(fs.existsSync(path.join(repo, "auto-applied.ts")), false);
 });
 
+/**
+ * The verification command is a child of this process too, and it holds the checkout for minutes. If
+ * it is not published as the run's child, a cancel kills the Hermes turn's pid instead — a process
+ * that has already exited — then reverts underneath the verification. The loop also has to stop
+ * spawning: without a gate it starts a retry turn into the checkout the cancel just reverted.
+ */
+test("cancel kills a running verification and leaves no post-cancel edit behind", async (t) => {
+  const runId = `cancel-verify-${process.pid}-${Date.now().toString(36)}`;
+  const { repo, callsPath } = await makeDispatchRepo(t);
+  t.after(() => clearRunState(runId));
+
+  // Relative names only: `runVerifyCommand` hands the command to `cmd /d /c`, which eats the quotes
+  // around an absolute path. The probe is ignored so it is not part of the run's change set.
+  const startedFile = path.join(repo, "verify-started.txt");
+  const lateFile = path.join(repo, "verify-late.txt");
+  const probe = path.join(repo, "verify-probe.cjs");
+  fs.writeFileSync(
+    probe,
+    [
+      'const fs = require("node:fs");',
+      'fs.writeFileSync("verify-started.txt", "started");',
+      // A long sleep keeps the verification running while the cancel lands, and the write after it is
+      // the edit that must never reach a checkout the cancel has already reverted.
+      'setTimeout(() => fs.writeFileSync("verify-late.txt", "late"), 20000);',
+    ].join(String.fromCharCode(10)),
+    "utf8",
+  );
+  fs.appendFileSync(path.join(repo, ".git", "info", "exclude"), "verify-probe.cjs\n", "utf8");
+
+  const outcome = await dispatchHermesTask({
+    cwd: repo,
+    prompt: "Add auto-applied.ts to the repository root.",
+    runId,
+    verifyCommand: "node verify-probe.cjs",
+    fastWaitSeconds: 0.5,
+  });
+  assert.ok("waitCommand" in outcome, "the verification keeps the run going");
+
+  // No verification has started until the probe writes its marker, so there is nothing to cancel yet.
+  for (let attempt = 0; attempt < 300 && !fs.existsSync(startedFile); attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  assert.equal(fs.existsSync(startedFile), true, "the verification never started");
+
+  const verifyPid = readRunState(runId)?.childPid;
+  assert.equal(typeof verifyPid, "number", "the verification child has to be published as the run's child");
+  assert.equal(isPidAlive(verifyPid), true, `the published child must be the live verification (pid ${verifyPid})`);
+
+  const cancelled = await manageWorktree({ action: "cancel", cwd: repo, runHandle: `agy-${runId}` });
+  assert.equal(cancelled.success, true, cancelled.message);
+  assert.equal(isPidAlive(verifyPid), false, "the verification process tree must be dead before the revert");
+
+  // Room for the unwound pipeline to finish and for any post-cancel spawn or write to show up.
+  await new Promise((resolve) => setTimeout(resolve, 2_500));
+  assert.equal(fs.existsSync(lateFile), false, "a killed verification must not write after the cancel");
+  assert.equal(readStubCalls(callsPath).length, 1, "a cancelled run must not start another turn");
+  assert.equal(await git(repo, ["status", "--porcelain"]), "", "no post-cancel edit may survive in the checkout");
+});
+
 test("apply and discard still refuse a live run, naming cancel as the way out", async (t) => {
   const runId = `live-${process.pid}-${Date.now().toString(36)}`;
   const { repo } = await makeRepo(t);
@@ -2341,9 +2405,26 @@ test("a hook rewritten with its mtime restored is still a security violation, an
     else process.env.HCLI_HOOK_FILE = previousHook;
   });
 
+  // What a previous turn of this conversation left behind: the binding the next turn would resume.
+  const conversationId = `conv-hook-${process.pid}-${Date.now().toString(36)}`;
+  const repoRoot = path.resolve((await git(repo, ["rev-parse", "--show-toplevel"])).trim());
+  // A real tree object, so resuming it costs nothing: the dispatch must read the binding, not trip
+  // over a stale hash before it ever reaches the hook check.
+  const seededTree = (await captureWorkingTreeSnapshot(repo)).treeSha;
+  await writeConversationSession({
+    conversationId,
+    repoRoot,
+    sessionId: "sess-hook-previous",
+    initialTreeSha: seededTree,
+    lastAfterTreeSha: seededTree,
+    updatedAt: Date.now(),
+  });
+  t.after(() => clearConversationSession(conversationId));
+
   const result = (await dispatchHermesTask({
     cwd: repo,
     prompt: "Add auto-applied.ts to the repository root.",
+    conversationId,
     runId,
     fastWaitSeconds: 120,
   })) as DispatchResult;
@@ -2353,6 +2434,46 @@ test("a hook rewritten with its mtime restored is still a security violation, an
   assert.match(result.message, /reverted/);
   assert.equal(result.success, false);
   assert.equal(fs.existsSync(path.join(repo, "auto-applied.ts")), false, "a violation reverts the run's work");
+  // A hook is executable code that runs on the caller's next git command, and `.git` is outside
+  // both snapshots: the revert has to put the hook back or it was never reverted at all.
+  assert.equal(
+    fs.readFileSync(hookFile, "utf8"),
+    "#!/bin/sh\nexit 0\n",
+    "a rewritten hook must be restored by the revert",
+  );
+  // The work is gone from the checkout, so the conversation must not stay bound to its session:
+  // the next turn would resume a session whose output was just reverted.
+  assert.equal(
+    await readConversationSession(conversationId),
+    null,
+    "a refused run must not leave the conversation bound to the rejected session",
+  );
+});
+
+test("a hook the run created is deleted by the revert", async (t) => {
+  const runId = `hookadd-${process.pid}-${Date.now().toString(36)}`;
+  const { repo } = await makeDispatchRepo(t, { mutateHook: true });
+  const added = path.join(repo, ".git", "hooks", "post-checkout");
+  fs.mkdirSync(path.dirname(added), { recursive: true });
+
+  const previousAdd = process.env.HCLI_HOOK_ADD_FILE;
+  process.env.HCLI_HOOK_ADD_FILE = added;
+  t.after(() => {
+    if (previousAdd === undefined) delete process.env.HCLI_HOOK_ADD_FILE;
+    else process.env.HCLI_HOOK_ADD_FILE = previousAdd;
+  });
+
+  const result = (await dispatchHermesTask({
+    cwd: repo,
+    prompt: "Add auto-applied.ts to the repository root.",
+    runId,
+    fastWaitSeconds: 120,
+  })) as DispatchResult;
+
+  assert.equal(result.securityViolation, true, result.message);
+  assert.equal(result.success, false);
+  // `.git` is in neither snapshot, so deleting it is the only thing that stops it running later.
+  assert.equal(fs.existsSync(added), false, "a hook the run added must not survive the revert");
 });
 
 test("a secret written during the run is a violation that blocks the review", async (t) => {
@@ -2389,6 +2510,95 @@ test("a secret written during the run is a violation that blocks the review", as
   assert.equal(result.changesKept, false);
   // The tree-scoped revert still removes the tracked work the run did alongside the secret.
   assert.equal(fs.existsSync(path.join(repo, "auto-applied.ts")), false);
+  // The secret is the thing the violation is about, and no snapshot tree can hold it: leaving it on
+  // disk means the checkout still carries the credential the dispatch reported as reverted.
+  assert.equal(fs.existsSync(path.join(repo, ".env")), false, "the secret must not survive the revert");
+});
+
+/**
+ * A blocked path the run overwrote was in the checkout before it ran, so the revert must not delete
+ * it: the file that existed is the caller's, and the dispatch has to say the bytes are not restored.
+ */
+test("a blocked path the run overwrote is kept and reported as unrestorable", async (t) => {
+  const runId = `secretover-${process.pid}-${Date.now().toString(36)}`;
+  const { repo, home } = await makeDispatchRepo(t, { sessionId: "sess-secret-over" });
+  const credential = path.join(repo, "credentials.json");
+  fs.writeFileSync(credential, '{"client_email":"caller@example.invalid"}\n', "utf8");
+  await git(repo, ["add", "credentials.json"]);
+  await git(repo, ["commit", "-m", "track a service account"]);
+
+  rearmStub({
+    sessionId: "sess-secret-over",
+    writeUsage: {
+      session_id: "sess-secret-over",
+      model: DEFAULT_MODEL,
+      provider: "opencode-go",
+      failed: false,
+    },
+    payload: {
+      first: { file: "credentials.json", content: '{"client_email":"stolen@example.invalid"}\n' },
+      later: { file: "credentials.json", content: '{"client_email":"stolen@example.invalid"}\n' },
+      marker: path.join(home, "secret-over-marker"),
+    },
+    writeAutoApplied: true,
+  });
+  process.env.HERMES_HOME = home;
+
+  const result = (await dispatchHermesTask({
+    cwd: repo,
+    prompt: "Rewrite the service account.",
+    runId,
+    fastWaitSeconds: 120,
+  })) as DispatchResult;
+
+  assert.equal(result.securityViolation, true, result.message);
+  // Deleting it would lose the caller's file outright: the trap this guard exists for.
+  assert.equal(fs.existsSync(credential), true, "a blocked path that already existed is not the run's to delete");
+  assert.match(result.message, /cannot restore: credentials\.json/);
+  assert.equal(fs.existsSync(path.join(repo, "auto-applied.ts")), false, "the run's tracked work is still reverted");
+});
+
+/**
+ * The revert deletes blocked paths by name, so the scope matters as much as the delete: a secret that
+ * was already in the checkout is the caller's, and dropping it would be worse than the violation.
+ */
+test("the revert removes only the blocked paths the run created", async (t) => {
+  const runId = `secretkeep-${process.pid}-${Date.now().toString(36)}`;
+  const { repo, home } = await makeDispatchRepo(t, { sessionId: "sess-secret-keep" });
+  rearmStub({
+    sessionId: "sess-secret-keep",
+    writeUsage: {
+      session_id: "sess-secret-keep",
+      model: DEFAULT_MODEL,
+      provider: "opencode-go",
+      failed: false,
+    },
+    payload: {
+      first: { file: ".npmrc", content: "//registry.example/:_authToken=stolen\n" },
+      later: { file: ".npmrc", content: "//registry.example/:_authToken=stolen\n" },
+      marker: path.join(home, "secret-keep-marker"),
+    },
+    writeAutoApplied: true,
+  });
+  process.env.HERMES_HOME = home;
+  fs.appendFileSync(path.join(repo, ".git", "info", "exclude"), ".env\n.npmrc\n", "utf8");
+  const callerSecret = path.join(repo, ".env");
+  fs.writeFileSync(callerSecret, "REAL=production-token\n", "utf8");
+
+  const result = (await dispatchHermesTask({
+    cwd: repo,
+    prompt: "Write the registry credentials.",
+    runId,
+    fastWaitSeconds: 120,
+  })) as DispatchResult;
+
+  assert.equal(result.securityViolation, true, result.message);
+  assert.equal(fs.existsSync(path.join(repo, ".npmrc")), false, "the secret the run wrote is removed");
+  assert.equal(
+    fs.readFileSync(callerSecret, "utf8"),
+    "REAL=production-token\n",
+    "a secret that was already there is not the run's to delete",
+  );
 });
 
 /**

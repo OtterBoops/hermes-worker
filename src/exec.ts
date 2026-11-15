@@ -14,6 +14,8 @@ export interface RunOptions {
   cwd?: string;
   env?: NodeJS.ProcessEnv;
   timeoutMs?: number;
+  /** The spawned child's pid, for a caller that has to be able to kill it from another call. */
+  onSpawn?: (pid: number) => void;
 }
 
 /** 16MB per stream: a runaway command must not be able to exhaust the host's memory. */
@@ -130,6 +132,14 @@ export const run = (
       windowsHide: true,
       stdio: ["ignore", "pipe", "pipe"],
     });
+
+    if (typeof child.pid === "number") {
+      try {
+        options.onSpawn?.(child.pid);
+      } catch {
+        // A caller's bookkeeping must never take the command down with it.
+      }
+    }
 
     const settle = (code: number | null, error?: string): void => {
       if (settled) return;

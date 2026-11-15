@@ -1,10 +1,11 @@
-import test from "node:test";
+import test, { mock } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import {
+  CONVERSATION_LOCK_FILE,
   CONVERSATION_SESSIONS_FILE,
   RUN_STATE_DIR,
   clearConversationSession,
@@ -268,6 +269,78 @@ test("two conversations across two repositories keep four independent records", 
     wide?.sessionId === "a-one" || wide?.sessionId === "a-two",
     "a conversation-wide read returns one of that conversation's records",
   );
+});
+
+/**
+ * Every mutation is a read-modify-write of one shared file, so two writers that read the same base
+ * each land a map without the other's record: the loser's conversation silently starts over.
+ */
+test("concurrent conversation writes never lose a record", async (t) => {
+  const conversations = Array.from({ length: 6 }, (_, index) => uniqueId(`conv-race-${index}`));
+  const lockPath = path.join(RUN_STATE_DIR, CONVERSATION_LOCK_FILE);
+  fs.mkdirSync(RUN_STATE_DIR, { recursive: true });
+  t.after(async () => {
+    for (const conversationId of conversations) await clearConversationSession(conversationId);
+  });
+
+  // The rename is the last step of a write, so holding it open puts every writer in the same window:
+  // unserialized, each one replaces a map that lacked the records written before it.
+  const realRename = fsp.rename.bind(fsp);
+  const delayed = mock.method(
+    fsp,
+    "rename",
+    async (from: Parameters<typeof fsp.rename>[0], to: Parameters<typeof fsp.rename>[1]) => {
+      if (String(to).endsWith(CONVERSATION_SESSIONS_FILE)) {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      return realRename(from, to);
+    },
+  );
+  t.after(() => delayed.mock.restore());
+
+  await Promise.all(
+    conversations.map((conversationId, index) =>
+      writeConversationSession(
+        conversationRecord(conversationId, path.join(os.tmpdir(), `hermes-conv-race-${index}`), {
+          sessionId: `sess-race-${index}`,
+        }),
+      ),
+    ),
+  );
+
+  for (const [index, conversationId] of conversations.entries()) {
+    assert.equal(
+      (await readConversationSession(conversationId))?.sessionId,
+      `sess-race-${index}`,
+      `${conversationId} lost its record to a concurrent writer`,
+    );
+  }
+  assert.equal(fs.existsSync(lockPath), false, "every write releases the lock it took");
+});
+
+/**
+ * A holder that died leaves its lock behind. Reading that as a live holder would make the map
+ * unwritable for every later dispatch, so the pid the lock carries is what decides.
+ */
+test("a lock left by a dead holder is reaped instead of blocking the map", async (t) => {
+  const conversationId = uniqueId("conv-stale-lock");
+  const repoRoot = path.join(os.tmpdir(), "hermes-conv-stale-lock");
+  const lockPath = path.join(RUN_STATE_DIR, CONVERSATION_LOCK_FILE);
+  fs.mkdirSync(RUN_STATE_DIR, { recursive: true });
+  t.after(async () => {
+    await clearConversationSession(conversationId);
+    fs.rmSync(lockPath, { force: true });
+  });
+
+  fs.writeFileSync(lockPath, String(DEAD_PID), "utf8");
+  await writeConversationSession(conversationRecord(conversationId, repoRoot, { sessionId: "sess-after-reap" }));
+
+  assert.equal(
+    (await readConversationSession(conversationId, repoRoot))?.sessionId,
+    "sess-after-reap",
+    "a dead holder must not block the next write",
+  );
+  assert.equal(fs.existsSync(lockPath), false, "the reaped lock is released again");
 });
 
 test("repoRoot matching ignores case and trailing separators exactly as the platform does", async (t) => {
