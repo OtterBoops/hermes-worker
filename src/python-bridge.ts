@@ -716,6 +716,115 @@ def op_session_info(request):
     return out
 
 
+SUBAGENT_CHILD_LIMIT = 100
+SUBAGENT_MESSAGE_LIMIT = 200
+SUBAGENT_PREVIEW_CHARS = 240
+
+
+def _flat(value, limit):
+    """One line, clipped: a worker tail is read line by line, so embedded newlines must go."""
+    text = re.sub(r"\s+", " ", value or "").strip()
+    return text if len(text) <= limit else text[: limit - 1] + "\u2026"
+
+
+def _subagent_children(conn, scope, args):
+    rows = conn.execute(
+        "SELECT id, title, started_at, ended_at, end_reason, message_count, tool_call_count "
+        "FROM sessions WHERE {} ORDER BY started_at DESC LIMIT ?".format(scope),
+        tuple(args) + (SUBAGENT_CHILD_LIMIT,),
+    ).fetchall()
+    out = []
+    for row in rows:
+        out.append({
+            "id": row["id"],
+            "title": row["title"],
+            "startedAt": row["started_at"],
+            "done": row["ended_at"] is not None,
+            "endReason": row["end_reason"],
+            "messageCount": row["message_count"] or 0,
+            "toolCallCount": row["tool_call_count"] or 0,
+        })
+    return out
+
+
+def op_subagent_activity(request):
+    """Child sessions and their new messages under one parent, as a read-only poll.
+
+    sinceStartedAt scopes the children to the turn that is running: a resumed parent carries the
+    children of every earlier turn in the same store, and replaying those would both flood the tail
+    and keep resetting an inactivity timer on work that finished long ago.
+    """
+    parent = request.get("parentSessionId")
+    if not isinstance(parent, str) or not parent:
+        raise ValueError("subagent_activity requires parentSessionId")
+    raw_since = request.get("sinceMessageId")
+    try:
+        since_id = None if raw_since is None else int(raw_since)
+    except (TypeError, ValueError):
+        since_id = None
+    raw_started = request.get("sinceStartedAt")
+    try:
+        since_started_at = None if raw_started is None else float(raw_started)
+    except (TypeError, ValueError):
+        since_started_at = None
+
+    scope = "parent_session_id = ? AND source = 'subagent'"
+    scope_args = [parent]
+    if since_started_at is not None:
+        # A row without a start time cannot be placed in time, and hiding it is worse than showing it.
+        scope += " AND (started_at IS NULL OR started_at >= ?)"
+        scope_args.append(since_started_at)
+
+    out = {
+        "parentSessionId": parent,
+        "baseline": since_id is None,
+        "cursor": 0 if since_id is None else since_id,
+        "children": [],
+        "messages": [],
+    }
+
+    db_path = get_hermes_home() / "state.db"
+    # A worker on a machine that never ran Hermes has no store: an empty poll is the answer.
+    if not db_path.exists():
+        return out
+
+    conn = None
+    try:
+        conn = sqlite3.connect("file:{}?mode=ro".format(db_path.as_posix()), uri=True, timeout=3.0)
+        conn.row_factory = sqlite3.Row
+        out["children"] = _subagent_children(conn, scope, scope_args)
+        children = "SELECT id FROM sessions WHERE {}".format(scope)
+        if since_id is None:
+            row = conn.execute(
+                "SELECT MAX(id) AS tip FROM messages WHERE session_id IN ({})".format(children),
+                tuple(scope_args),
+            ).fetchone()
+            tip = row["tip"] if row is not None else None
+            out["cursor"] = int(tip) if tip is not None else 0
+            return out
+        rows = conn.execute(
+            "SELECT id, session_id, role, tool_name, content FROM messages "
+            "WHERE id > ? AND session_id IN ({}) ORDER BY id LIMIT ?".format(children),
+            tuple([since_id] + scope_args + [SUBAGENT_MESSAGE_LIMIT]),
+        ).fetchall()
+        for row in rows:
+            out["messages"].append({
+                "id": row["id"],
+                "sessionId": row["session_id"],
+                "role": row["role"],
+                "toolName": row["tool_name"],
+                "preview": _flat(row["content"], SUBAGENT_PREVIEW_CHARS),
+            })
+            out["cursor"] = int(row["id"])
+        return out
+    except sqlite3.Error:
+        # An older schema or a locked store is a quiet poll, never a reason to fail a dispatch.
+        return out
+    finally:
+        if conn is not None:
+            conn.close()
+
+
 def _escape_like(value):
     return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
@@ -786,6 +895,7 @@ HANDLERS = {
     "projects_list": op_projects_list,
     "session_info": op_session_info,
     "sessions_list": op_sessions_list,
+    "subagent_activity": op_subagent_activity,
 }
 
 
@@ -813,6 +923,37 @@ def main():
 main()
 `;
 
+/** One child session of the run, as `op_subagent_activity` reports it. */
+export interface SubagentChildActivity {
+  id: string;
+  title: string | null;
+  startedAt: number | null;
+  /** True once the child wrote `ended_at`: the store has no status column to ask. */
+  done: boolean;
+  endReason: string | null;
+  messageCount: number;
+  toolCallCount: number;
+}
+
+export interface SubagentMessageActivity {
+  id: number;
+  sessionId: string;
+  role: string;
+  toolName: string | null;
+  /** The message text, flattened and clipped by the bridge: a tail line, not a payload. */
+  preview: string | null;
+}
+
+export interface SubagentActivity {
+  parentSessionId: string;
+  /** True when the poll carried no cursor: it reports the children and the tip, but no messages. */
+  baseline: boolean;
+  /** Highest child message id seen, to pass back as `sinceMessageId` on the next poll. */
+  cursor: number;
+  children: SubagentChildActivity[];
+  messages: SubagentMessageActivity[];
+}
+
 export interface BridgeRequest {
   op:
     | "inspect"
@@ -823,13 +964,20 @@ export interface BridgeRequest {
     | "reject"
     | "projects_list"
     | "session_info"
-    | "sessions_list";
+    | "sessions_list"
+    | "subagent_activity";
   subsystem?: "memory" | "skills" | "all";
   id?: string;
   sessionId?: string;
   repoRoot?: string;
   cwd?: string;
   limit?: number;
+  /** `subagent_activity`: the run whose child sessions and messages are wanted. */
+  parentSessionId?: string;
+  /** `subagent_activity`: omit for a baseline poll that returns no messages but the cursor. */
+  sinceMessageId?: number;
+  /** `subagent_activity`: epoch seconds; children started before it belong to an earlier turn. */
+  sinceStartedAt?: number;
 }
 
 const SUBSYSTEMS = new Set(["memory", "skills", "all"]);
@@ -845,6 +993,11 @@ const validateRequest = (request: BridgeRequest): void => {
   }
   if (request.id !== undefined && request.id !== "all" && !ID_PATTERN.test(request.id)) {
     throw new Error(`Invalid pending id '${request.id}' (expected 'all' or [A-Za-z0-9_-]+)`);
+  }
+  // A poll without a parent would scan every session's children, so it is refused here as well as
+  // in Python: the cost of the mistake is a whole-store read every few seconds.
+  if (request.op === "subagent_activity" && !request.parentSessionId) {
+    throw new Error("subagent_activity requires parentSessionId");
   }
 };
 

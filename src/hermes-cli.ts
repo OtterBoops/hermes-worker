@@ -24,8 +24,8 @@ import {
   resolveAntigravityProject,
   type ResolvedProject,
 } from "./project-binding.js";
-import { runBridge } from "./python-bridge.js";
-import { createStreamFormatter, openRunLog, type RunLog } from "./run-log.js";
+import { runBridge, type SubagentActivity } from "./python-bridge.js";
+import { createStreamFormatter, createSubagentFormatter, openRunLog, type RunLog } from "./run-log.js";
 import {
   RUN_ID_PATTERN,
   clearConversationSession,
@@ -75,7 +75,7 @@ export interface DispatchOptions {
 /** Pinned so a dispatch is reproducible regardless of what Hermes' config was last set to. */
 export const DEFAULT_MODEL = "deepseek-v4.1-flash";
 export const DEFAULT_REASONING = "high";
-export const DEFAULT_TIMEOUT_SECONDS = 1800;
+export const DEFAULT_TIMEOUT_SECONDS = 900;
 export const DEFAULT_FAST_WAIT_SECONDS = 1;
 
 export interface ToolEvent {
@@ -508,28 +508,33 @@ interface StreamState {
   durationMs: number | null;
   isError: boolean;
   error: string | null;
+  /** `delegate_task` calls with no result yet: subagents can only be live inside that window. */
+  delegations: Set<string>;
 }
 
 /**
  * Calls only, never results: a result's payload is the run log's job, and copying 200 characters of
  * every read into the returned result bills the caller for output nothing reads.
  */
-const collectToolEvents = (node: unknown, sink: ToolEvent[], depth = 0): void => {
+const DELEGATE_TOOL = "delegate_task";
+
+const collectToolEvents = (node: unknown, sink: ToolEvent[], delegations: Set<string>, depth = 0): void => {
   if (!node || typeof node !== "object" || depth > 6) return;
   if (Array.isArray(node)) {
-    for (const item of node) collectToolEvents(item, sink, depth + 1);
+    for (const item of node) collectToolEvents(item, sink, delegations, depth + 1);
     return;
   }
   const record = node as Record<string, unknown>;
   if (record.type === "tool_use") {
-    sink.push({
-      type: "tool_use",
-      name: String(record.name ?? "tool"),
-      detail: String(record.id ?? ""),
-    });
+    const name = String(record.name ?? "tool");
+    sink.push({ type: "tool_use", name, detail: String(record.id ?? "") });
+    if (name === DELEGATE_TOOL) delegations.add(String(record.id ?? "delegate"));
+  } else if (record.type === "tool_result") {
+    const id = record.tool_use_id;
+    if (typeof id === "string") delegations.delete(id);
   }
   for (const value of Object.values(record)) {
-    if (value && typeof value === "object") collectToolEvents(value, sink, depth + 1);
+    if (value && typeof value === "object") collectToolEvents(value, sink, delegations, depth + 1);
   }
 };
 
@@ -556,7 +561,7 @@ const ingestStreamLine = (line: string, state: StreamState): void => {
     if (event.is_error === true) state.isError = true;
     if (typeof event.error === "string" && event.error) state.error = event.error;
   }
-  collectToolEvents(event, state.toolEvents);
+  collectToolEvents(event, state.toolEvents, state.delegations);
 };
 
 interface HermesRun {
@@ -655,6 +660,130 @@ export const sandboxedGitEnv = (
   };
 };
 
+const DEFAULT_SUBAGENT_POLL_MS = 3000;
+const SUBAGENT_POLL_TIMEOUT_MS = 15_000;
+/** A bridge that cannot answer three times running will not start answering on the fourth. */
+const SUBAGENT_MAX_FAILURES = 3;
+
+export type SubagentActivityReader = (
+  parentSessionId: string,
+  sinceMessageId: number | null,
+  sinceStartedAt: number | null,
+) => Promise<SubagentActivity>;
+
+const readSubagentActivity: SubagentActivityReader = (parentSessionId, sinceMessageId, sinceStartedAt) =>
+  runBridge<SubagentActivity>(
+    {
+      op: "subagent_activity",
+      parentSessionId,
+      sinceMessageId: sinceMessageId ?? undefined,
+      sinceStartedAt: sinceStartedAt ?? undefined,
+    },
+    { timeoutMs: SUBAGENT_POLL_TIMEOUT_MS },
+  );
+
+export interface SubagentPollerOptions {
+  /** The run's current session: null until the child has printed one. */
+  parentSessionId: () => string | null;
+  /** Formatted lines plus whether they carried news, which is what keeps a run's timer alive. */
+  onActivity: (lines: string[], active: boolean) => void;
+  pollMs?: number;
+  /** Injected by tests; production reads the session store through the bridge. */
+  read?: SubagentActivityReader;
+}
+
+export interface SubagentPoller {
+  /** Arm or pause: paused is not ended, so re-arming later continues the same cursor. */
+  setActive: (active: boolean) => void;
+  stop: () => void;
+  poll: () => Promise<void>;
+}
+
+/**
+ * Polls the session store for the children of one parent while a `delegate_task` call is open.
+ *
+ * The store is only ever read through the Python bridge: workers hold no `node:sqlite` reader, so
+ * there is one place where the schema is known. A poll in flight is never overlapped, and a poller
+ * left armed after its run settles would leak both a timer and a Python process per tick.
+ */
+export const createSubagentPoller = (options: SubagentPollerOptions): SubagentPoller => {
+  const pollMs = options.pollMs ?? DEFAULT_SUBAGENT_POLL_MS;
+  const read = options.read ?? readSubagentActivity;
+  const format = createSubagentFormatter();
+  // The run began here, before its child exists: any earlier subagent belongs to an earlier turn.
+  const beganAt = Date.now() / 1000;
+  let cursor: number | null = null;
+  let timer: NodeJS.Timeout | null = null;
+  let active = false;
+  let inFlight = false;
+  let flushPending = false;
+  let stopped = false;
+  let failures = 0;
+
+  const schedule = (): void => {
+    if (stopped || timer !== null || !active || pollMs <= 0) return;
+    if (failures >= SUBAGENT_MAX_FAILURES || !options.parentSessionId()) return;
+    timer = setTimeout(() => {
+      timer = null;
+      void poll().finally(schedule);
+    }, pollMs);
+    // The poller must never be the reason the process outlives its run.
+    if (typeof timer.unref === "function") timer.unref();
+  };
+
+  const poll = async (): Promise<void> => {
+    if (stopped || inFlight) return;
+    const parentSessionId = options.parentSessionId();
+    if (!parentSessionId) return;
+    inFlight = true;
+    try {
+      const activity = await read(parentSessionId, cursor, beganAt);
+      // A settle raced this poll: its lines belong to a run that has already been reported.
+      if (stopped) return;
+      if (typeof activity?.cursor === "number" && Number.isFinite(activity.cursor)) cursor = activity.cursor;
+      failures = 0;
+      const batch = format(activity);
+      if (batch.lines.length > 0 || batch.active) options.onActivity(batch.lines, batch.active);
+    } catch {
+      // A tail is a convenience: a bridge that cannot answer must never fail the dispatch.
+      failures += 1;
+    } finally {
+      inFlight = false;
+      // The flush a deactivation asked for while this poll held the lock.
+      if (flushPending && !stopped) {
+        flushPending = false;
+        void poll();
+      }
+    }
+  };
+
+  return {
+    setActive: (next: boolean): void => {
+      if (stopped) return;
+      const wasActive = active;
+      active = next;
+      if (next) {
+        schedule();
+        return;
+      }
+      if (timer !== null) clearTimeout(timer);
+      timer = null;
+      // One last read on the way out: the children finish as their parent's call returns.
+      if (wasActive) {
+        if (inFlight) flushPending = true;
+        else void poll();
+      }
+    },
+    stop: (): void => {
+      stopped = true;
+      active = false;
+      if (timer !== null) clearTimeout(timer);
+      timer = null;
+    },
+    poll,
+  };
+};
+
 interface ExecHermesOptions {
   args: string[];
   cwd: string;
@@ -667,9 +796,13 @@ interface ExecHermesOptions {
   onChildPid?: (pid: number) => void;
   /** `log` receives every formatted line as the child emits it, which is what makes the run tailable. */
   log?: RunLog;
+  /** Subagent poll interval; the default only matters where a `delegate_task` call is open. */
+  subagentPollMs?: number;
+  /** Injected by tests; production reads the session store through the bridge. */
+  subagentReadActivity?: SubagentActivityReader;
 }
 
-const execHermes = (options: ExecHermesOptions): Promise<HermesRun> =>
+export const execHermes = (options: ExecHermesOptions): Promise<HermesRun> =>
   new Promise((resolve) => {
     const { args, cwd, timeoutSeconds, repoRoot, env, onSessionId, onChildPid, log } = options;
     // One formatter per run: correlating a result to its tool needs the ids this run has seen.
@@ -683,6 +816,7 @@ const execHermes = (options: ExecHermesOptions): Promise<HermesRun> =>
       durationMs: null,
       isError: false,
       error: null,
+      delegations: new Set<string>(),
     };
 
     const command = hermesCommand();
@@ -709,14 +843,35 @@ const execHermes = (options: ExecHermesOptions): Promise<HermesRun> =>
     let turnOneSeen = false;
     let abortedFallback = false;
 
-    const timer = setTimeout(() => {
-      timedOut = true;
-      if (child.pid && isWindows) {
-        spawn("taskkill", ["/PID", String(child.pid), "/T", "/F"], { windowsHide: true });
-      } else {
-        child.kill("SIGKILL");
-      }
-    }, timeoutSeconds * 1000);
+    // Inactivity timer rather than a hard wall-clock cap: reset on every stdout/stderr chunk so
+    // long active runs never get killed mid-flight, while silent subagent waits still get the full
+    // timeoutSeconds window before a genuinely wedged process is reaped.
+    let timer: NodeJS.Timeout | null = null;
+    const resetTimer = (): void => {
+      if (settled) return;
+      if (timer !== null) clearTimeout(timer);
+      timer = setTimeout(() => {
+        timedOut = true;
+        if (child.pid && isWindows) {
+          spawn("taskkill", ["/PID", String(child.pid), "/T", "/F"], { windowsHide: true });
+        } else {
+          child.kill("SIGKILL");
+        }
+      }, timeoutSeconds * 1000);
+    };
+    resetTimer();
+
+    // Subagents are silent on this run's own stream, so a `delegate_task` window would otherwise
+    // look like a wedged process and be killed mid-flight.
+    const subagents = createSubagentPoller({
+      parentSessionId: () => state.sessionId,
+      onActivity: (lines, active) => {
+        if (lines.length > 0) log?.write(lines);
+        if (active) resetTimer();
+      },
+      pollMs: options.subagentPollMs,
+      read: options.subagentReadActivity,
+    });
 
     /**
      * The pinned model is a contract, not a preference: a turn already answered by the fallback
@@ -754,6 +909,7 @@ const execHermes = (options: ExecHermesOptions): Promise<HermesRun> =>
 
     child.stdout?.setEncoding("utf8");
     child.stdout?.on("data", (chunk: string) => {
+      resetTimer();
       buffer += chunk;
       const lines = buffer.split(/\r?\n/);
       buffer = lines.pop() ?? "";
@@ -765,10 +921,12 @@ const execHermes = (options: ExecHermesOptions): Promise<HermesRun> =>
         abortOnFallback();
         // The turn has produced its first step: any fallback it was going to report is on disk.
         if (state.toolEvents.length > 0 || state.text) turnOneSeen = true;
+        subagents.setActive(state.delegations.size > 0);
       }
     });
     child.stderr?.setEncoding("utf8");
     child.stderr?.on("data", (chunk: string) => {
+      resetTimer();
       stderr += chunk;
       if (stderr.length > 40_000) stderr = stderr.slice(-40_000);
       stderrBuffer += chunk;
@@ -784,7 +942,9 @@ const execHermes = (options: ExecHermesOptions): Promise<HermesRun> =>
     const settle = (code: number | null): void => {
       if (settled) return;
       settled = true;
-      clearTimeout(timer);
+      if (timer !== null) clearTimeout(timer);
+      timer = null;
+      subagents.stop();
       if (graceTimer !== null) clearTimeout(graceTimer);
       graceTimer = null;
       if (buffer.trim()) {
@@ -1115,8 +1275,23 @@ const restoreHooks = (hooksDir: string, before: HooksSnapshot, after: HooksSnaps
 };
 
 /** The hooks dir a linked worktree shares with its repository, before any sandbox overrides it. */
-const resolveHooksDir = async (repoRoot: string): Promise<string | null> => {
-  const result = await runGit(repoRoot, ["rev-parse", "--git-path", "hooks"]);
+/**
+ * A `core.hooksPath` in the caller's own environment answers with the sandbox directory this worker
+ * points its children at, so the guard would watch an empty dir while the repository's hooks were
+ * rewritten. The repository's own config still decides the path; only the environment override goes.
+ */
+const withoutGitConfigEnv = (base: NodeJS.ProcessEnv): NodeJS.ProcessEnv => {
+  const env = { ...base };
+  for (const key of Object.keys(env)) {
+    if (/^GIT_CONFIG_(COUNT|KEY_\d+|VALUE_\d+)$/i.test(key)) delete env[key];
+  }
+  return env;
+};
+
+export const resolveHooksDir = async (repoRoot: string): Promise<string | null> => {
+  const result = await runGit(repoRoot, ["rev-parse", "--git-path", "hooks"], {
+    env: withoutGitConfigEnv(process.env),
+  });
   if (!result.ok) return null;
   const raw = result.stdout.trim();
   if (!raw) return null;
@@ -1839,7 +2014,7 @@ export const dispatchHermesTask = async (options: DispatchOptions): Promise<Disp
 
       result.sessionId = sessionId;
       if (!result.message) {
-        if (result.timedOut) result.message = `Hermes exceeded ${timeoutSeconds}s and was killed.`;
+        if (result.timedOut) result.message = `Hermes produced no output for ${timeoutSeconds}s and was killed.`;
         else if (failed) result.message = `Hermes exited ${result.exitCode ?? "unknown"}${result.error ? `: ${result.error}` : ""}.`;
       }
 

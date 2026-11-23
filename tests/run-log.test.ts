@@ -5,10 +5,13 @@ import os from "node:os";
 import path from "node:path";
 import {
   createStreamFormatter,
+  createSubagentFormatter,
   formatStreamEvent,
   formatStreamLine,
   openRunLog,
+  shortSubagentId,
 } from "../src/run-log.js";
+import type { SubagentActivity, SubagentChildActivity } from "../src/python-bridge.js";
 
 const tmpDir = (prefix: string): string => fs.mkdtempSync(path.join(os.tmpdir(), prefix));
 
@@ -143,4 +146,104 @@ test("close resolves even when the log stream failed to open", async () => {
 
   assert.equal(settled, "closed", "an errored stream must not hang the dispatch");
   fs.rmSync(dir, { recursive: true, force: true });
+});
+
+const childActivity = (id: string, over: Partial<SubagentChildActivity> = {}): SubagentChildActivity => ({
+  id,
+  title: `Subagent: work for ${id}`,
+  startedAt: 1,
+  done: false,
+  endReason: null,
+  messageCount: 0,
+  toolCallCount: 0,
+  ...over,
+});
+
+const subagentActivity = (over: Partial<SubagentActivity> = {}): SubagentActivity => ({
+  parentSessionId: "parent-1",
+  baseline: false,
+  cursor: 1,
+  children: [],
+  messages: [],
+  ...over,
+});
+
+test("the first poll announces the children it finds, once", () => {
+  const format = createSubagentFormatter();
+  const children = [
+    childActivity("20260101_120000_bbbbbb"),
+    childActivity("20260101_120000_aaaaaa"),
+  ];
+
+  const first = format(subagentActivity({ baseline: true, children }));
+  assert.deepEqual(first.lines, [
+    "[Hermes:Subagent:aaaaaa] started: work for 20260101_120000_aaaaaa",
+    "[Hermes:Subagent:bbbbbb] started: work for 20260101_120000_bbbbbb",
+  ]);
+
+  // Every poll repeats the whole child list, so a start is news exactly once.
+  const second = format(subagentActivity({ baseline: true, children }));
+  assert.deepEqual(second, { lines: [], active: false });
+});
+
+test("subagent starts, tool calls and steps are rendered oldest first", () => {
+  const format = createSubagentFormatter();
+
+  const batch = format(
+    subagentActivity({
+      children: [
+        childActivity("20260101_120000_bbbbbb", { title: "Subagent: write the docs" }),
+        childActivity("20260101_120000_aaaaaa", { title: "Subagent: audit the parser" }),
+      ],
+      messages: [
+        { id: 1, sessionId: "20260101_120000_aaaaaa", role: "tool", toolName: "read_file", preview: "1|export" },
+        { id: 2, sessionId: "20260101_120000_aaaaaa", role: "assistant", toolName: null, preview: "Found two\ncandidates." },
+        { id: 3, sessionId: "20260101_120000_bbbbbb", role: "user", toolName: null, preview: "ignored" },
+      ],
+    }),
+  );
+
+  assert.deepEqual(batch.lines, [
+    "[Hermes:Subagent:aaaaaa] started: audit the parser",
+    "[Hermes:Subagent:bbbbbb] started: write the docs",
+    "[Hermes:Subagent:aaaaaa] tool read_file",
+    "[Hermes:Subagent:aaaaaa] step: Found two candidates.",
+  ]);
+  assert.equal(batch.active, true);
+});
+
+test("a repeated tool call is one line of news, and a child finishes once", () => {
+  const format = createSubagentFormatter();
+  const id = "20260101_120000_abc123";
+
+  // The child is already known from the poll that announced it.
+  format(subagentActivity({ baseline: true, children: [childActivity(id)] }));
+
+  const first = format(
+    subagentActivity({
+      children: [childActivity(id, { toolCallCount: 1 })],
+      messages: [{ id: 5, sessionId: id, role: "tool", toolName: "read_file", preview: "" }],
+    }),
+  );
+  assert.deepEqual(first.lines, ["[Hermes:Subagent:abc123] tool read_file"]);
+
+  const repeated = format(
+    subagentActivity({
+      children: [childActivity(id, { toolCallCount: 2 })],
+      messages: [{ id: 6, sessionId: id, role: "tool", toolName: "read_file", preview: "" }],
+    }),
+  );
+  assert.deepEqual(repeated.lines, [], "five reads in a row are still one line");
+  assert.equal(repeated.active, true, "the run is busy even when the tail has nothing new to say");
+
+  const finished = format(subagentActivity({ children: [childActivity(id, { done: true, toolCallCount: 7 })] }));
+  assert.deepEqual(finished.lines, ["[Hermes:Subagent:abc123] finished after 7 tool calls"]);
+
+  const again = format(subagentActivity({ children: [childActivity(id, { done: true, toolCallCount: 7 })] }));
+  assert.deepEqual(again.lines, [], "a completion is reported once");
+});
+
+test("shortSubagentId keeps the tail of a session id", () => {
+  assert.equal(shortSubagentId("20260101_120000_abcdef"), "abcdef");
+  assert.equal(shortSubagentId("local-0123456789abcdef"), "abcdef");
 });

@@ -17,6 +17,7 @@ import {
   captureWorkingTreeSnapshot,
   diffTreeSnapshots,
   dispatchHermesTask,
+  execHermes,
   listHermesSessions,
   manageWorktree,
   parseGatewayRuntime,
@@ -26,6 +27,7 @@ import {
   raceFastWait,
   readSessionAfterRun,
   readUsageReport,
+  resolveHooksDir,
   restoreWorkingTreeSnapshot,
   runMetadata,
   runVerifyCommand,
@@ -3494,4 +3496,113 @@ test("readSessionAfterRun reads the row through the bridge and never creates a s
   assert.equal(known.model, DEFAULT_MODEL);
   assert.equal(known.provider, "opencode-go");
   assert.equal(known.fallbackActive, false);
+});
+
+test("subagent activity keeps a delegate_task window alive and stops with the run", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "hermes-subagent-poll-"));
+  const bin = path.join(dir, "stub-hermes.mjs");
+  // The child goes silent for longer than the inactivity timeout: only the poller can save it.
+  fs.writeFileSync(
+    bin,
+    [
+      'const emit = (value) => console.log(JSON.stringify(value));',
+      'emit({ type: "system", session_id: "parent-run-1" });',
+      'emit({ type: "assistant", message: { role: "assistant", content: [{ type: "tool_use", id: "call-delegate", name: "delegate_task", input: { tasks: [] } }] } });',
+      'setTimeout(() => emit({ type: "result", result: "all subagents done", exit_code: 0 }), 1600);',
+    ].join("\n"),
+    "utf8",
+  );
+  const previousBin = process.env.HERMES_BIN;
+  process.env.HERMES_BIN = bin;
+  t.after(() => {
+    if (previousBin === undefined) delete process.env.HERMES_BIN;
+    else process.env.HERMES_BIN = previousBin;
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  const lines: string[] = [];
+  let reads = 0;
+  const outcome = await execHermes({
+    args: [],
+    cwd: dir,
+    timeoutSeconds: 1,
+    repoRoot: dir,
+    env: process.env,
+    log: { write: (batch) => void lines.push(...batch), close: async () => undefined },
+    subagentPollMs: 100,
+    subagentReadActivity: async (parentSessionId, sinceMessageId) => {
+      reads += 1;
+      const id = (sinceMessageId ?? 0) + 1;
+      return {
+        parentSessionId,
+        baseline: sinceMessageId === null,
+        cursor: id,
+        children: [
+          {
+            id: "20260101_120000_abc123",
+            title: "Subagent: audit the parser",
+            startedAt: 1,
+            done: false,
+            endReason: null,
+            messageCount: 1,
+            toolCallCount: 1,
+          },
+        ],
+        messages:
+          sinceMessageId === null
+            ? []
+            : [
+                {
+                  id,
+                  sessionId: "20260101_120000_abc123",
+                  role: "assistant",
+                  toolName: null,
+                  preview: "step " + String(reads),
+                },
+              ],
+      };
+    },
+  });
+
+  assert.equal(outcome.timedOut, false, "a silent delegate_task window must not be killed as wedged");
+  assert.equal(outcome.state.sessionId, "parent-run-1");
+  assert.equal(reads > 1, true, "the poller repeated while the delegation was open");
+  assert.equal(lines.includes("[Hermes:Subagent:abc123] started: audit the parser"), true);
+  assert.equal(
+    lines.filter((line) => line.startsWith("[Hermes:Subagent:abc123] step: ")).length >= 2,
+    true,
+    "every poll's new step reaches the run log",
+  );
+
+  const settledReads = reads;
+  await new Promise((resolve) => setTimeout(resolve, 250));
+  assert.equal(reads, settledReads, "a settled run leaves no poller behind");
+});
+
+test("an inherited core.hooksPath does not redirect the hook guard", async (t) => {
+  const { repo } = await makeRepo(t);
+  const sandboxHooks = fs.mkdtempSync(path.join(os.tmpdir(), "hermes-worker-empty-hooks-"));
+  t.after(() => fs.rmSync(sandboxHooks, { recursive: true, force: true }));
+
+  // The worker points its own children at an empty hooks dir, and a nested run can inherit that.
+  const previous = {
+    GIT_CONFIG_COUNT: process.env.GIT_CONFIG_COUNT,
+    GIT_CONFIG_KEY_0: process.env.GIT_CONFIG_KEY_0,
+    GIT_CONFIG_VALUE_0: process.env.GIT_CONFIG_VALUE_0,
+  };
+  process.env.GIT_CONFIG_COUNT = "1";
+  process.env.GIT_CONFIG_KEY_0 = "core.hooksPath";
+  process.env.GIT_CONFIG_VALUE_0 = sandboxHooks;
+  t.after(() => {
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  });
+
+  assert.equal(
+    path.resolve(await resolveHooksDir(repo)),
+    path.resolve(repo, ".git", "hooks"),
+    "the guard must watch the repository's hooks, not the sandbox it hands its children",
+  );
 });

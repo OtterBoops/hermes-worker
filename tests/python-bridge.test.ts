@@ -3,9 +3,11 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { runBridge } from "../src/python-bridge.js";
+import { runBridge, type SubagentActivity } from "../src/python-bridge.js";
 import { managePendingWrites, type PendingWritesResult, type SalvageOutcome } from "../src/memory-manager.js";
 import { resolveHermesPython } from "../src/hermes-paths.js";
+import { DatabaseSync } from "node:sqlite";
+import { makeBridgeHome } from "./bridge-home.js";
 
 const DELIMITER = "\n§\n";
 const ALPHA = "Alpha topic: the widget lives in src/widget.ts and is covered by tests.";
@@ -233,4 +235,108 @@ test("salvage never writes through a record id that is not a bare token", async 
     payload: { operations: Array<Record<string, unknown>> };
   };
   assert.equal(onDisk.payload.operations[0].matched_entry, BETA);
+});
+
+const SUBAGENT_SCHEMA = `
+CREATE TABLE sessions (
+  id TEXT PRIMARY KEY, parent_session_id TEXT, source TEXT, title TEXT,
+  started_at REAL, ended_at REAL, end_reason TEXT, message_count INTEGER, tool_call_count INTEGER
+);
+CREATE TABLE messages (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, role TEXT, tool_name TEXT, content TEXT
+)`;
+
+/** One write connection per call: the bridge opens its own read-only handle alongside. */
+const seedStore = (home: string, statements: (db: DatabaseSync) => void): void => {
+  const db = new DatabaseSync(path.join(home, "state.db"));
+  statements(db);
+  db.close();
+};
+
+test("subagent activity baselines, then reports only the children's new messages", async (t) => {
+  const { home, available } = await makeBridgeHome(t);
+  if (!available) return;
+
+  seedStore(home, (db) => {
+    db.exec(SUBAGENT_SCHEMA);
+    const session = db.prepare(
+      "INSERT INTO sessions (id, parent_session_id, source, title, started_at, ended_at, message_count, tool_call_count) VALUES (?,?,?,?,?,?,?,?)",
+    );
+    session.run("parent-1", null, "cli", "the run", 1, null, 2, 0);
+    session.run("20260101_120000_aaaaaa", "parent-1", "subagent", "Subagent: audit the parser", 2, null, 1, 1);
+    session.run("20260101_120000_bbbbbb", "parent-1", "subagent", "Subagent: write the docs", 3, 9, 1, 0);
+    // A sibling run's child shares the store but not the parent: it must never be reported here.
+    session.run("parent-2", null, "cli", "another run", 4, null, 1, 0);
+    session.run("20260101_120000_cccccc", "parent-2", "subagent", "Subagent: unrelated", 5, null, 1, 0);
+
+    const message = db.prepare("INSERT INTO messages (session_id, role, tool_name, content) VALUES (?,?,?,?)");
+    message.run("parent-1", "assistant", null, "the parent's own step");
+    message.run("20260101_120000_aaaaaa", "tool", "read_file", '{"content": "1|export"}');
+  });
+
+  const baseline = await runBridge<SubagentActivity>({ op: "subagent_activity", parentSessionId: "parent-1" });
+  assert.equal(baseline.baseline, true);
+  assert.deepEqual(baseline.messages, [], "a baseline replays nothing");
+  assert.equal(baseline.cursor > 0, true, "the baseline still hands back a cursor to poll from");
+  assert.deepEqual(
+    baseline.children.map((child) => [child.id, child.done, child.toolCallCount]).sort(),
+    [
+      ["20260101_120000_aaaaaa", false, 1],
+      ["20260101_120000_bbbbbb", true, 0],
+    ],
+  );
+
+  seedStore(home, (db) => {
+    const message = db.prepare("INSERT INTO messages (session_id, role, tool_name, content) VALUES (?,?,?,?)");
+    message.run("20260101_120000_aaaaaa", "assistant", null, "Found\ntwo candidates.");
+    message.run("20260101_120000_cccccc", "tool", "terminal", "pnpm test");
+  });
+
+  const delta = await runBridge<SubagentActivity>({
+    op: "subagent_activity",
+    parentSessionId: "parent-1",
+    sinceMessageId: baseline.cursor,
+  });
+  assert.equal(delta.baseline, false);
+  assert.equal(delta.messages.length, 1, "only this parent's children are polled");
+  assert.equal(delta.messages[0].sessionId, "20260101_120000_aaaaaa");
+  assert.equal(delta.messages[0].preview, "Found two candidates.", "a tail line cannot carry newlines");
+  assert.equal(delta.cursor > baseline.cursor, true);
+
+  const idle = await runBridge<SubagentActivity>({
+    op: "subagent_activity",
+    parentSessionId: "parent-1",
+    sinceMessageId: delta.cursor,
+  });
+  assert.deepEqual(idle.messages, []);
+  assert.equal(idle.cursor, delta.cursor, "an idle poll must not move the cursor");
+
+  // A resumed parent carries every earlier turn's children in this store: only this turn's count.
+  const scoped = await runBridge<SubagentActivity>({
+    op: "subagent_activity",
+    parentSessionId: "parent-1",
+    sinceMessageId: 0,
+    sinceStartedAt: 2.5,
+  });
+  assert.deepEqual(
+    scoped.children.map((child) => child.id),
+    ["20260101_120000_bbbbbb"],
+    "a child that started before the turn is never replayed",
+  );
+});
+
+test("subagent polling returns an empty batch when there is no session store", async (t) => {
+  const { home, available } = await makeBridgeHome(t);
+  if (!available) return;
+  assert.equal(fs.existsSync(path.join(home, "state.db")), false, "the fixture starts empty");
+
+  const activity = await runBridge<SubagentActivity>({ op: "subagent_activity", parentSessionId: "parent-1" });
+  assert.deepEqual(activity.children, []);
+  assert.deepEqual(activity.messages, []);
+  assert.equal(activity.baseline, true);
+  assert.equal(
+    fs.existsSync(path.join(home, "state.db")),
+    false,
+    "a read must never create the store it could not find",
+  );
 });

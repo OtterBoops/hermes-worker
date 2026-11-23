@@ -117,7 +117,7 @@ server.registerTool(
         .min(30)
         .max(7200)
         .optional()
-        .describe("Wall-clock budget for each Hermes turn (default 1800s)."),
+        .describe("Inactivity timeout for each Hermes turn, reset on parent or subagent activity (default 900s)."),
       fastWaitSeconds: z
         .number()
         .min(1)

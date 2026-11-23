@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import type { SubagentActivity, SubagentChildActivity, SubagentMessageActivity } from "./python-bridge.js";
 
 /**
  * Turns the stream-json event tree into the human-readable lines that `<runId>.log` carries.
@@ -237,6 +238,82 @@ export const createStreamFormatter = (): ((line: string) => string[]) => {
       previousLine = entry;
     }
     return emitted;
+  };
+};
+
+/** A batch of subagent lines plus whether anything new was seen: the caller resets a timer on it. */
+export interface SubagentLogBatch {
+  lines: string[];
+  active: boolean;
+}
+
+const SUBAGENT_TITLE_LIMIT = 100;
+
+/** Child ids are `20260101_120000_abcdef`; the tail is the only part a tail reader can tell apart. */
+export const shortSubagentId = (id: string): string => {
+  const tail = id.slice(id.lastIndexOf("_") + 1);
+  return tail.length > 6 ? tail.slice(-6) : tail;
+};
+
+const describeChild = (child: SubagentChildActivity): string => {
+  const title = clip((child.title ?? "").replace(/^Subagent:\s*/i, ""), SUBAGENT_TITLE_LIMIT);
+  return title ? `: ${title}` : "";
+};
+
+/**
+ * Renders what `op_subagent_activity` reports as `[Hermes:Subagent:<shortId>] ...` lines.
+ *
+ * Stateful on purpose: the bridge reports raw rows, so "started", "finished" and a repeated tool
+ * call are only visible against what this run has already printed. The bridge scopes the rows to
+ * this turn, which is what keeps a resumed parent from replaying the previous turn's children.
+ */
+export const createSubagentFormatter = (): ((activity: SubagentActivity) => SubagentLogBatch) => {
+  const announced = new Set<string>();
+  const finished = new Set<string>();
+  const lastLine = new Map<string, string>();
+
+  const lineFor = (shortId: string, message: SubagentMessageActivity): string | null => {
+    if (message.role === "tool") return message.toolName ? `[Hermes:Subagent:${shortId}] tool ${message.toolName}` : null;
+    if (message.role !== "assistant") return null;
+    const preview = clip(message.preview ?? "", TEXT_LIMIT);
+    return preview ? `[Hermes:Subagent:${shortId}] step: ${preview}` : null;
+  };
+
+  return (activity: SubagentActivity): SubagentLogBatch => {
+    const lines: string[] = [];
+    if (!activity || typeof activity !== "object") return { lines, active: false };
+
+    const children = Array.isArray(activity.children) ? activity.children.filter((child) => child?.id) : [];
+
+    // Children arrive newest-first; the tail reads oldest-first, and a start must precede the work
+    // the same poll already carries.
+    for (const child of [...children].reverse()) {
+      if (announced.has(child.id)) continue;
+      announced.add(child.id);
+      lines.push(`[Hermes:Subagent:${shortSubagentId(child.id)}] started${describeChild(child)}`);
+    }
+
+    for (const message of Array.isArray(activity.messages) ? activity.messages : []) {
+      if (!message || typeof message.sessionId !== "string") continue;
+      const rendered = lineFor(shortSubagentId(message.sessionId), message);
+      if (!rendered) continue;
+      // A child reading six files in a row is one line of news, not six.
+      if (lastLine.get(message.sessionId) === rendered) continue;
+      lastLine.set(message.sessionId, rendered);
+      lines.push(rendered);
+    }
+
+    for (const child of children) {
+      if (!child.done || finished.has(child.id)) continue;
+      finished.add(child.id);
+      const calls = child.toolCallCount;
+      const plural = calls === 1 ? "" : "s";
+      lines.push(
+        `[Hermes:Subagent:${shortSubagentId(child.id)}] finished${calls > 0 ? ` after ${calls} tool call${plural}` : ""}`,
+      );
+    }
+
+    return { lines, active: lines.length > 0 || (Array.isArray(activity.messages) && activity.messages.length > 0) };
   };
 };
 
